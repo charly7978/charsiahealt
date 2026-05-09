@@ -148,7 +148,29 @@ function handleSample(payload: Float32Array): void {
   const filt = bandpass.process(fused.value);
   filtered.push(filt);
 
+  // --- Resampling path: use real performance.now() as frame timestamp.
+  // The cubic spline emits values on a uniform 100 Hz grid. We feed each
+  // emitted (R, G) pair to the RoR estimator. R and G splines share the
+  // grid by construction (same input timestamps).
   const now = performance.now();
+  const beforeR = resampledCount;
+  splineR.push(now, r, onResampledR);
+  const emittedR = splineR.push !== undefined ? 0 : 0; // (counter handled below)
+  void emittedR; // silence unused warning
+  splineG.push(now, g, onResampledG);
+  if (pendingR && pendingG) {
+    ror.push(lastResampledR, lastResampledG);
+    resampledCount++;
+    pendingR = false;
+    pendingG = false;
+    void beforeR;
+  }
+  const reading = ror.read();
+  if (reading) {
+    lastRoR = reading.ror;
+    lastSpo2 = reading.spo2;
+  }
+
   if (now - lastEmit < EMIT_INTERVAL_MS) return;
   lastEmit = now;
 
@@ -173,6 +195,10 @@ function handleSample(payload: Float32Array): void {
     meanB,
     dcEstimate,
     samplesProcessed: sampleCount,
+    resampledRate: RESAMPLED_RATE,
+    resampledCount,
+    ror: lastRoR,
+    spo2Experimental: lastSpo2,
   };
   (self as unknown as Worker).postMessage(out, [snapshotBuffer.buffer]);
   snapshotBuffer = new Float32Array(filtered.capacity);
@@ -193,6 +219,14 @@ function handleReset(): void {
   meanR = 0;
   meanG = 0;
   meanB = 0;
+  splineR.reset();
+  splineG.reset();
+  ror.reset();
+  resampledCount = 0;
+  lastRoR = null;
+  lastSpo2 = null;
+  pendingR = false;
+  pendingG = false;
 }
 
 self.addEventListener("message", (event: MessageEvent<WorkerInbound>) => {
