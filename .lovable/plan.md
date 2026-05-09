@@ -1,65 +1,97 @@
-# Por qué hoy aparecen ondas y vitales "lindos" sin dedo
+## Objetivo
 
-Aunque ya removimos el bloqueo por liveness, el sistema sigue *fabricando* señales plausibles a partir de cualquier escena por **3 mecanismos acumulativos**:
+Construir desde cero un núcleo PPG profesional en `src/lib/ppg/` siguiendo la secuencia de 3 prompts (hardware → captura/ROI → DSP/Worker/Hook), con tipado estricto, degradación elegante en iOS Safari, zero-copy entre hilos y cero `any`/`Math.random`/sintéticos.
 
-1. **Pseudo‑pulso por baseline EMA** (`PPGSignalProcessor.extractBestPulseSignal`)
-   - Se construye `rNorm = (redBaseline − rawRed) / redBaseline`, con `redBaseline` siguiendo a `rawRed` con `α = 0.02–0.04`. La diferencia entre la media lenta y el valor instantáneo es **siempre una oscilación de ~0.7–4 Hz** (justo la banda cardíaca), aún apuntando a una pared. Después se multiplica por **3200** y se mete al bandpass: lo que sale parece una onda PPG perfecta.
+## Alcance (solo lo pedido)
 
-2. **Suavizado y retención en `VitalSignsProcessor`**
-   - `EMA_ALPHA_STABLE = 0.20`, `EMA_ALPHA_DYNAMIC = 0.30`. Una vez que entró un valor "razonable" (SpO₂ entre 70–100, glucosa 40–400, etc.), el EMA lo conserva visible aunque la entrada se vuelva basura.
-   - `getFormattedResult()` siempre devuelve el último `measurements.*` aunque `validateRealPulse` falle (no se ponen a 0).
+Crear módulos nuevos y aislados bajo `src/lib/ppg/`. **No** se modifica el pipeline existente (`useSignalProcessor`, `HeartBeatProcessor`, `PPGSignalProcessor`, `BandpassFilter`, `Index.tsx`, etc.) — coexiste como un núcleo paralelo listo para futura integración. No se toca UI (monitor, displays, grilla) ni `CameraView.tsx`.
 
-3. **Gates que se cumplen con ruido**
-   - `stableHumanSignal` solo pide `quality ≥ 12` y `perfusionIndex ≥ 0.005`. El ruido del AGC + flash sobre cualquier objeto los cumple.
-   - El detector de picos (`HeartBeatProcessor`) tiene `prominence ≥ 2.2` sobre señal **ya normalizada × 120**: el ruido amplificado lo supera trivialmente.
+## Estructura final
 
-Resultado: la app reporta lo que *parece* un humano sano porque el propio pipeline está diseñado para alisar y sostener.
+```text
+src/lib/ppg/
+├── types.ts
+├── camera/
+│   ├── cameraCapabilities.ts
+│   └── cameraController.ts
+├── capture/
+│   ├── frameLoop.ts
+│   └── downsample.ts
+├── detection/
+│   └── fingerDetector.ts
+├── roi/
+│   └── adaptiveRoi.ts
+├── signal/
+│   ├── ringBuffer.ts
+│   ├── filters.ts
+│   ├── signalFusion.ts
+│   └── sqi.ts
+├── worker/
+│   └── ppgWorker.ts
+└── hooks/
+    └── usePpgCapture.ts
+```
 
-# Plan: modo "crudo total + solo bruto"
+## Fase 1 — Hardware y contratos (Prompt 1)
 
-Tu decisión:
-- **Salida visible: Crudo total** → seguir mostrando ondas y métricas siempre, aunque sean absurdas.
-- **Tratamiento: Solo bruto** → quitar EMA y retención; cada valor en pantalla es el cálculo directo del frame/ventana actual.
+- **`types.ts`**
+  - `PPG_CONFIG` (`as const`): `FPS_TARGET=30`, `DOWNSAMPLE={w:160,h:120}`, `ROI_GRID={cols:10,rows:8}`, `BANDPASS={lowHz:0.5,highHz:4.0}`, `RING_SECONDS=12`.
+  - Tipos: `PpgCaptureState` (`'idle'|'starting'|'running'|'degraded'|'error'`), `FrameSample` (timestamp, mediaTime, presentedFrames, droppedFrames, fpsInstant, r/g/b medios del ROI, perfusión, fingerDetected, roiWeights `Float32Array`), `PpgSignalSnapshot` (filtered `Float32Array`, sqi, perfusionIndex, skewness, kurtosis, fpsActual).
+  - Sin `any`. Sin clases.
+- **`camera/cameraCapabilities.ts`**
+  - `extractCapabilities(track: MediaStreamTrack): SafeCapabilities` y `extractSettings(...)` con narrowing seguro (`unknown` + type guards), nunca `any`.
+- **`camera/cameraController.ts`**
+  - Clase `CameraController` con array de fallbacks (`[1280x720@60, 1280x720@30, 640x480@30, facingMode:'environment']`) probados en cascada.
+  - `applyTorch()` y `applyFocusManual()` cada uno en su propio `try/catch` aislado; un fallo NO aborta `start()`. Reporta `degraded=true` en el estado.
+  - Devuelve `{ stream, track, state, capabilities }` listo para inyectar en `<video>`.
 
-## Cambios
+## Fase 2 — Bucle, downsample y ROI adaptativa (Prompt 2)
 
-### 1. `PPGSignalProcessor.extractBestPulseSignal` — quitar el "pulso fabricado"
-- Eliminar la división por baseline EMA. La señal cruda emitida será la **verdadera intensidad media del canal** (R, G o RG) **sin restar baseline** y **sin multiplicar × 3200**.
-- El `BandpassFilter` se queda — es el que convierte cualquier DC en oscilación honesta. Pero ya no estará alimentado con un "diff vs media móvil" (que es matemáticamente un pseudo‑pulso garantizado).
-- `pulseSource.strength` será la varianza real corta (std en ventana de 30 muestras) del canal seleccionado, no `|rPulse|·1000`.
+- **`capture/frameLoop.ts`**
+  - Usa `video.requestVideoFrameCallback` si existe; fallback a `requestAnimationFrame` solo si no.
+  - Calcula jitter real desde `metadata.mediaTime` y `presentedFrames`/`processingDuration`; expone `fpsInstant` y `droppedFrames`.
+- **`capture/downsample.ts`**
+  - `OffscreenCanvas` cuando esté disponible, si no `HTMLCanvasElement` oculto, ambos creados con `getContext('2d', { willReadFrequently: true })`.
+  - Reutiliza el mismo `ImageData` / buffer entre frames (sin re-alloc).
+- **`detection/fingerDetector.ts`**
+  - Itera `Uint8ClampedArray` con índices planos (`i+=4`) y variables primitivas (`r`,`g`,`b`,`luma`); cero objetos en el loop.
+  - Heurística: `r` dominante, ratios `r/g` y `r/b`, penaliza saturación (`r>252`) y oscuridad (`luma<20`); devuelve `fingerDetected:boolean` + score.
+- **`roi/adaptiveRoi.ts`**
+  - Particiona en `10x8` tiles; por tile calcula score = asimetría cromática − penalización clipping − penalización oscuridad.
+  - **EMA** sobre los pesos por tile (`alpha≈0.2`) para evitar saltos. Devuelve `Float32Array` de pesos normalizados que ponderan el promedio RGB.
 
-### 2. `Index.tsx` — siempre emitir, sin gate `stableHumanSignal`
-- Eliminar `stableHumanSignal` y el contador `unstableFrameCounter`. El bloque que pone vitales a 0/`INVALID` se borra.
-- `setHeartbeatSignal(heartBeatResult.filteredValue)` siempre — la onda se pinta venga de donde venga.
-- `setHeartRate(heartBeatResult.bpm)` siempre, aunque sea 0 o errático. Sin sanity gate "freezing".
-- `processVitalSigns(...)` se llama siempre con los `rrData` que produzca el `HeartBeatProcessor`, sin filtrar por `confidence > 0.18`.
-- El `VitalsSanityChecker` deja de **bloquear** la actualización: solo registra el verdict para auditoría (toast/log), pero los números mostrados son los crudos del frame.
+## Fase 3 — DSP, Worker y Hook React (Prompt 3)
 
-### 3. `VitalSignsProcessor` — eliminar EMA y retención
-- `smoothValue(...)` queda en passthrough: `return raw`. SpO₂, BP, glucosa, hemoglobina, lípidos se actualizan con el cálculo directo de la ventana actual.
-- `getFormattedResult()`: si la última iteración no produjo un valor (no hubo ciclos / RR insuficientes), devolver **0** para esa métrica en vez del previo. Sin "soft hold".
-- Quitar la guarda `if (!hasRealPulse) return getFormattedResult()` que congelaba previos: si no hay pulso, todo a 0 ese frame.
-- Eliminar las ventanas de validación (`spo2 > 70 && < 100`, etc.) que **descartaban** valores extremos: ahora se publica el número crudo, sea 42 o 187. Esto es exactamente el "ver la realidad" que pediste.
+- **`signal/ringBuffer.ts`**
+  - Clase genérica sobre `Float32Array` preasignado: `push(v)`, `last(n)`, `snapshot(out)`, `length`. Nunca `push/shift` de Array.
+- **`signal/filters.ts`**
+  - Biquad bandpass (Direct Form I o TDF II) con coeficientes recomputables vía `setSampleRate(fs)` usando los **FPS reales** del `frameLoop`.
+- **`signal/signalFusion.ts`**
+  - PCA cerrado sobre matriz de covarianza 3×3 (R,G,B): media incremental, covarianza, eigenvalues por **Cardano** (cúbica deprimida), eigenvectores por eliminación; proyecta sobre el componente principal con signo alineado al canal verde. Sin librerías matemáticas externas.
+- **`signal/sqi.ts`**
+  - Calcula sobre la ventana filtrada: AC/DC (perfusión), **skewness**, **kurtosis**, SNR en banda 0.7–4 Hz vs fuera de banda; combina en `sqi ∈ [0,1]`.
+- **`worker/ppgWorker.ts`**
+  - Worker dedicado (Vite `?worker`). Recibe muestras vía `postMessage(buffer, [buffer])` (Transferable, zero-copy). Mantiene ring buffers, filtro, PCA, SQI. Emite `PpgSignalSnapshot` también con Transferables.
+- **`hooks/usePpgCapture.ts`**
+  - Orquesta `CameraController` → `frameLoop` → `downsample` → `adaptiveRoi`/`fingerDetector` (main thread, barato) → envía RGB ponderado al worker.
+  - Estado React **throttled** a 5–10 Hz vía `requestAnimationFrame` + timestamp gate; el worker puede correr a 30/60 Hz internamente.
+  - Cleanup completo en `useEffect` (stop track, cancel rVFC, terminate worker).
 
-### 4. `HeartBeatProcessor` — quitar suavizado de BPM
-- Reemplazar `smoothBPM` por `instantBPM = 60000 / lastIBI` directamente.
-- Quitar el blend tiempo+frecuencia (`displayBPM = ... * 0.88 + frequencyBPM * 0.12`). Devolver solo el BPM instantáneo del último intervalo válido. Si no hay último intervalo: 0.
-- Mantener `MIN_PEAK_INTERVAL_MS` y la detección de picos como están — no toco el detector, solo dejo de mentir alisando.
+## Restricciones transversales (cumplidas en todo el plan)
 
-### 5. UI — etiqueta de modo
-- En el panel técnico ya existente (`advanced.*` / debug), añadir una línea visible permanente:
-  `MODO: CRUDO — sin EMA, sin gates, sin retención`
-  para que quede claro que lo que se ve es exactamente lo que el algoritmo decodifica frame a frame.
+- Tipado estricto: cero `any`, cero `// @ts-ignore`. Todos los DOM optionals vía type guards.
+- Cero `Math.random`, cero `mock/fake/synthetic/simulate` → pasa el guardrail anti-simulación existente (`scripts/check-no-simulation.mjs`).
+- Cero alocaciones en hot loops (píxeles, DSP). Buffers preasignados.
+- `applyConstraints` siempre aislado; degradación a luz ambiental sin abortar.
+- Zero-copy main↔worker con Transferables.
+- Coeficientes de filtro recomputados con FPS real, nunca asumiendo 30.
 
-## Lo que NO cambia
-- Captura de cámara, ROI, `BandpassFilter`, `LivenessEvaluator` (queda como telemetría informativa), `ArrhythmiaProcessor`, persistencia, UI estética.
-- No se reintroducen restricciones de "no dedo = no medir". La app **siempre mide**.
+## Fuera de alcance
 
-## Resultado esperado
-- Apuntando a una pared/objeto rojo: la onda mostrará el ruido real del sensor (mucho más errática y de menor amplitud que ahora), BPM saltará entre 0 y valores incoherentes, SpO₂/PA/glucosa cambiarán cuadro a cuadro o se quedarán en 0. Eso es la **prueba honesta** de que el algoritmo está procesando lo que llega de la cámara.
-- Con dedo real + flash: el verdadero pulso fisiológico aparece como una oscilación coherente real (no fabricada por baseline‑EMA), y como tal sí produce BPM/SpO₂ estables.
+- Integración con la UI actual (monitor, VitalSign, sanity log).
+- Estimadores de SpO₂/PA/HRV (vendrán en fases posteriores).
+- Tests unitarios (se pueden añadir si se solicita).
 
-## Tests
-- Actualizar `HeartBeatProcessor.regression.test.ts` (snapshot) para reflejar BPM instantáneo sin EMA.
-- Ajustar `Liveness.test.ts` solo para que no asuma valores suavizados.
-- `tsc` limpio.
+## Entregable
+
+11 archivos nuevos bajo `src/lib/ppg/`, sin tocar nada existente, compilando con el `tsconfig` actual y pasando los scripts de CI anti-simulación.

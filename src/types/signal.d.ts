@@ -10,8 +10,6 @@ export interface ProcessedSignal {
   fingerDetected: boolean;
   contactState: ContactState;
   motionArtifact?: boolean;
-  /** Continuous motion score in [0, +∞) from IMU; ~0 still, >0.6 = artifact. */
-  motionScore?: number;
   roi: {
     x: number;
     y: number;
@@ -21,10 +19,6 @@ export interface ProcessedSignal {
   perfusionIndex?: number;
   rawRed?: number;
   rawGreen?: number;
-  /** Multi-evidence liveness score in [0,1]. 0 means no human PPG detected. */
-  livenessScore?: number;
-  /** Reason code from the liveness evaluator (e.g. INERT_DC, NO_PERIODICITY). */
-  livenessReason?: string;
   diagnostics?: {
     message: string;
     hasPulsatility: boolean;

@@ -606,7 +606,7 @@ const Index = () => {
     totalBeatsRef.current = 0;
     arrhythmiaBeatsRef.current = 0;
     lastArrhythmiaCountForBeatsRef.current = 0;
-    vitalSignsFrameCounter.current = 0;
+    unstableFrameCounter.current = 0;
     setHeartbeatSignal(0);
     setBeatMarker(0);
     setRRIntervals([]);
@@ -635,40 +635,96 @@ const Index = () => {
     console.log('✅ Reset completado');
   }, [cameraStream, stopFrameLoop, stopProcessing, fullResetVitalSigns, resetHeartBeat]);
 
-  // === PROCESAR SEÑAL PPG (RAW MODE — siempre emite) ===
+  // === PROCESAR SEÑAL PPG ===
   const vitalSignsFrameCounter = useRef<number>(0);
+  const unstableFrameCounter = useRef<number>(0);
+  const UNSTABLE_ZERO_THRESHOLD = 15; // ~0.5s de señal mala antes de borrar vitales
   const VITALS_PROCESS_EVERY_N_FRAMES = 3;
-
+  
   useEffect(() => {
     if (!lastSignal || !isMonitoring) return;
-
+    
     const signalValue = lastSignal.filteredValue;
     const contactState = (lastSignal as any).contactState || (lastSignal.fingerDetected ? 'STABLE_CONTACT' : 'NO_CONTACT');
+    const stableHumanSignal =
+      contactState === 'STABLE_CONTACT' &&
+      (lastSignal.quality || 0) >= 12 &&
+      (lastSignal.perfusionIndex || 0) >= 0.005;
 
     const heartBeatResult = processHeartBeat(
       signalValue,
       contactState,
-      lastSignal.timestamp,
-      lastSignal.motionScore ?? 0
+      lastSignal.timestamp
     );
 
-    // RAW MODE: paint the waveform at all times, regardless of contact.
-    setHeartbeatSignal(heartBeatResult.filteredValue);
+    setHeartbeatSignal(stableHumanSignal ? heartBeatResult.filteredValue : 0);
 
-    // RAW MODE: sanity checker is informational only — it does NOT block UI.
+    if (!stableHumanSignal) {
+      unstableFrameCounter.current++;
+      
+      // Solo borrar vitales después de señal mala SOSTENIDA
+      if (unstableFrameCounter.current >= UNSTABLE_ZERO_THRESHOLD) {
+        setHeartRate(0);
+        vitalSignsFrameCounter.current = 0;
+        setBeatMarker(0);
+        setRRIntervals([]);
+        setArrhythmiaCount("--");
+        arrhythmiaDetectedRef.current = false;
+        setVitalSigns(prev => (
+          prev.measurementConfidence === 'INVALID' &&
+          prev.spo2 === 0 &&
+          prev.glucose === 0 &&
+          prev.hemoglobin === 0 &&
+          prev.pressure.systolic === 0 &&
+          prev.pressure.diastolic === 0
+            ? prev
+            : {
+                ...prev,
+                spo2: 0,
+                glucose: 0,
+                hemoglobin: 0,
+                pressure: { systolic: 0, diastolic: 0, confidence: 'INSUFFICIENT' as const, featureQuality: 0 },
+                arrhythmiaCount: 0,
+                arrhythmiaStatus: "SIN ARRITMIAS|0",
+                lipids: { totalCholesterol: 0, triglycerides: 0 },
+                lastArrhythmiaData: undefined,
+                signalQuality: 0,
+                measurementConfidence: 'INVALID'
+              }
+        ));
+      }
+      // Durante los primeros frames inestables, mantener último valor válido (no borrar)
+      return;
+    }
+
+    // Señal estable — resetear contador de inestabilidad
+    unstableFrameCounter.current = 0;
+    // Guardrail anti-simulación: si el stream de BPM se vuelve constante /
+    // repetitivo / fuera de rango fisiológico, congelamos la actualización
+    // y exponemos un estado de error en lugar de pintar datos sospechosos.
     const verdict = bpmSanityRef.current.push(heartBeatResult.bpm);
     if (verdict.ok === false) {
       const msg = `BPM stream ${verdict.reason} (${verdict.detail})`;
       if (sanityErrorRef.current !== verdict.reason) {
         sanityErrorRef.current = verdict.reason;
         setSanityError(msg);
+        const now = performance.now();
+        if (now - sanityToastAtRef.current > 5000) {
+          sanityToastAtRef.current = now;
+          toast({
+            variant: "destructive",
+            title: "⚠ Señal sospechosa detectada",
+            description: msg,
+          });
+        }
       }
-    } else if (sanityErrorRef.current) {
+      // No actualizamos heartRate ni vitales mientras el verdict sea inválido.
+      return;
+    }
+    if (sanityErrorRef.current) {
       sanityErrorRef.current = null;
       setSanityError(null);
     }
-
-    // Always publish raw BPM (0 if no peaks).
     setHeartRate(heartBeatResult.bpm);
 
     if (heartBeatResult.isPeak) {
@@ -687,6 +743,7 @@ const Index = () => {
     }
 
     vitalSignsFrameCounter.current++;
+
     if (vitalSignsFrameCounter.current >= VITALS_PROCESS_EVERY_N_FRAMES) {
       vitalSignsFrameCounter.current = 0;
       const rgbStats = getRGBStats();
@@ -696,37 +753,47 @@ const Index = () => {
           redAC: rgbStats.redAC,
           redDC: rgbStats.redDC,
           greenAC: rgbStats.greenAC,
-          greenDC: rgbStats.greenDC,
+          greenDC: rgbStats.greenDC
         });
       }
 
-      // RAW MODE: always pass whatever rrData we have, no confidence gate.
       const vitals = processVitalSigns(
         lastSignal.filteredValue,
-        heartBeatResult.rrData && heartBeatResult.rrData.intervals.length >= 2
+        heartBeatResult.rrData && heartBeatResult.rrData.intervals.length >= 2 && heartBeatResult.confidence > 0.18
           ? heartBeatResult.rrData
           : undefined
       );
 
       setVitalSigns(vitals);
 
-      const arrhythmiaStatus = vitals.arrhythmiaStatus;
-      if (arrhythmiaStatus) {
-        lastArrhythmiaData.current = vitals.lastArrhythmiaData || null;
-        const parts = arrhythmiaStatus.split('|');
-        const count = parts.length > 1 ? parts[1] : "0";
-        setArrhythmiaCount(count);
+      if (heartBeatResult.rrData && heartBeatResult.rrData.intervals.length >= 2 && heartBeatResult.confidence > 0.18 && vitals.measurementConfidence !== 'INVALID') {
+        const arrhythmiaStatus = vitals.arrhythmiaStatus;
+        if (arrhythmiaStatus) {
+          lastArrhythmiaData.current = vitals.lastArrhythmiaData || null;
+          const parts = arrhythmiaStatus.split('|');
+          const count = parts.length > 1 ? parts[1] : "0";
+          setArrhythmiaCount(count);
 
-        const isArrhythmiaDetected = arrhythmiaStatus.includes("ARRITMIA DETECTADA");
-        if (isArrhythmiaDetected !== arrhythmiaDetectedRef.current) {
-          arrhythmiaDetectedRef.current = isArrhythmiaDetected;
-          if (isArrhythmiaDetected && navigator.vibrate) {
-            navigator.vibrate([200, 100, 200]);
+          const isArrhythmiaDetected = arrhythmiaStatus.includes("ARRITMIA DETECTADA");
+          if (isArrhythmiaDetected !== arrhythmiaDetectedRef.current) {
+            arrhythmiaDetectedRef.current = isArrhythmiaDetected;
+
+            if (isArrhythmiaDetected) {
+              if (navigator.vibrate) {
+                navigator.vibrate([200, 100, 200]);
+              }
+              toast({
+                title: "⚠️ Arritmia detectada",
+                description: `Latido irregular #${vitals.arrhythmiaCount}`,
+                variant: "destructive",
+                duration: 4000
+              });
+            }
           }
         }
       }
     }
-  }, [lastSignal, isMonitoring, processHeartBeat, processVitalSigns, setRGBData, getRGBStats, vitalSigns.arrhythmiaCount]);
+  }, [lastSignal, isMonitoring, processHeartBeat, processVitalSigns, setRGBData, getRGBStats]);
 
   // AUTO-FINALIZAR a los 60 segundos (1 minuto)
   useEffect(() => {
@@ -1091,9 +1158,6 @@ const Index = () => {
                         <div className="text-white/40">err</div>
                         <div className="text-amber-300 truncate">{advanced.error ?? "—"}</div>
                       </div>
-                    </div>
-                    <div className="mt-2 text-[10px] font-mono text-amber-300/90 border-t border-white/10 pt-2">
-                      MODO: CRUDO — sin EMA, sin gates, sin retención
                     </div>
                   </div>
 

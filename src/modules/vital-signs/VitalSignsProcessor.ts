@@ -138,10 +138,10 @@ export class VitalSignsProcessor {
   }
 
   processSignal(
-    signalValue: number,
+    signalValue: number, 
     rrData?: { intervals: number[], lastPeakTime: number | null }
   ): VitalSignsResult {
-
+    
     // Actualizar historial
     this.signalHistory.push(signalValue);
     if (this.signalHistory.length > this.HISTORY_SIZE) {
@@ -156,24 +156,19 @@ export class VitalSignsProcessor {
       }
     }
 
-    // RAW MODE: zero-out all measurements every frame so the result strictly
-    // reflects what the algorithm just computed (no retention, no soft-hold).
-    this.measurements.spo2 = 0;
-    this.measurements.glucose = 0;
-    this.measurements.hemoglobin = 0;
-    this.measurements.systolicPressure = 0;
-    this.measurements.diastolicPressure = 0;
-    this.measurements.totalCholesterol = 0;
-    this.measurements.triglycerides = 0;
-    this.lastBPConfidence = 'INSUFFICIENT';
-    this.lastBPFeatureQuality = 0;
-
+    // Calcular SQI propio para control de calidad de signos vitales
     this.measurements.signalQuality = this.calculateSignalQuality();
 
-    // Track valid pulses for confidence reporting only — not gating output.
-    this.validateRealPulse(rrData);
+    // Validar pulso real
+    const hasRealPulse = this.validateRealPulse(rrData);
+    
+    if (!hasRealPulse) {
+      // Don't zero-out values that are already accumulated — just stop updating
+      // This prevents flicker when signal dips momentarily
+      return this.getFormattedResult();
+    }
 
-    // Always recompute on every frame with whatever we have.
+    // Calcular signos vitales — lowered from 30 to 20 samples, 3 to 2 intervals
     if (this.signalHistory.length >= 20 && rrData && rrData.intervals.length >= 2) {
       this.calculateVitalSigns(signalValue, rrData);
     }
@@ -279,76 +274,84 @@ export class VitalSignsProcessor {
     signalValue: number, 
     rrData: { intervals: number[], lastPeakTime: number | null }
   ): void {
-    // RAW MODE: no SQI gate. Compute and emit whatever the math produces.
-
-    // SpO2 — raw output from ratio-of-ratios (0 if inputs invalid).
+    const minQualityForCalculation = 10;
+    if (this.measurements.signalQuality < minQualityForCalculation) {
+      return;
+    }
+    
+    // SpO2 — lowest gate, always try first
     const spo2 = this.calculateSpO2Raw();
-    if (spo2 !== 0) {
-      this.measurements.spo2 = spo2;
+    if (spo2 !== 0 && spo2 > 70 && spo2 < 100) {
+      this.measurements.spo2 = this.smoothValue(this.measurements.spo2, spo2, 'stable');
       this.updateHistory('spo2', spo2);
     }
 
     const cycles = PPGFeatureExtractor.detectCardiacCycles(this.signalHistory, 30);
     const validCycleFeatures: import('./PPGFeatureExtractor').CycleFeatures[] = [];
-
+    
     for (const cycle of cycles) {
       const features = PPGFeatureExtractor.extractCycleFeatures(this.signalHistory, cycle, 30);
-      // RAW MODE: accept any feature-extraction output that isn't null.
-      if (features) {
+      if (features && features.quality >= 0.30) {  // lowered from 0.45
         validCycleFeatures.push(features);
       }
     }
 
-    // RAW MODE: use ALL intervals exactly as they came from the peak detector.
-    const allRR = rrData.intervals;
-    const avgRR = allRR.length > 0 ? allRR.reduce((a, b) => a + b, 0) / allRR.length : 0;
+    const validRR = rrData.intervals.filter(i => i >= 270 && i <= 2200);
+    const avgRR = validRR.length > 0 ? validRR.reduce((a, b) => a + b, 0) / validRR.length : 0;
     const hr = avgRR > 0 ? 60000 / avgRR : 0;
-    const rrVar = PPGFeatureExtractor.extractRRVariability(allRR);
+    const rrVar = PPGFeatureExtractor.extractRRVariability(validRR);
 
-    // BP — emit raw estimate regardless of confidence label.
-    if (allRR.length >= 2) {
+    // BP — try with 2+ valid RR
+    if (validRR.length >= 2) {
       const bpEstimate = this.bloodPressureProcessor.estimate(
-        this.signalHistory, allRR, 30
+        this.signalHistory, validRR, 30
       );
       this.lastBPConfidence = bpEstimate.confidence;
       this.lastBPFeatureQuality = bpEstimate.featureQuality;
-      if (bpEstimate.systolic > 0) {
-        this.measurements.systolicPressure = bpEstimate.systolic;
-        this.measurements.diastolicPressure = bpEstimate.diastolic;
+      if (bpEstimate.systolic > 0 && bpEstimate.confidence !== 'INSUFFICIENT') {
+        this.measurements.systolicPressure = this.smoothValue(this.measurements.systolicPressure, bpEstimate.systolic, 'stable');
+        this.measurements.diastolicPressure = this.smoothValue(this.measurements.diastolicPressure, bpEstimate.diastolic, 'stable');
         this.updateHistory('systolic', bpEstimate.systolic);
         this.updateHistory('diastolic', bpEstimate.diastolic);
       }
     }
 
-    // Glucose, Hemoglobin, Lipids — compute when we have any cycle features.
-    if (validCycleFeatures.length >= 1 && hr > 0) {
+    // Glucose, Hemoglobin, Lipids — need cycle features
+    if (validCycleFeatures.length >= 2 && hr >= 35 && hr <= 200 && this.measurements.signalQuality >= 15) {
       const medianF = this.medianCycleFeatures(validCycleFeatures);
-
+      
       const glucose = this.calculateGlucoseAdvanced(medianF, hr, rrVar);
-      if (glucose !== 0) {
-        this.measurements.glucose = glucose;
+      if (glucose > 40 && glucose < 400) {
+        this.measurements.glucose = this.smoothValue(this.measurements.glucose, glucose, 'dynamic');
         this.updateHistory('glucose', glucose);
       }
 
       const hemoglobin = this.calculateHemoglobinAdvanced(medianF);
-      if (hemoglobin !== 0) {
-        this.measurements.hemoglobin = hemoglobin;
+      if (hemoglobin > 5 && hemoglobin < 25) {
+        this.measurements.hemoglobin = this.smoothValue(this.measurements.hemoglobin, hemoglobin, 'stable');
         this.updateHistory('hemoglobin', hemoglobin);
       }
 
       const lipids = this.calculateLipidsAdvanced(medianF, hr, rrVar);
-      if (lipids.totalCholesterol !== 0) {
-        this.measurements.totalCholesterol = lipids.totalCholesterol;
-        this.measurements.triglycerides = lipids.triglycerides;
+      if (lipids.totalCholesterol > 80 && lipids.totalCholesterol < 400) {
+        this.measurements.totalCholesterol = this.smoothValue(this.measurements.totalCholesterol, lipids.totalCholesterol, 'dynamic');
+        this.measurements.triglycerides = this.smoothValue(this.measurements.triglycerides, lipids.triglycerides, 'dynamic');
       }
     }
 
-    // Arrhythmia — pass through whatever RRs we have.
-    const arrhythmiaInput = allRR.length >= 3 ? { ...rrData, intervals: allRR.slice(-10) } : undefined;
+    // Arrhythmia — solo con RR robustos y SQI suficiente
+    const arrhythmiaRR = validRR.slice(-10);
+    const arrhythmiaInput = (
+      arrhythmiaRR.length >= 5 &&
+      this.measurements.signalQuality >= 25 &&
+      hr >= 35 &&
+      hr <= 180
+    ) ? { ...rrData, intervals: arrhythmiaRR } : undefined;
+
     const arrhythmiaResult = this.arrhythmiaProcessor.processRRData(arrhythmiaInput);
     this.measurements.arrhythmiaStatus = arrhythmiaResult.arrhythmiaStatus;
     this.measurements.lastArrhythmiaData = arrhythmiaResult.lastArrhythmiaData;
-
+    
     const parts = arrhythmiaResult.arrhythmiaStatus.split('|');
     this.measurements.arrhythmiaCount = parts.length > 1 ? (parseInt(parts[1]) || 0) : 0;
   }
@@ -656,10 +659,34 @@ export class VitalSignsProcessor {
    * 
    * MEJORA: Detecta cambios bruscos y ajusta alpha dinámicamente
    */
-  // RAW MODE: smoothValue is a passthrough. Every UI tick shows the raw
-  // computation of the current frame/window — no EMA, no adaptive blending.
-  private smoothValue(_current: number, newVal: number, _type: 'stable' | 'dynamic' = 'stable'): number {
-    return newVal;
+  private smoothValue(current: number, newVal: number, type: 'stable' | 'dynamic' = 'stable'): number {
+    if (current === 0 || isNaN(current) || !isFinite(current)) return newVal; // Fast initial lock
+    if (isNaN(newVal) || !isFinite(newVal)) return current;
+    
+    const baseAlpha = type === 'stable' ? this.EMA_ALPHA_STABLE : this.EMA_ALPHA_DYNAMIC;
+    
+    // Calcular cambio relativo
+    const relativeChange = Math.abs(newVal - current) / (Math.abs(current) + 0.01);
+    
+    // Si el cambio es muy grande (>50%), podría ser ruido - suavizar más
+    // Si el cambio es moderado (<20%), responder más rápido
+    let adaptiveAlpha = baseAlpha;
+    
+    if (relativeChange > 0.5) {
+      // Cambio muy grande - probablemente ruido, suavizar mucho más
+      adaptiveAlpha = baseAlpha * 0.3;
+    } else if (relativeChange > 0.3) {
+      // Cambio grande - suavizar un poco más
+      adaptiveAlpha = baseAlpha * 0.5;
+    } else if (relativeChange < 0.1) {
+      // Cambio pequeño - responder más rápido para seguir tendencia
+      adaptiveAlpha = baseAlpha * 1.5;
+    }
+    
+    // Limitar alpha entre 0.05 y 0.4
+    adaptiveAlpha = Math.max(0.05, Math.min(0.4, adaptiveAlpha));
+    
+    return current * (1 - adaptiveAlpha) + newVal * adaptiveAlpha;
   }
 
   getCalibrationProgress(): number {

@@ -1,6 +1,5 @@
 import type { ProcessedSignal, ProcessingError, SignalProcessor as SignalProcessorInterface, ContactState } from '../../types/signal';
 import { BandpassFilter } from './BandpassFilter';
-import { LivenessEvaluator, type LivenessVerdict } from './LivenessEvaluator';
 import { createLogger, ppgPerf } from '../../utils/logger';
 import {
   DEFAULT_BACKPRESSURE_CONFIG,
@@ -116,22 +115,6 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   private lastSourceSwitch = 0;
   private readonly SOURCE_HYSTERESIS_MS = 2000;
 
-  // === LIVENESS GATE ===
-  private readonly liveness = new LivenessEvaluator(5, 30);
-  private lastLiveness: LivenessVerdict = {
-    score: 0,
-    reason: 'WARMING_UP',
-    acdcRed: 0,
-    acdcGreen: 0,
-    autocorrPeak: 0,
-    autocorrLag: 0,
-    cardiacToDriftRatio: 0,
-  };
-  private livenessFrameCounter = 0;
-  private readonly LIVENESS_EVAL_EVERY = 6; // ≈5 Hz at 30 fps; cheap.
-  private livenessOkStreak = 0;
-  private readonly LIVENESS_OK_STREAK_NEEDED = 8; // need consistent OK before STABLE.
-
   constructor(
     public onSignalReady?: (signal: ProcessedSignal) => void,
     public onError?: (error: ProcessingError) => void
@@ -178,13 +161,6 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
 
     if (this.contactState === 'NO_CONTACT') {
       this.signalQuality = 0;
-      this.liveness.reset();
-      this.livenessOkStreak = 0;
-      this.lastLiveness = {
-        score: 0, reason: 'WARMING_UP',
-        acdcRed: 0, acdcGreen: 0,
-        autocorrPeak: 0, autocorrLag: 0, cardiacToDriftRatio: 0,
-      };
       this.onSignalReady({
         timestamp,
         rawValue: 0,
@@ -197,8 +173,6 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
         perfusionIndex: 0,
         rawRed: roi.rawRed,
         rawGreen: roi.rawGreen,
-        livenessScore: 0,
-        livenessReason: 'WARMING_UP',
         diagnostics: {
           message: `BUSCANDO DEDO C:${(roi.coverageRatio * 100).toFixed(0)}%`,
           hasPulsatility: false,
@@ -240,23 +214,6 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       this.filteredBuffer.shift();
     }
 
-    // Feed liveness with the bandpassed signal + current FPS estimate.
-    this.liveness.pushFiltered(filtered, this.estimatedSampleRate);
-    this.livenessFrameCounter++;
-    if (this.livenessFrameCounter >= this.LIVENESS_EVAL_EVERY) {
-      this.livenessFrameCounter = 0;
-      this.lastLiveness = this.liveness.evaluate(
-        this.redAC, this.redDC, this.greenAC, this.greenDC,
-      );
-      if (this.lastLiveness.score >= 0.55 && this.lastLiveness.reason === 'OK') {
-        this.livenessOkStreak = Math.min(this.livenessOkStreak + 1, 100);
-      } else if (this.lastLiveness.score < 0.30) {
-        this.livenessOkStreak = 0;
-      } else {
-        this.livenessOkStreak = Math.max(0, this.livenessOkStreak - 1);
-      }
-    }
-
     const endDeriv = ppgPerf.start('derivatives');
     this.calculateDerivatives();
     endDeriv();
@@ -265,17 +222,12 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     endSqi();
 
     const perfusionIndex = this.calculatePerfusionIndex();
-    void this.livenessOkStreak; // informational only
     const adjustedQuality = motionArtifact
       ? Math.max(0, this.signalQuality * 0.75)
       : this.signalQuality;
-    // Continuous-measurement policy: liveness is informational only. The
-    // pipeline keeps emitting raw decoded vitals at all times so the real
-    // behavior of the algorithm can be observed and audited end-to-end.
     const gatedQuality = this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.005
       ? adjustedQuality
       : Math.min(18, adjustedQuality * 0.45);
-
 
     const now = Date.now();
     if (now - this.lastLogTime >= 2000) {
@@ -300,19 +252,15 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       fingerDetected: this.fingerDetected,
       contactState: this.contactState,
       motionArtifact,
-      motionScore: this.motionScore,
       roi: { x: 0, y: 0, width: imageData.width, height: imageData.height },
       perfusionIndex,
       rawRed: roi.rawRed,
       rawGreen: roi.rawGreen,
-      livenessScore: this.lastLiveness.score,
-      livenessReason: this.lastLiveness.reason,
       diagnostics: {
         message:
           `${pulseSource.label}:${pulseSource.strength.toFixed(1)} ` +
           `PI:${perfusionIndex.toFixed(2)} C:${(this.smoothedCoverage * 100).toFixed(0)} ` +
-          `${this.contactState}${motionArtifact ? ' MOV' : ''} M:${this.motionScore.toFixed(2)} ` +
-          `LIV:${(this.lastLiveness.score * 100).toFixed(0)}/${this.lastLiveness.reason}`,
+          `${this.contactState}${motionArtifact ? ' MOV' : ''}`,
         hasPulsatility: this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.05 && pulseSource.strength > 1.5,
         pulsatilityValue: this.contactState === 'STABLE_CONTACT' ? Math.max(perfusionIndex, pulseSource.strength * 0.02) : 0,
       },
@@ -331,8 +279,7 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
 
       if (this.fingerConfidenceCount >= this.FINGER_CONFIRM_FRAMES) {
         this.fingerDetected = true;
-        // STABLE requires real perfusion — liveness stays informational so
-        // measurement never stops while the user is testing the pipeline.
+        // Require real perfusion for STABLE — not just visual contact
         const perfusion = this.calculatePerfusionIndex();
         this.contactState = (this.stableContactCount >= this.STABLE_THRESHOLD && perfusion > 0.003)
           ? 'STABLE_CONTACT'
@@ -577,31 +524,26 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.blueBaseline = this.blueBaseline * (1 - alpha) + rawBlue * alpha;
   }
 
-  // === MULTI-SOURCE PPG EXTRACTION (Elgendi 2013, Allen 2007) ===
-  // Detrending = (channel − slow baseline). This is the standard PPG
-  // preprocessing step — it removes DC and very-low-frequency drift while
-  // preserving the cardiac AC. A modest gain (×80) brings the AC into the
-  // numeric range expected by the downstream bandpass + peak detector
-  // (prominence ≥ 2.2). NO ×3200 amplification (that was hiding noise as
-  // signal). Without contact, the contact-gate above already emits 0 →
-  // no fabricated waves can leak through.
-  private readonly PULSE_GAIN = 80;
+  // === MULTI-SOURCE COMPETITIVE EXTRACTION ===
   private extractBestPulseSignal(
-    rawRed: number, rawGreen: number, rawBlue: number, _motionArtifact: boolean
+    rawRed: number, rawGreen: number, rawBlue: number, motionArtifact: boolean
   ): { value: number; label: string; strength: number } {
-    void rawBlue;
-    // Detrended AC components (channel − slow EMA baseline).
-    const rAC = this.redBaseline > 0 ? (rawRed - this.redBaseline) : 0;
-    const gAC = this.greenBaseline > 0 ? (rawGreen - this.greenBaseline) : 0;
-    // Inverted convention: as blood volume increases, reflected light DROPS.
-    // Multiply by −1 so peaks correspond to systolic up-strokes (Allen 2007).
+    const rNorm = this.redBaseline > 0 ? (this.redBaseline - rawRed) / this.redBaseline : 0;
+    const gNorm = this.greenBaseline > 0 ? (this.greenBaseline - rawGreen) / this.greenBaseline : 0;
+    const bNorm = this.blueBaseline > 0 ? (this.blueBaseline - rawBlue) / this.blueBaseline : 0;
+
+    const clamp = (v: number) => this.clamp(v, -0.04, 0.04);
+    const rPulse = clamp(rNorm);
+    const gPulse = clamp(gNorm);
+
+    // Source candidates (CHROM removed — amplifies noise without finger)
     const sources: { [key: string]: number } = {
-      R: -rAC * this.PULSE_GAIN,
-      G: -gAC * this.PULSE_GAIN,
-      RG: -((rAC + gAC) * 0.5) * this.PULSE_GAIN,
+      R: rPulse * 3200,
+      G: gPulse * 3200,
+      RG: this.blendRG(rPulse, gPulse, rawRed, rawGreen, motionArtifact) * 3200,
     };
 
-    // Update per-source buffers (still useful for ranking on real variance).
+    // Update per-source buffers
     for (const key of Object.keys(sources)) {
       this.sourceBuffers[key].push(sources[key]);
       if (this.sourceBuffers[key].length > 120) {
@@ -609,22 +551,13 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       }
     }
 
+    // Rank sources every ~1 second (30 frames)
     if (this.frameCount % 30 === 0 && this.redBuffer.length >= 60) {
       this.rankSources();
     }
 
-    const value = sources[this.activeSource] ?? sources['RG'];
-
-    // Strength = real short-window std of the active source (not a
-    // fabricated metric derived from baseline-EMA division).
-    const buf = this.sourceBuffers[this.activeSource] ?? this.sourceBuffers['RG'];
-    let strength = 0;
-    if (buf.length >= 8) {
-      const recent = buf.slice(-30);
-      const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
-      const variance = recent.reduce((a, v) => a + (v - mean) ** 2, 0) / recent.length;
-      strength = Math.sqrt(variance);
-    }
+    const value = this.clamp(sources[this.activeSource] ?? sources['RG'], -80, 80);
+    const strength = Math.max(Math.abs(rPulse), Math.abs(gPulse)) * 1000;
 
     return { value, label: this.activeSource, strength };
   }
@@ -821,9 +754,6 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.blueDC = 0; this.blueAC = 0;
     this.sourceBuffers = { R: [], G: [], RG: [] };
     this.bandpassFilter.reset();
-    this.liveness.reset();
-    this.livenessOkStreak = 0;
-    this.livenessFrameCounter = 0;
   }
 
   reset(): void {
@@ -863,14 +793,6 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.resetBaselines();
     this.bandpassFilter.setSampleRate(this.estimatedSampleRate);
     this.bandpassFilter.reset();
-    this.liveness.reset();
-    this.livenessOkStreak = 0;
-    this.livenessFrameCounter = 0;
-    this.lastLiveness = {
-      score: 0, reason: 'WARMING_UP',
-      acdcRed: 0, acdcGreen: 0,
-      autocorrPeak: 0, autocorrLag: 0, cardiacToDriftRatio: 0,
-    };
   }
 
   private handleMotionEvent = (event: DeviceMotionEvent) => {

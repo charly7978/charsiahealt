@@ -65,8 +65,7 @@ export const useHeartBeatProcessor = () => {
   const processSignal = useCallback((
     value: number,
     contactState: ContactState = 'STABLE_CONTACT',
-    timestamp?: number,
-    motionScore: number = 0
+    timestamp?: number
   ): HeartBeatResult => {
     if (!processorRef.current || processingStateRef.current !== 'ACTIVE') {
       return {
@@ -113,7 +112,7 @@ export const useHeartBeatProcessor = () => {
     noContactFramesRef.current = 0;
     processedSignalsRef.current++;
 
-    const result = processorRef.current.processSignal(value, timestamp, motionScore);
+    const result = processorRef.current.processSignal(value, timestamp);
     const rrIntervals = processorRef.current.getRRIntervals();
     const lastPeakTime = processorRef.current.getLastPeakTime();
     const rrData = { intervals: rrIntervals, lastPeakTime: lastPeakTime || null };
