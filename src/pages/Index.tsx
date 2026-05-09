@@ -549,7 +549,7 @@ const Index = () => {
     
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
-      setCameraStream(null);
+      setCameraStream(null); setAdvVideoEl(null);
     }
     
     setIsMonitoring(false);
@@ -594,7 +594,7 @@ const Index = () => {
     
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
-      setCameraStream(null);
+      setCameraStream(null); setAdvVideoEl(null);
     }
     
     setIsMonitoring(false);
