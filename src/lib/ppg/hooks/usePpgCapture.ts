@@ -49,7 +49,7 @@ export interface UsePpgCaptureResult {
 export function usePpgCapture(
   options: UsePpgCaptureOptions,
 ): UsePpgCaptureResult {
-  const { video, active } = options;
+  const { video, active, useExternalVideo = false } = options;
 
   const [state, setState] = useState<PpgCaptureState>("idle");
   const [diagnostics, setDiagnostics] = useState<CameraDiagnostics | null>(
