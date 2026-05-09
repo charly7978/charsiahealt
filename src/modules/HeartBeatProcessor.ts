@@ -74,7 +74,7 @@ export class HeartBeatProcessor {
     document.addEventListener('click', unlock, { passive: true });
   }
 
-  processSignal(filteredValue: number, timestamp?: number): {
+  processSignal(filteredValue: number, timestamp?: number, motionScore: number = 0): {
     bpm: number;
     confidence: number;
     isPeak: boolean;
@@ -84,6 +84,7 @@ export class HeartBeatProcessor {
   } {
     this.frameCount++;
     const now = timestamp ?? Date.now();
+    this.currentMotionScore = motionScore;
 
     this.signalBuffer.push(filteredValue);
     this.timestampBuffer.push(now);
