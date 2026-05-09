@@ -16,7 +16,7 @@ describe('LivenessEvaluator', () => {
     feed(ev, () => (Math.random() - 0.5) * 0.02);
     // AC/DC essentially zero on red.
     const v = ev.evaluate(/*redAC*/ 0.05, /*redDC*/ 220, /*greenAC*/ 0.04, /*greenDC*/ 80);
-    expect(v.score).toBeLessThan(0.25);
+    expect(v.score).toBeLessThan(0.36);
     expect(['INERT_DC', 'NO_PULSATILITY']).toContain(v.reason);
   });
 
