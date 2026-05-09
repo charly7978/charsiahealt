@@ -1136,6 +1136,24 @@ const Index = () => {
                         <div className="text-white/40">kurt</div>
                         <div className="text-white">{(advanced.snapshot?.kurtosis ?? 0).toFixed(2)}</div>
                       </div>
+                      <div>
+                        <div className="text-white/40">R / G / B</div>
+                        <div className="text-white">
+                          {(advanced.snapshot?.meanR ?? 0).toFixed(0)}
+                          {" / "}
+                          {(advanced.snapshot?.meanG ?? 0).toFixed(0)}
+                          {" / "}
+                          {(advanced.snapshot?.meanB ?? 0).toFixed(0)}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">DC (G)</div>
+                        <div className="text-white">{(advanced.snapshot?.dcEstimate ?? 0).toFixed(1)}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">samples</div>
+                        <div className="text-white">{advanced.snapshot?.samplesProcessed ?? 0}</div>
+                      </div>
                       <div className="col-span-2">
                         <div className="text-white/40">err</div>
                         <div className="text-amber-300 truncate">{advanced.error ?? "—"}</div>
