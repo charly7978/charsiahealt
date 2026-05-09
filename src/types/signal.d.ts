@@ -10,6 +10,8 @@ export interface ProcessedSignal {
   fingerDetected: boolean;
   contactState: ContactState;
   motionArtifact?: boolean;
+  /** Continuous motion score in [0, +∞) from IMU; ~0 still, >0.6 = artifact. */
+  motionScore?: number;
   roi: {
     x: number;
     y: number;

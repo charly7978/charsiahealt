@@ -34,7 +34,14 @@ export class HeartBeatProcessor {
   private lastPeakValue = 0;
 
   private rrIntervals: number[] = [];
+  /** Per-IBI motion score at the time the beat was accepted. Parallel to rrIntervals. */
+  private rrMotionScores: number[] = [];
   private readonly MAX_RR_INTERVALS = 30;
+  /** IBIs whose motionScore exceeds this are excluded from BPM median. */
+  private readonly MOTION_TAINT_THRESHOLD = 0.6;
+  /** Above this, no new peak is accepted (frame fully rejected). */
+  private readonly MOTION_REJECT_THRESHOLD = 1.2;
+  private currentMotionScore = 0;
   private smoothBPM = 0;
   private frequencyBPM = 0;
   private periodicityScore = 0;
@@ -67,7 +74,7 @@ export class HeartBeatProcessor {
     document.addEventListener('click', unlock, { passive: true });
   }
 
-  processSignal(filteredValue: number, timestamp?: number): {
+  processSignal(filteredValue: number, timestamp?: number, motionScore: number = 0): {
     bpm: number;
     confidence: number;
     isPeak: boolean;
@@ -77,6 +84,7 @@ export class HeartBeatProcessor {
   } {
     this.frameCount++;
     const now = timestamp ?? Date.now();
+    this.currentMotionScore = motionScore;
 
     this.signalBuffer.push(filteredValue);
     this.timestampBuffer.push(now);
@@ -118,21 +126,35 @@ export class HeartBeatProcessor {
     const timeSinceLastPeak = this.lastPeakTime > 0 ? now - this.lastPeakTime : Number.MAX_SAFE_INTEGER;
     let isPeak = false;
 
-    if (timeSinceLastPeak >= this.MIN_PEAK_INTERVAL_MS) {
+    // === MOTION GATE ===
+    // Hard reject: severe motion → no peak this frame, but keep buffers
+    // (graceful resume when motion subsides).
+    const motionHardReject = this.currentMotionScore >= this.MOTION_REJECT_THRESHOLD;
+
+    if (!motionHardReject && timeSinceLastPeak >= this.MIN_PEAK_INTERVAL_MS) {
       isPeak = this.detectPeakWithScoring(timeSinceLastPeak);
 
       if (isPeak) {
         if (this.lastPeakTime > 0 && timeSinceLastPeak <= this.MAX_PEAK_INTERVAL_MS) {
           this.rrIntervals.push(timeSinceLastPeak);
+          this.rrMotionScores.push(this.currentMotionScore);
           if (this.rrIntervals.length > this.MAX_RR_INTERVALS) {
             this.rrIntervals.shift();
+            this.rrMotionScores.shift();
           }
 
-          // Robust BPM = 60000 / median(last 5 RR). No EMA blending,
-          // no frequency fallback — but median rejects single outlier beats
-          // (standard practice: Tarvainen 2014, Kubios HRV).
-          const tail = this.rrIntervals.slice(-5).sort((a, b) => a - b);
-          const medianIBI = tail[Math.floor(tail.length / 2)] ?? timeSinceLastPeak;
+          // Robust BPM = 60000 / median(last 5 CLEAN RR).
+          // IBIs whose motionScore exceeded MOTION_TAINT_THRESHOLD are
+          // excluded (Tarvainen 2014; Kubios HRV; Tamura 2014 motion-rejection
+          // for wearable PPG). If <2 clean IBIs remain, fall back to the raw
+          // tail rather than freezing the display indefinitely.
+          const tailLen = Math.min(8, this.rrIntervals.length);
+          const tailIbis = this.rrIntervals.slice(-tailLen);
+          const tailMot = this.rrMotionScores.slice(-tailLen);
+          const clean = tailIbis.filter((_, i) => tailMot[i] < this.MOTION_TAINT_THRESHOLD);
+          const usable = clean.length >= 2 ? clean : tailIbis;
+          const sorted = [...usable].slice(-5).sort((a, b) => a - b);
+          const medianIBI = sorted[Math.floor(sorted.length / 2)] ?? timeSinceLastPeak;
           this.smoothBPM = 60000 / medianIBI;
           this.consecutivePeaks++;
         }
@@ -333,11 +355,16 @@ export class HeartBeatProcessor {
     // === CANDIDATE SCORING ===
     let score = 0;
 
-    // Prominence gate: reject flat noise but accept real PPG
-    if (prominence < 2.2) return false;
+    // Prominence gate (motion-adaptive). Light motion (<0.6) = baseline 2.2;
+    // moderate motion ramps up to ~3.5; severe motion is already hard-rejected
+    // upstream. This rejects motion-induced spurious peaks (Tamura 2014).
+    const motionPenalty = 1 + Math.max(0, this.currentMotionScore - 0.2) * 1.2;
+    const prominenceGate = 2.2 * motionPenalty;
+    const risingGate = 0.8 * motionPenalty;
+    if (prominence < prominenceGate) return false;
 
     // Morphology gate: PPG has rising edge
-    if (risingSlope < 0.8) return false;
+    if (risingSlope < risingGate) return false;
 
     // Prominence (0-30 points)
     score += Math.min(30, prominence * 2.5);
@@ -434,6 +461,8 @@ export class HeartBeatProcessor {
     this.derivativeBuffer.clear();
     this.timestampBuffer.clear();
     this.rrIntervals = [];
+    this.rrMotionScores = [];
+    this.currentMotionScore = 0;
     this.smoothBPM = 0;
     this.frequencyBPM = 0;
     this.periodicityScore = 0;
