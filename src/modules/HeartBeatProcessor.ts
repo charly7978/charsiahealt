@@ -461,6 +461,8 @@ export class HeartBeatProcessor {
     this.derivativeBuffer.clear();
     this.timestampBuffer.clear();
     this.rrIntervals = [];
+    this.rrMotionScores = [];
+    this.currentMotionScore = 0;
     this.smoothBPM = 0;
     this.frequencyBPM = 0;
     this.periodicityScore = 0;
