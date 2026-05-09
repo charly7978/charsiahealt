@@ -37,10 +37,17 @@ export class HeartBeatProcessor {
   /** Per-IBI motion score at the time the beat was accepted. Parallel to rrIntervals. */
   private rrMotionScores: number[] = [];
   private readonly MAX_RR_INTERVALS = 30;
-  /** IBIs whose motionScore exceeds this are excluded from BPM median. */
-  private readonly MOTION_TAINT_THRESHOLD = 0.6;
-  /** Above this, no new peak is accepted (frame fully rejected). */
-  private readonly MOTION_REJECT_THRESHOLD = 1.2;
+  /** Baseline floors — auto-calibration can only TIGHTEN further, never relax. */
+  private readonly MOTION_TAINT_BASELINE = 0.6;
+  private readonly MOTION_REJECT_BASELINE = 1.2;
+  /** Active thresholds, updated after the calibration window. */
+  private motionTaintThreshold = this.MOTION_TAINT_BASELINE;
+  private motionRejectThreshold = this.MOTION_REJECT_BASELINE;
+  /** Auto-calibration: collect motionScore for first 30 s of session. */
+  private readonly MOTION_CAL_WINDOW_MS = 30_000;
+  private motionCalSamples: number[] = [];
+  private motionCalStartMs = 0;
+  private motionCalibrated = false;
   private currentMotionScore = 0;
   private smoothBPM = 0;
   private frequencyBPM = 0;
