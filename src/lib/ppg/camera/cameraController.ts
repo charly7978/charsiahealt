@@ -102,14 +102,21 @@ export class CameraController {
     let whiteBalanceManual = false;
 
     if (caps.torch) {
-      try {
-        await track.applyConstraints({
-          advanced: [{ torch: true } as MediaTrackConstraintSet],
-        });
-        torch = true;
-      } catch {
-        notes.push("torch_rejected");
+      // Some Android devices reject torch immediately after acquisition.
+      // Retry with a short backoff before giving up.
+      for (const delay of [0, 200, 500] as const) {
+        try {
+          if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+          await track.applyConstraints({
+            advanced: [{ torch: true } as MediaTrackConstraintSet],
+          });
+          torch = true;
+          break;
+        } catch {
+          // try next backoff
+        }
       }
+      if (!torch) notes.push("torch_rejected");
     } else {
       notes.push("torch_unsupported");
     }
@@ -131,6 +138,35 @@ export class CameraController {
           advanced: [{ exposureMode: "manual" } as MediaTrackConstraintSet],
         });
         exposureManual = true;
+
+        // Lock exposureTime to ~28ms (≈85% of 1/30s) — maximizes SNR
+        // without clipping. Without this, AGC keeps changing gain and
+        // injects 0.1–2 Hz noise into the cardiac band.
+        const rawCaps = (track.getCapabilities?.() ?? {}) as Record<string, unknown>;
+        const etRange = rawCaps["exposureTime"] as { min: number; max: number } | undefined;
+        if (etRange && typeof etRange.min === "number" && typeof etRange.max === "number") {
+          const targetEt = Math.round(Math.min(etRange.max, Math.max(etRange.min, 28000)));
+          try {
+            await track.applyConstraints({
+              advanced: [{ exposureTime: targetEt } as MediaTrackConstraintSet],
+            });
+          } catch {
+            notes.push("exposure_time_rejected");
+          }
+        }
+
+        // Lock ISO at the midpoint of the supported range to stop AGC drift.
+        const isoRange = rawCaps["iso"] as { min: number; max: number } | undefined;
+        if (isoRange && typeof isoRange.min === "number" && typeof isoRange.max === "number") {
+          const targetIso = Math.round((isoRange.min + isoRange.max) / 2);
+          try {
+            await track.applyConstraints({
+              advanced: [{ iso: targetIso } as MediaTrackConstraintSet],
+            });
+          } catch {
+            notes.push("iso_rejected");
+          }
+        }
       } catch {
         notes.push("exposure_manual_rejected");
       }
