@@ -11,7 +11,7 @@ import { useHealthAnalysis } from "@/hooks/useHealthAnalysis";
 import PPGSignalMeter from "@/components/PPGSignalMeter";
 import { VitalSignsResult } from "@/modules/vital-signs/VitalSignsProcessor";
 import { toast } from "@/components/ui/use-toast";
-import { ppgPerf } from "@/utils/logger";
+// ppgPerf removed — frame capture moved to Worker pipeline
 import { usePerfTelemetry, getPerfConsent, setPerfConsent } from "@/hooks/usePerfTelemetry";
 import type { BackpressureConfig } from "@/lib/perf/backpressureConfig";
 import { VitalsSanityChecker } from "@/lib/sanity/vitalsSanity";
@@ -180,13 +180,8 @@ const Index = () => {
     useExternalVideo: true,
   });
   
-  // HOOKS DE PROCESAMIENTO
+  // HOOKS DE PROCESAMIENTO (legacy signal processor kept for backpressure config only)
   const { 
-    startProcessing, 
-    stopProcessing, 
-    isProcessing, 
-    framesProcessed,
-    getRGBStats,
     getBackpressureState,
     getBackpressureConfig,
     setBackpressureConfig,
@@ -383,7 +378,6 @@ const Index = () => {
     setVitalSigns(prev => ({ ...prev, arrhythmiaStatus: "SIN ARRITMIAS|0" }));
     
     // Iniciar procesamiento
-    startProcessing();
     setIsCameraOn(true);
     setIsMonitoring(true);
     
@@ -406,7 +400,7 @@ const Index = () => {
     startCalibration();
     setTimeout(() => setIsCalibrating(false), 3000);
     
-  }, [isMonitoring, startProcessing, startCalibration, enterFullScreen, sanityProfileId]);
+  }, [isMonitoring, startCalibration, enterFullScreen, sanityProfileId]);
 
   // === CUANDO LA CÁMARA ESTÁ LISTA ===
   const handleStreamReady = useCallback((stream: MediaStream) => {
@@ -431,16 +425,13 @@ const Index = () => {
     if (navigator.vibrate) {
       navigator.vibrate([100, 50, 100, 50, 200]);
     }
-    // Detener loop primero (ya no hay frame loop del main thread)
-    
     // Detener timer
     if (measurementTimerRef.current) {
       clearInterval(measurementTimerRef.current);
       measurementTimerRef.current = null;
     }
     
-    // Detener procesadores
-    stopProcessing();
+    // Detener procesadores (legacy - kept for cleanup)
     
     if (isCalibrating) {
       forceCalibrationCompletion();
@@ -487,7 +478,7 @@ const Index = () => {
     setCalibrationProgress(0);
     
     if (import.meta.env.DEV) console.log('Medición finalizada y guardada');
-  }, [isMonitoring, isCalibrating, cameraStream, stopProcessing, forceCalibrationCompletion, resetVitalSigns, saveMeasurement, heartRate, vitalSigns]);
+  }, [isMonitoring, isCalibrating, cameraStream, forceCalibrationCompletion, resetVitalSigns, saveMeasurement, heartRate, vitalSigns]);
 
   // === RESET COMPLETO ===
   const handleReset = useCallback(() => {
@@ -498,7 +489,6 @@ const Index = () => {
       measurementTimerRef.current = null;
     }
     
-    stopProcessing();
     fullResetVitalSigns();
     resetHeartBeat();
     
@@ -545,7 +535,7 @@ const Index = () => {
     arrhythmiaDetectedRef.current = false;
     
     if (import.meta.env.DEV) console.log('Reset completado');
-  }, [cameraStream, stopProcessing, fullResetVitalSigns, resetHeartBeat]);
+  }, [cameraStream, fullResetVitalSigns, resetHeartBeat]);
 
   // === PROCESAR SEÑAL PPG ===
   const vitalSignsFrameCounter = useRef<number>(0);
@@ -664,14 +654,18 @@ const Index = () => {
 
     if (vitalSignsFrameCounter.current >= VITALS_PROCESS_EVERY_N_FRAMES) {
       vitalSignsFrameCounter.current = 0;
-      const rgbStats = getRGBStats();
+      // Derive RGB stats from the worker snapshot (AC estimated from perfusion)
+      const snapMeanR = snap.meanR ?? 0;
+      const snapMeanG = snap.meanG ?? 0;
+      const snapDC = snap.dcEstimate ?? 0;
+      const snapPI = snap.perfusionIndex ?? 0;
 
-      if (rgbStats.redDC > 0 && rgbStats.greenDC > 0) {
+      if (snapMeanR > 5 && snapMeanG > 5) {
         setRGBData({
-          redAC: rgbStats.redAC,
-          redDC: rgbStats.redDC,
-          greenAC: rgbStats.greenAC,
-          greenDC: rgbStats.greenDC
+          redAC: snapMeanR * snapPI,
+          redDC: snapMeanR,
+          greenAC: snapMeanG * snapPI,
+          greenDC: snapMeanG
         });
       }
 
@@ -711,7 +705,7 @@ const Index = () => {
         }
       }
     }
-  }, [advanced.snapshot, advanced.fingerDetected, isMonitoring, processHeartBeat, processVitalSigns, setRGBData, getRGBStats]);
+  }, [advanced.snapshot, advanced.fingerDetected, isMonitoring, processHeartBeat, processVitalSigns, setRGBData]);
 
   // AUTO-FINALIZAR a los 60 segundos (1 minuto)
   useEffect(() => {
