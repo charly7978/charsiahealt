@@ -43,6 +43,14 @@ export interface WorkerOutboundSnapshot {
   readonly kurtosis: number;
   readonly fpsActual: number;
   readonly samples: number;
+  /** Smoothed mean R/G/B in [0..255], suitable as input to SpO2 / lipids heads. */
+  readonly meanR: number;
+  readonly meanG: number;
+  readonly meanB: number;
+  /** Current Green-channel DC estimate (used for absorbance-style metrics). */
+  readonly dcEstimate: number;
+  /** Total samples processed since worker init (or last reset). */
+  readonly samplesProcessed: number;
 }
 
 const ringCapacity = Math.max(
@@ -62,6 +70,11 @@ let dcInitialized = false;
 let snapshotBuffer = new Float32Array(ringCapacity);
 let lastEmit = 0;
 let sampleCount = 0;
+// Smoothed RGB means (EMA in RGB space) for downstream vital estimators.
+let meanR = 0;
+let meanG = 0;
+let meanB = 0;
+const RGB_EMA_ALPHA = 0.15;
 let sqiWeights: SqiWeights = {
   perfusionScale: 25,
   weightPerfusion: 0.55,
