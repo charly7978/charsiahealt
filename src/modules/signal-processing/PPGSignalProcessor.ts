@@ -300,6 +300,7 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       fingerDetected: this.fingerDetected,
       contactState: this.contactState,
       motionArtifact,
+      motionScore: this.motionScore,
       roi: { x: 0, y: 0, width: imageData.width, height: imageData.height },
       perfusionIndex,
       rawRed: roi.rawRed,
@@ -310,7 +311,7 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
         message:
           `${pulseSource.label}:${pulseSource.strength.toFixed(1)} ` +
           `PI:${perfusionIndex.toFixed(2)} C:${(this.smoothedCoverage * 100).toFixed(0)} ` +
-          `${this.contactState}${motionArtifact ? ' MOV' : ''} ` +
+          `${this.contactState}${motionArtifact ? ' MOV' : ''} M:${this.motionScore.toFixed(2)} ` +
           `LIV:${(this.lastLiveness.score * 100).toFixed(0)}/${this.lastLiveness.reason}`,
         hasPulsatility: this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.05 && pulseSource.strength > 1.5,
         pulsatilityValue: this.contactState === 'STABLE_CONTACT' ? Math.max(perfusionIndex, pulseSource.strength * 0.02) : 0,
