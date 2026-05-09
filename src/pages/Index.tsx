@@ -477,6 +477,8 @@ const Index = () => {
   const handleStreamReady = useCallback((stream: MediaStream) => {
     console.log('📹 Stream recibido');
     setCameraStream(stream);
+    // Hand the same <video> element to the advanced engine.
+    setAdvVideoEl(cameraRef.current?.getVideoElement() ?? null);
     
     // Esperar a que el video esté listo y comenzar captura
     setTimeout(() => {
