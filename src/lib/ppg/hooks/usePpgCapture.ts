@@ -165,13 +165,13 @@ export function usePpgCapture(
       loopRef.current = loop;
       loop.start();
 
-      setState(result.state);
+      setState(controllerRef.current?.getState() ?? "running");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Capture failed.");
       setState("error");
       await stop();
     }
-  }, [video, stop]);
+  }, [video, stop, useExternalVideo]);
 
   useEffect(() => {
     if (active) void start();
