@@ -1,5 +1,5 @@
 
-import { useState, useEffect, useCallback, useRef, useReducer } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { PPGSignalProcessor } from '../modules/signal-processing/PPGSignalProcessor';
 import { ProcessedSignal, ProcessingError } from '../types/signal';
 import {
@@ -15,13 +15,9 @@ import {
 export const useSignalProcessor = () => {
   const processorRef = useRef<PPGSignalProcessor | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
-  type SignalState = { signal: ProcessedSignal | null; count: number };
-  const [sigState, dispatch] = useReducer(
-    (s: SignalState, sig: ProcessedSignal) => ({ signal: sig, count: (s.count + 1) % 10000 }),
-    { signal: null, count: 0 }
-  );
+  const [lastSignal, setLastSignal] = useState<ProcessedSignal | null>(null);
   const [error, setError] = useState<ProcessingError | null>(null);
-  const errorRef = useRef<ProcessingError | null>(null);
+  const [framesProcessed, setFramesProcessed] = useState(0);
   const [currentStride, setCurrentStride] = useState<number>(3);
   
   // CONTROL ÚNICO DE INSTANCIA - PREVENIR DUPLICIDADES ABSOLUTAMENTE
@@ -47,17 +43,15 @@ export const useSignalProcessor = () => {
     const onSignalReady = (signal: ProcessedSignal) => {
       if (initializationState.current !== 'READY') return;
       
-      dispatch(signal);
-      if (errorRef.current !== null) {
-        setError(null);
-        errorRef.current = null;
-      }
+      setLastSignal(signal);
+      setError(null);
+      // CRÍTICO: Limitar contador para evitar números infinitos que afectan rendimiento
+      setFramesProcessed(prev => (prev + 1) % 10000);
     };
 
-    const onError = (processingError: ProcessingError) => {
-      console.error(`Error procesador: ${processingError.code}`);
-      setError(processingError);
-      errorRef.current = processingError;
+    const onError = (error: ProcessingError) => {
+      console.error(`Error procesador: ${error.code}`);
+      setError(error);
     };
 
     // CREAR PROCESADOR ÚNICO
@@ -92,8 +86,8 @@ export const useSignalProcessor = () => {
     }
     
     setIsProcessing(true);
+    setFramesProcessed(0);
     setError(null);
-    errorRef.current = null;
     
     processorRef.current.start();
   }, [isProcessing]);
@@ -107,6 +101,8 @@ export const useSignalProcessor = () => {
     // Primero detener el procesador, luego actualizar estado
     processorRef.current.stop();
     setIsProcessing(false);
+    setLastSignal(null);
+    setFramesProcessed(0);
   }, []);
 
   // CALIBRACIÓN ÚNICA
@@ -189,9 +185,9 @@ export const useSignalProcessor = () => {
 
   return {
     isProcessing,
-    lastSignal: sigState.signal,
+    lastSignal,
     error,
-    framesProcessed: sigState.count,
+    framesProcessed,
     currentStride,
     startProcessing,
     stopProcessing,

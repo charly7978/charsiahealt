@@ -11,7 +11,7 @@ import { useHealthAnalysis } from "@/hooks/useHealthAnalysis";
 import PPGSignalMeter from "@/components/PPGSignalMeter";
 import { VitalSignsResult } from "@/modules/vital-signs/VitalSignsProcessor";
 import { toast } from "@/components/ui/use-toast";
-// ppgPerf removed — frame capture moved to Worker pipeline
+import { ppgPerf } from "@/utils/logger";
 import { usePerfTelemetry, getPerfConsent, setPerfConsent } from "@/hooks/usePerfTelemetry";
 import type { BackpressureConfig } from "@/lib/perf/backpressureConfig";
 import { VitalsSanityChecker } from "@/lib/sanity/vitalsSanity";
@@ -91,6 +91,10 @@ const Index = () => {
   const arrhythmiaDetectedRef = useRef(false);
   const lastArrhythmiaData = useRef<{ timestamp: number; rmssd: number; rrVariation: number; } | null>(null);
   const cameraRef = useRef<CameraViewHandle>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const frameLoopRef = useRef<number | null>(null);
+  const isProcessingRef = useRef(false);
   // anti-sim-allow: reason="Wires up the runtime detector for fabricated vitals streams." ref="GUARDRAIL-DIST-RUNTIME"
   // Runtime guardrail: detect implausible vitals streams.
   const [sanityProfileId, setSanityProfileId] = useState<string>(() => getActiveProfileId());
@@ -180,8 +184,15 @@ const Index = () => {
     useExternalVideo: true,
   });
   
-  // HOOKS DE PROCESAMIENTO (legacy signal processor kept for backpressure config only)
+  // HOOKS DE PROCESAMIENTO
   const { 
+    startProcessing, 
+    stopProcessing, 
+    lastSignal, 
+    processFrame, 
+    isProcessing, 
+    framesProcessed,
+    getRGBStats,
     getBackpressureState,
     getBackpressureConfig,
     setBackpressureConfig,
@@ -224,9 +235,9 @@ const Index = () => {
     context: {
       getCamera: () => cameraRef.current?.getDiagnostics?.() ?? {},
       getPipeline: () => ({
-        sqi: (advanced.snapshot?.sqi ?? 0) * 100,
-        fingerDetected: advanced.fingerDetected,
-        perfusionIndex: advanced.snapshot?.perfusionIndex ?? 0,
+        sqi: lastSignal?.quality ?? 0,
+        fingerDetected: !!lastSignal?.fingerDetected,
+        perfusionIndex: lastSignal?.perfusionIndex ?? 0,
         bpm: heartRate,
         spo2: vitalSigns.spo2,
         confidence: vitalSigns.measurementConfidence,
@@ -281,8 +292,18 @@ const Index = () => {
     }
   }, [currentStride, isMonitoring, getBackpressureConfig]);
 
-  // (Canvas de captura eliminado — el pipeline del Worker reemplaza
-  // la captura de píxeles en el hilo principal.)
+  // CANVAS PARA CAPTURA
+  useEffect(() => {
+    if (!canvasRef.current) {
+      canvasRef.current = document.createElement('canvas');
+      canvasRef.current.width = 320;
+      canvasRef.current.height = 240;
+      ctxRef.current = canvasRef.current.getContext('2d', { 
+        willReadFrequently: true,
+        alpha: false 
+      });
+    }
+  }, []);
 
   // PANTALLA COMPLETA
   const enterFullScreen = async () => {
@@ -355,14 +376,63 @@ const Index = () => {
     }
   }, [lastValidResults, isMonitoring]);
 
-  // (Frame loop del hilo principal eliminado — toda la captura y DSP
-  // ahora corre en el Web Worker vía usePpgCapture.)
+  // === LOOP DE CAPTURA — requestVideoFrameCallback con fallback RAF ===
+  const startFrameLoop = useCallback(() => {
+    if (isProcessingRef.current) return;
+    isProcessingRef.current = true;
+    
+    const canvas = canvasRef.current;
+    const ctx = ctxRef.current;
+    if (!canvas || !ctx) {
+      isProcessingRef.current = false;
+      return;
+    }
+
+    const captureOneFrame = () => {
+      if (!isProcessingRef.current) return;
+      const video = cameraRef.current?.getVideoElement();
+      if (!video || video.readyState < 2 || video.videoWidth === 0) {
+        frameLoopRef.current = requestAnimationFrame(() => captureOneFrame());
+        return;
+      }
+      try {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        processFrame(imageData);
+      } catch {}
+      scheduleNext(video);
+    };
+
+    const scheduleNext = (video: HTMLVideoElement) => {
+      if (!isProcessingRef.current) return;
+      if ('requestVideoFrameCallback' in video) {
+        (video as any).requestVideoFrameCallback((_now: number, metadata: any) => {
+          ppgPerf.markFrame(metadata);
+          captureOneFrame();
+        });
+      } else {
+        ppgPerf.markFrame();
+        frameLoopRef.current = requestAnimationFrame(() => captureOneFrame());
+      }
+    };
+    
+    console.log('🎬 Captura iniciada (requestVideoFrameCallback)');
+    captureOneFrame();
+  }, [processFrame]);
+
+  const stopFrameLoop = useCallback(() => {
+    isProcessingRef.current = false;
+    if (frameLoopRef.current) {
+      cancelAnimationFrame(frameLoopRef.current);
+      frameLoopRef.current = null;
+    }
+  }, []);
 
   // === INICIO DE MONITOREO ===
   const startMonitoring = useCallback(() => {
     if (isMonitoring) return;
     
-    if (import.meta.env.DEV) console.log('Iniciando monitoreo...');
+    console.log('🚀 Iniciando monitoreo...');
     
     if (navigator.vibrate) {
       navigator.vibrate([200]);
@@ -378,6 +448,7 @@ const Index = () => {
     setVitalSigns(prev => ({ ...prev, arrhythmiaStatus: "SIN ARRITMIAS|0" }));
     
     // Iniciar procesamiento
+    startProcessing();
     setIsCameraOn(true);
     setIsMonitoring(true);
     
@@ -400,23 +471,43 @@ const Index = () => {
     startCalibration();
     setTimeout(() => setIsCalibrating(false), 3000);
     
-  }, [isMonitoring, startCalibration, enterFullScreen, sanityProfileId]);
+  }, [isMonitoring, startProcessing, startCalibration, enterFullScreen, sanityProfileId]);
 
   // === CUANDO LA CÁMARA ESTÁ LISTA ===
   const handleStreamReady = useCallback((stream: MediaStream) => {
-    if (import.meta.env.DEV) console.log('Stream recibido');
+    console.log('📹 Stream recibido');
     setCameraStream(stream);
     // Hand the same <video> element to the advanced engine.
     setAdvVideoEl(cameraRef.current?.getVideoElement() ?? null);
-    // El Worker pipeline (usePpgCapture) arranca automáticamente cuando
-    // active=true y el video element está disponible.
-  }, []);
+    
+    // Esperar a que el video esté listo y comenzar captura
+    setTimeout(() => {
+      const video = cameraRef.current?.getVideoElement();
+      if (video && video.readyState >= 2) {
+        console.log('✅ Video listo:', video.videoWidth, 'x', video.videoHeight);
+        startFrameLoop();
+      } else {
+        // Reintentar
+        const checkReady = setInterval(() => {
+          const v = cameraRef.current?.getVideoElement();
+          if (v && v.readyState >= 2 && v.videoWidth > 0) {
+            clearInterval(checkReady);
+            console.log('✅ Video listo (retry):', v.videoWidth, 'x', v.videoHeight);
+            startFrameLoop();
+          }
+        }, 100);
+        
+        // Timeout después de 5 segundos
+        setTimeout(() => clearInterval(checkReady), 5000);
+      }
+    }, 500);
+  }, [startFrameLoop]);
 
   // === FINALIZAR MEDICIÓN ===
   const finalizeMeasurement = useCallback(async () => {
     if (!isMonitoring) return;
     
-    if (import.meta.env.DEV) console.log('Finalizando medición...');
+    console.log('🛑 Finalizando medición...');
     
     // Sonido de finalización
     playCompletionSound();
@@ -425,13 +516,17 @@ const Index = () => {
     if (navigator.vibrate) {
       navigator.vibrate([100, 50, 100, 50, 200]);
     }
+    // Detener loop primero
+    stopFrameLoop();
+    
     // Detener timer
     if (measurementTimerRef.current) {
       clearInterval(measurementTimerRef.current);
       measurementTimerRef.current = null;
     }
     
-    // Detener procesadores (legacy - kept for cleanup)
+    // Detener procesadores
+    stopProcessing();
     
     if (isCalibrating) {
       forceCalibrationCompletion();
@@ -445,7 +540,7 @@ const Index = () => {
       await saveMeasurement({
         heartRate,
         vitalSigns: dataToSave,
-        signalQuality: (advanced.snapshot?.sqi || 0) * 100
+        signalQuality: lastSignal?.quality || 0
       });
     }
     
@@ -477,18 +572,21 @@ const Index = () => {
     setElapsedTime(0);
     setCalibrationProgress(0);
     
-    if (import.meta.env.DEV) console.log('Medición finalizada y guardada');
-  }, [isMonitoring, isCalibrating, cameraStream, forceCalibrationCompletion, resetVitalSigns, saveMeasurement, heartRate, vitalSigns]);
+    console.log('✅ Medición finalizada y guardada');
+  }, [isMonitoring, isCalibrating, cameraStream, stopFrameLoop, stopProcessing, forceCalibrationCompletion, resetVitalSigns, saveMeasurement, heartRate, vitalSigns, lastSignal]);
 
   // === RESET COMPLETO ===
   const handleReset = useCallback(() => {
-    if (import.meta.env.DEV) console.log('Reset completo...');
+    console.log('🔄 Reset completo...');
+    
+    stopFrameLoop();
     
     if (measurementTimerRef.current) {
       clearInterval(measurementTimerRef.current);
       measurementTimerRef.current = null;
     }
     
+    stopProcessing();
     fullResetVitalSigns();
     resetHeartBeat();
     
@@ -534,8 +632,8 @@ const Index = () => {
     setCalibrationProgress(0);
     arrhythmiaDetectedRef.current = false;
     
-    if (import.meta.env.DEV) console.log('Reset completado');
-  }, [cameraStream, fullResetVitalSigns, resetHeartBeat]);
+    console.log('✅ Reset completado');
+  }, [cameraStream, stopFrameLoop, stopProcessing, fullResetVitalSigns, resetHeartBeat]);
 
   // === PROCESAR SEÑAL PPG ===
   const vitalSignsFrameCounter = useRef<number>(0);
@@ -544,26 +642,19 @@ const Index = () => {
   const VITALS_PROCESS_EVERY_N_FRAMES = 3;
   
   useEffect(() => {
-    if (!isMonitoring) return;
-
-    // Use the worker pipeline snapshot as the signal source.
-    const snap = advanced.snapshot;
-    if (!snap || !snap.filtered || snap.filtered.length === 0) return;
-
-    const signalValue = snap.filtered[snap.filtered.length - 1];
-    const contactState = advanced.fingerDetected ? 'STABLE_CONTACT' as const : 'NO_CONTACT' as const;
-    const quality = snap.sqi ?? 0;           // Worker SQI: range [0, 1]
-    const qualityPct = quality * 100;          // Scale to 0-100 for UI
-    const perfIdx = snap.perfusionIndex ?? 0;
+    if (!lastSignal || !isMonitoring) return;
+    
+    const signalValue = lastSignal.filteredValue;
+    const contactState = (lastSignal as any).contactState || (lastSignal.fingerDetected ? 'STABLE_CONTACT' : 'NO_CONTACT');
     const stableHumanSignal =
       contactState === 'STABLE_CONTACT' &&
-      quality >= 0.12 &&
-      perfIdx >= 0.005;
+      (lastSignal.quality || 0) >= 12 &&
+      (lastSignal.perfusionIndex || 0) >= 0.005;
 
     const heartBeatResult = processHeartBeat(
       signalValue,
       contactState,
-      Date.now()
+      lastSignal.timestamp
     );
 
     setHeartbeatSignal(stableHumanSignal ? heartBeatResult.filteredValue : 0);
@@ -655,23 +746,19 @@ const Index = () => {
 
     if (vitalSignsFrameCounter.current >= VITALS_PROCESS_EVERY_N_FRAMES) {
       vitalSignsFrameCounter.current = 0;
-      // Derive RGB stats from the worker snapshot (AC estimated from perfusion)
-      const snapMeanR = snap.meanR ?? 0;
-      const snapMeanG = snap.meanG ?? 0;
-      const snapDC = snap.dcEstimate ?? 0;
-      const snapPI = snap.perfusionIndex ?? 0;
+      const rgbStats = getRGBStats();
 
-      if (snapMeanR > 5 && snapMeanG > 5) {
+      if (rgbStats.redDC > 0 && rgbStats.greenDC > 0) {
         setRGBData({
-          redAC: snapMeanR * snapPI,
-          redDC: snapMeanR,
-          greenAC: snapMeanG * snapPI,
-          greenDC: snapMeanG
+          redAC: rgbStats.redAC,
+          redDC: rgbStats.redDC,
+          greenAC: rgbStats.greenAC,
+          greenDC: rgbStats.greenDC
         });
       }
 
       const vitals = processVitalSigns(
-        signalValue,
+        lastSignal.filteredValue,
         heartBeatResult.rrData && heartBeatResult.rrData.intervals.length >= 2 && heartBeatResult.confidence > 0.18
           ? heartBeatResult.rrData
           : undefined
@@ -706,7 +793,7 @@ const Index = () => {
         }
       }
     }
-  }, [advanced.snapshot, advanced.fingerDetected, isMonitoring, processHeartBeat, processVitalSigns, setRGBData]);
+  }, [lastSignal, isMonitoring, processHeartBeat, processVitalSigns, setRGBData, getRGBStats]);
 
   // AUTO-FINALIZAR a los 60 segundos (1 minuto)
   useEffect(() => {
@@ -1049,42 +1136,6 @@ const Index = () => {
                         <div className="text-white/40">kurt</div>
                         <div className="text-white">{(advanced.snapshot?.kurtosis ?? 0).toFixed(2)}</div>
                       </div>
-                      <div>
-                        <div className="text-white/40">R / G / B</div>
-                        <div className="text-white">
-                          {(advanced.snapshot?.meanR ?? 0).toFixed(0)}
-                          {" / "}
-                          {(advanced.snapshot?.meanG ?? 0).toFixed(0)}
-                          {" / "}
-                          {(advanced.snapshot?.meanB ?? 0).toFixed(0)}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">DC (G)</div>
-                        <div className="text-white">{(advanced.snapshot?.dcEstimate ?? 0).toFixed(1)}</div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">samples</div>
-                        <div className="text-white">{advanced.snapshot?.samplesProcessed ?? 0}</div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">resampled @{advanced.snapshot?.resampledRate ?? 0}Hz</div>
-                        <div className="text-white">{advanced.snapshot?.resampledCount ?? 0}</div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">RoR (R/G)</div>
-                        <div className="text-white">
-                          {advanced.snapshot?.ror != null ? advanced.snapshot.ror.toFixed(3) : "—"}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">SpO₂* exp</div>
-                        <div className="text-amber-300">
-                          {advanced.snapshot?.spo2Experimental != null
-                            ? `${advanced.snapshot.spo2Experimental.toFixed(1)}%`
-                            : "—"}
-                        </div>
-                      </div>
                       <div className="col-span-2">
                         <div className="text-white/40">err</div>
                         <div className="text-amber-300 truncate">{advanced.error ?? "—"}</div>
@@ -1203,21 +1254,21 @@ const Index = () => {
           <div className="flex-1 h-full">
             <PPGSignalMeter 
               value={heartbeatSignal}
-              quality={(advanced.snapshot?.sqi || 0) * 100}
-              isFingerDetected={advanced.fingerDetected}
+              quality={lastSignal?.quality || 0}
+              isFingerDetected={lastSignal?.fingerDetected || false}
               onStartMeasurement={handleToggleMonitoring}
               onReset={handleReset}
               isMonitoring={isMonitoring}
               arrhythmiaStatus={vitalSigns.arrhythmiaStatus}
               rawArrhythmiaData={lastArrhythmiaData.current}
               preserveResults={showResults}
-              diagnosticMessage={undefined}
+              diagnosticMessage={lastSignal?.diagnostics?.message}
               isPeak={beatMarker === 1}
               bpm={heartRate}
               spo2={vitalSigns.spo2}
               rrIntervals={rrIntervals}
               elapsedTime={elapsedTime}
-              perfusionIndex={advanced.snapshot?.perfusionIndex || 0}
+              perfusionIndex={lastSignal?.perfusionIndex || 0}
               pressure={vitalSigns.pressure}
             />
           </div>
@@ -1415,7 +1466,7 @@ const Index = () => {
                     {/* Botón Análisis AI */}
                     <button
                       onClick={() => {
-                        analyzeVitals({ heartRate, vitalSigns, quality: (advanced.snapshot?.sqi || 0) * 100 });
+                        analyzeVitals({ heartRate, vitalSigns, quality: lastSignal?.quality || 0 });
                         setShowAIAnalysis(true);
                       }}
                       disabled={isAnalyzing}

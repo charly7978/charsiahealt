@@ -8,32 +8,20 @@
  * 3. Scoring de candidatos de pico por prominencia + pendiente + consistencia RR
  * 4. Ventanas adaptativas: cortas para señal débil, largas para estable
  */
-import { NumericRingBuffer } from "../lib/ppg/signal/NumericRingBuffer";
-
 export class HeartBeatProcessor {
   private readonly MIN_PEAK_INTERVAL_MS = 330;
   private readonly MAX_PEAK_INTERVAL_MS = 2000;
 
-
+  private signalBuffer: number[] = [];
+  private derivativeBuffer: number[] = [];
+  private timestampBuffer: number[] = [];
   private readonly BUFFER_SIZE = 300;
-  private signalBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
-  private derivativeBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
-  private timestampBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
-
-  // Reusable scratch buffers — avoid per-frame allocation in hot path.
-  private scratchGate: number[] = [];
-  private scratchNorm: number[] = [];
-  private scratchPeriod: number[] = [];
-  private scratchSampleRate: number[] = [];
-  private scratchSqi: number[] = [];
-  private scratchPeakSig: number[] = [];
-  private scratchPeakDeriv: number[] = [];
 
   private lastPeakTime = 0;
   private peakThreshold = 4.0;
   private lastPeakValue = 0;
 
-  private rrIntervals = new NumericRingBuffer(30);
+  private rrIntervals: number[] = [];
   private readonly MAX_RR_INTERVALS = 30;
   private smoothBPM = 0;
   private frequencyBPM = 0;
@@ -80,17 +68,23 @@ export class HeartBeatProcessor {
 
     this.signalBuffer.push(filteredValue);
     this.timestampBuffer.push(now);
-    // Ring buffers self-cap at BUFFER_SIZE (oldest is overwritten); no shift needed.
+    if (this.signalBuffer.length > this.BUFFER_SIZE) {
+      this.signalBuffer.shift();
+      this.timestampBuffer.shift();
+    }
 
     const derivative = this.calculateDerivative();
     this.derivativeBuffer.push(derivative);
+    if (this.derivativeBuffer.length > this.BUFFER_SIZE) {
+      this.derivativeBuffer.shift();
+    }
 
-    if (this.signalBuffer.size < 20) {
+    if (this.signalBuffer.length < 20) {
       return { bpm: 0, confidence: 0, isPeak: false, filteredValue: 0, arrhythmiaCount: 0, sqi: 0 };
     }
 
     // === GATE: minimum signal energy to reject noise ===
-    const recentForGate = this.signalBuffer.copyLastN(60, this.scratchGate);
+    const recentForGate = this.signalBuffer.slice(-60);
     const gSorted = [...recentForGate].sort((a, b) => a - b);
     const gRange = (gSorted[Math.floor(gSorted.length * 0.9)] ?? 0) - (gSorted[Math.floor(gSorted.length * 0.1)] ?? 0);
     if (gRange < 0.5) {
@@ -124,6 +118,9 @@ export class HeartBeatProcessor {
       if (isPeak) {
         if (this.lastPeakTime > 0 && timeSinceLastPeak <= this.MAX_PEAK_INTERVAL_MS) {
           this.rrIntervals.push(timeSinceLastPeak);
+          if (this.rrIntervals.length > this.MAX_RR_INTERVALS) {
+            this.rrIntervals.shift();
+          }
 
           const instantBPM = 60000 / timeSinceLastPeak;
 
@@ -180,12 +177,9 @@ export class HeartBeatProcessor {
   }
 
   private calculateDerivative(): number {
-    const n = this.signalBuffer.size;
+    const n = this.signalBuffer.length;
     if (n < 3) return 0;
-    const sn1 = this.signalBuffer.at(n - 1);
-    const sn2 = this.signalBuffer.at(n - 2);
-    const sn3 = this.signalBuffer.at(n - 3);
-    return (sn1 - sn3) * 0.5 + (sn1 - sn2) * 0.5;
+    return (this.signalBuffer[n - 1] - this.signalBuffer[n - 3]) * 0.5 + (this.signalBuffer[n - 1] - this.signalBuffer[n - 2]) * 0.5;
   }
 
   private getRobustBounds(values: number[]): { low: number; high: number; range: number } {
@@ -197,7 +191,7 @@ export class HeartBeatProcessor {
   }
 
   private normalizeSignal(value: number, windowLen: number = 150): { normalizedValue: number; range: number } {
-    const recent = this.signalBuffer.copyLastN(windowLen, this.scratchNorm);
+    const recent = this.signalBuffer.slice(-windowLen);
     const { low, high, range } = this.getRobustBounds(recent);
     if (range < 0.15) return { normalizedValue: 0, range: 0 };
     const clipped = Math.min(high, Math.max(low, value));
@@ -206,9 +200,7 @@ export class HeartBeatProcessor {
   }
 
   private normalizeWindow(values: number[], windowLen: number = 150): number[] {
-    // Reference window comes from signalBuffer; use a dedicated scratch (different from
-    // scratchNorm) so concurrent callers within the same frame don't clobber each other.
-    const refWindow = this.signalBuffer.copyLastN(windowLen, this.scratchPeriod);
+    const refWindow = this.signalBuffer.slice(-windowLen);
     const { low, high, range } = this.getRobustBounds(refWindow);
     if (range < 0.15) return values.map(() => 0);
     return values.map((v) => {
@@ -218,8 +210,8 @@ export class HeartBeatProcessor {
   }
 
   private estimateSampleRate(): number {
-    if (this.timestampBuffer.size < 10) return 30;
-    const recent = this.timestampBuffer.copyLastN(50, this.scratchSampleRate);
+    if (this.timestampBuffer.length < 10) return 30;
+    const recent = this.timestampBuffer.slice(-50);
     const intervals: number[] = [];
     for (let i = 1; i < recent.length; i++) {
       const d = recent[i] - recent[i - 1];
@@ -232,13 +224,11 @@ export class HeartBeatProcessor {
   }
 
   private estimatePeriodicity(): { bpm: number; score: number } {
-    if (this.signalBuffer.size < 60) return { bpm: 0, score: 0 };
+    if (this.signalBuffer.length < 60) return { bpm: 0, score: 0 };
 
     const sampleRate = this.estimateSampleRate();
     const windowLen = this.consecutivePeaks < 3 ? 120 : 180;
-    // Snapshot last `windowLen` samples; normalizeWindow uses its own internal scratch
-    // for the reference window, so passing a fresh array here is safe.
-    const recentSignal = this.normalizeWindow(this.signalBuffer.toLastNArray(windowLen), windowLen);
+    const recentSignal = this.normalizeWindow(this.signalBuffer.slice(-windowLen), windowLen);
     const mean = recentSignal.reduce((s, v) => s + v, 0) / recentSignal.length;
     const centered = recentSignal.map((v) => v - mean);
     const energy = centered.reduce((s, v) => s + v * v, 0);
@@ -279,20 +269,19 @@ export class HeartBeatProcessor {
   }
 
   private calculateSQI(range: number, periodicityScore: number): number {
-    if (this.signalBuffer.size < 30) return 0;
+    if (this.signalBuffer.length < 30) return 0;
 
     const rangeFactor = Math.min(1, range / 5) * 22;
-    const derivWindow = this.derivativeBuffer.copyLastN(60, this.scratchSqi);
+    const derivWindow = this.derivativeBuffer.slice(-60);
     const meanAbsDeriv = derivWindow.length > 0
       ? derivWindow.reduce((s, v) => s + Math.abs(v), 0) / derivWindow.length
       : 0;
     const slopeFactor = Math.min(1, meanAbsDeriv / 1.0) * 14;
 
     let rrFactor = 0;
-    if (this.rrIntervals.size >= 3) {
-      const rrArr = this.rrIntervals.toLastNArray(this.rrIntervals.size);
-      const m = rrArr.reduce((a, b) => a + b, 0) / rrArr.length;
-      const v = rrArr.reduce((a, rr) => a + (rr - m) ** 2, 0) / rrArr.length;
+    if (this.rrIntervals.length >= 3) {
+      const m = this.rrIntervals.reduce((a, b) => a + b, 0) / this.rrIntervals.length;
+      const v = this.rrIntervals.reduce((a, rr) => a + (rr - m) ** 2, 0) / this.rrIntervals.length;
       const cv = Math.sqrt(v) / Math.max(1, m);
       rrFactor = Math.max(0, 1 - cv * 2) * 22;
     }
@@ -310,8 +299,8 @@ export class HeartBeatProcessor {
   }
 
   private getExpectedRR(): number {
-    if (this.rrIntervals.size >= 3) {
-      const recent = this.rrIntervals.toLastNArray(Math.min(6, this.rrIntervals.size)).sort((a, b) => a - b);
+    if (this.rrIntervals.length >= 3) {
+      const recent = this.rrIntervals.slice(-6).sort((a, b) => a - b);
       return recent[Math.floor(recent.length / 2)] ?? recent[0] ?? 0;
     }
     if (this.frequencyBPM > 0) return 60000 / this.frequencyBPM;
@@ -320,15 +309,15 @@ export class HeartBeatProcessor {
 
   // === PEAK DETECTION WITH CANDIDATE SCORING ===
   private detectPeakWithScoring(timeSinceLastPeak: number): boolean {
-    const n = this.signalBuffer.size;
-    const dn = this.derivativeBuffer.size;
+    const n = this.signalBuffer.length;
+    const dn = this.derivativeBuffer.length;
     if (n < 11 || dn < 6) return false;
 
-    const deriv = this.derivativeBuffer.copyLastN(6, this.scratchPeakDeriv);
+    const deriv = this.derivativeBuffer.slice(-6);
     const zeroCrossing = (deriv[2] > 0 && deriv[3] <= 0) || (deriv[3] > 0 && deriv[4] <= 0);
 
     const windowLen = this.consecutivePeaks < 3 ? 90 : 150;
-    const recentNormalized = this.normalizeWindow(this.signalBuffer.copyLastN(11, this.scratchPeakSig), windowLen);
+    const recentNormalized = this.normalizeWindow(this.signalBuffer.slice(-11), windowLen);
     const ci = 5;
     const center = recentNormalized[ci];
     const neighborhoodMin = Math.min(...recentNormalized);
@@ -399,13 +388,12 @@ export class HeartBeatProcessor {
     const sqiFactor = this.signalQualityIndex / 100;
     const peakSupport = Math.min(1, this.consecutivePeaks / 5);
 
-    if (this.rrIntervals.size < 2) {
+    if (this.rrIntervals.length < 2) {
       return this.clamp(sqiFactor * 0.22 + peakSupport * 0.2 + this.periodicityScore * 0.3, 0, 0.6);
     }
 
-    const rrArr = this.rrIntervals.toLastNArray(this.rrIntervals.size);
-    const mean = rrArr.reduce((a, b) => a + b, 0) / rrArr.length;
-    const variance = rrArr.reduce((a, rr) => a + (rr - mean) ** 2, 0) / rrArr.length;
+    const mean = this.rrIntervals.reduce((a, b) => a + b, 0) / this.rrIntervals.length;
+    const variance = this.rrIntervals.reduce((a, rr) => a + (rr - mean) ** 2, 0) / this.rrIntervals.length;
     const cv = Math.sqrt(variance) / Math.max(1, mean);
     const rrStability = this.clamp(1 - cv * 1.7, 0, 1);
 
@@ -441,17 +429,17 @@ export class HeartBeatProcessor {
     return Math.min(max, Math.max(min, value));
   }
 
-  getRRIntervals(): number[] { return this.rrIntervals.toLastNArray(this.rrIntervals.size); }
+  getRRIntervals(): number[] { return [...this.rrIntervals]; }
   getLastPeakTime(): number { return this.lastPeakTime; }
   getSQI(): number { return this.signalQualityIndex; }
-  getDerivativeBuffer(): number[] { return this.derivativeBuffer.toLastNArray(this.derivativeBuffer.size); }
+  getDerivativeBuffer(): number[] { return [...this.derivativeBuffer]; }
 
 
   reset(): void {
-    this.signalBuffer.clear();
-    this.derivativeBuffer.clear();
-    this.timestampBuffer.clear();
-    this.rrIntervals.clear();
+    this.signalBuffer = [];
+    this.derivativeBuffer = [];
+    this.timestampBuffer = [];
+    this.rrIntervals = [];
     this.smoothBPM = 0;
     this.frequencyBPM = 0;
     this.periodicityScore = 0;

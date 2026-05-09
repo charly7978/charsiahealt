@@ -3,7 +3,7 @@ import { CameraController } from "../camera/cameraController";
 import { FrameLoop } from "../capture/frameLoop";
 import { FrameDownsampler } from "../capture/downsample";
 import { AdaptiveRoi } from "../roi/adaptiveRoi";
-import { classifyAndAggregate } from "../capture/combinePass";
+import { classifyFrame } from "../detection/fingerDetector";
 import {
   PPG_CONFIG,
   type CameraDiagnostics,
@@ -69,8 +69,6 @@ export function usePpgCapture(
   const lastUiUpdateRef = useRef(0);
   const fingerRef = useRef(false);
   const fpsRef = useRef(0);
-  const fingerStateRef = useRef(false);
-  const fpsStateRef = useRef(0);
   const configRef = useRef(getPpgRuntimeConfig());
 
   const stop = useCallback(async () => {
@@ -136,31 +134,14 @@ export function usePpgCapture(
           skewness: data.skewness,
           kurtosis: data.kurtosis,
           fpsActual: data.fpsActual,
-          meanR: data.meanR,
-          meanG: data.meanG,
-          meanB: data.meanB,
-          dcEstimate: data.dcEstimate,
-          samplesProcessed: data.samplesProcessed,
-          resampledRate: data.resampledRate,
-          resampledCount: data.resampledCount,
-          ror: data.ror,
-          spo2Experimental: data.spo2Experimental,
         };
         const now = performance.now();
         const minInterval = 1000 / PPG_CONFIG.STATE_THROTTLE_HZ;
         if (now - lastUiUpdateRef.current < minInterval) return;
         lastUiUpdateRef.current = now;
         setSnapshot(next);
-        // Gate state updates: only call setState when value actually changes.
-        if (fingerRef.current !== fingerStateRef.current) {
-          fingerStateRef.current = fingerRef.current;
-          setFingerDetected(fingerRef.current);
-        }
-        const roundedFps = Math.round(fpsRef.current);
-        if (roundedFps !== fpsStateRef.current) {
-          fpsStateRef.current = roundedFps;
-          setFpsInstant(roundedFps);
-        }
+        setFingerDetected(fingerRef.current);
+        setFpsInstant(fpsRef.current);
       });
 
       const loop = new FrameLoop(video, (timing) => {
@@ -169,15 +150,8 @@ export function usePpgCapture(
         const w = workerRef.current;
         if (!ds || !region || !w) return;
         const rgba = ds.capture(video);
-        // Single-pass: finger detection + tile aggregation share one
-        // iteration over the RGBA buffer (was two before).
-        const { detection, aggregate } = classifyAndAggregate(
-          rgba,
-          ds.width,
-          ds.height,
-          configRef.current.finger,
-          region,
-        );
+        const detection = classifyFrame(rgba, configRef.current.finger);
+        const aggregate = region.process(rgba, ds.width, ds.height);
         fingerRef.current = detection.fingerDetected;
         fpsRef.current = timing.fpsInstant;
 

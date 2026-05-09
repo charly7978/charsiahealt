@@ -1,7 +1,6 @@
 import { ArrhythmiaProcessor } from './arrhythmia-processor';
 import { PPGFeatureExtractor } from './PPGFeatureExtractor';
 import { BloodPressureProcessor } from './BloodPressureProcessor';
-import { NumericRingBuffer } from '../../lib/ppg/signal/NumericRingBuffer';
 
 export interface VitalSignsResult {
   spo2: number;
@@ -75,8 +74,8 @@ export class VitalSignsProcessor {
     signalQuality: 0
   };
   
-  // Historial de señal — ring buffer pre-asignado (zero GC)
-  private signalHistory = new NumericRingBuffer(90);
+  // Historial de señal
+  private signalHistory: number[] = [];
   private readonly HISTORY_SIZE = 90;
   
   // RGB para SpO2
@@ -105,7 +104,7 @@ export class VitalSignsProcessor {
     this.arrhythmiaProcessor = new ArrhythmiaProcessor();
     this.bloodPressureProcessor = new BloodPressureProcessor();
     this.arrhythmiaProcessor.setArrhythmiaDetectionCallback((detected) => {
-      if (import.meta.env.DEV) console.log(`ArrhythmiaProcessor: Cambio de estado → ${detected ? 'ARRITMIA' : 'NORMAL'}`);
+      console.log(`ArrhythmiaProcessor: Cambio de estado → ${detected ? 'ARRITMIA' : 'NORMAL'}`);
     });
   }
 
@@ -126,7 +125,7 @@ export class VitalSignsProcessor {
       lastArrhythmiaData: null,
       signalQuality: 0
     };
-    this.signalHistory.clear();
+    this.signalHistory = [];
   }
 
   forceCalibrationCompletion(): void {
@@ -145,6 +144,9 @@ export class VitalSignsProcessor {
     
     // Actualizar historial
     this.signalHistory.push(signalValue);
+    if (this.signalHistory.length > this.HISTORY_SIZE) {
+      this.signalHistory.shift();
+    }
 
     // Control de calibración
     if (this.isCalibrating) {
@@ -167,7 +169,7 @@ export class VitalSignsProcessor {
     }
 
     // Calcular signos vitales — lowered from 30 to 20 samples, 3 to 2 intervals
-    if (this.signalHistory.size >= 20 && rrData && rrData.intervals.length >= 2) {
+    if (this.signalHistory.length >= 20 && rrData && rrData.intervals.length >= 2) {
       this.calculateVitalSigns(signalValue, rrData);
     }
 
@@ -203,9 +205,9 @@ export class VitalSignsProcessor {
   }
 
   private calculateSignalQuality(): number {
-    if (this.signalHistory.size < 20) return 0;
+    if (this.signalHistory.length < 20) return 0;
     
-    const recent = this.signalHistory.toLastNArray(Math.min(60, this.signalHistory.size));
+    const recent = this.signalHistory.slice(-60);
     const sorted = [...recent].sort((a, b) => a - b);
     const p10 = sorted[Math.floor((sorted.length - 1) * 0.1)] ?? 0;
     const p90 = sorted[Math.floor((sorted.length - 1) * 0.9)] ?? 0;
@@ -284,12 +286,11 @@ export class VitalSignsProcessor {
       this.updateHistory('spo2', spo2);
     }
 
-    const signalArr = this.signalHistory.toLastNArray(this.signalHistory.size);
-    const cycles = PPGFeatureExtractor.detectCardiacCycles(signalArr, 30);
+    const cycles = PPGFeatureExtractor.detectCardiacCycles(this.signalHistory, 30);
     const validCycleFeatures: import('./PPGFeatureExtractor').CycleFeatures[] = [];
     
     for (const cycle of cycles) {
-      const features = PPGFeatureExtractor.extractCycleFeatures(signalArr, cycle, 30);
+      const features = PPGFeatureExtractor.extractCycleFeatures(this.signalHistory, cycle, 30);
       if (features && features.quality >= 0.30) {  // lowered from 0.45
         validCycleFeatures.push(features);
       }
@@ -303,7 +304,7 @@ export class VitalSignsProcessor {
     // BP — try with 2+ valid RR
     if (validRR.length >= 2) {
       const bpEstimate = this.bloodPressureProcessor.estimate(
-        signalArr, validRR, 30
+        this.signalHistory, validRR, 30
       );
       this.lastBPConfidence = bpEstimate.confidence;
       this.lastBPFeatureQuality = bpEstimate.featureQuality;
@@ -694,7 +695,7 @@ export class VitalSignsProcessor {
 
   reset(): VitalSignsResult | null {
     const result = this.getFormattedResult();
-    this.signalHistory.clear();
+    this.signalHistory = [];
     this.validPulseCount = 0;
     this.arrhythmiaProcessor.reset();
     this.measurements.arrhythmiaCount = 0;
@@ -710,7 +711,7 @@ export class VitalSignsProcessor {
   }
 
   fullReset(): void {
-    this.signalHistory.clear();
+    this.signalHistory = [];
     this.validPulseCount = 0;
     this.measurements = {
       spo2: 0,

@@ -1,19 +1,14 @@
 /**
  * Closed-form PCA on a 3x3 covariance matrix of (R, G, B) channels.
  *
- * Uses an **online Welford accumulator** (with exponential forgetting
- * factor) for mean + cross-products: O(1) per sample instead of O(N).
- * Eigen-decomposition uses Cardano + Gauss elimination — fast, no deps.
- * The principal eigenvector is cached for `PCA_CACHE_FRAMES` samples;
- * RGB covariance evolves slowly, so reusing axis projection between
- * recomputes saves >50% CPU in the worker.
+ * Eigenvalues are computed via Cardano's depressed cubic — runs in
+ * nanoseconds without external math libraries. The principal eigenvector is
+ * recovered by Gauss elimination on `(C - λ·I)`. The output sign is aligned
+ * with the green channel so the projected signal stays physiologically
+ * consistent across frames.
  */
 
 const EPS = 1e-12;
-/** Frames between full eigen-decomposition. Reuse axis in between. */
-const PCA_CACHE_FRAMES = 4;
-/** Forgetting factor applied per sample once the window is filled. */
-const FORGET_LAMBDA = 0.995;
 
 export interface FusionResult {
   readonly value: number;
@@ -29,6 +24,7 @@ function cardanoEigenvalues(
   m02: number,
   m12: number,
 ): [number, number, number] {
+  // Symmetric matrix => characteristic polynomial λ^3 - p2 λ^2 + p1 λ - p0.
   const p2 = m00 + m11 + m22;
   const p1 =
     m00 * m11 + m00 * m22 + m11 * m22 - m01 * m01 - m02 * m02 - m12 * m12;
@@ -37,6 +33,7 @@ function cardanoEigenvalues(
     m01 * (m01 * m22 - m12 * m02) +
     m02 * (m01 * m12 - m11 * m02);
 
+  // Depressed cubic substitution λ = t + p2/3.
   const a = -p2;
   const b = p1;
   const c = -det;
@@ -48,6 +45,7 @@ function cardanoEigenvalues(
   const disc = half * half + third * third * third;
 
   if (disc > 0) {
+    // One real root + two complex; numeric noise from a near-symmetric matrix.
     const sqrtDisc = Math.sqrt(disc);
     const u = Math.cbrt(-half + sqrtDisc);
     const v = Math.cbrt(-half - sqrtDisc);
@@ -77,6 +75,7 @@ function principalEigenvector(
   const d = m11 - lambda;
   const f = m22 - lambda;
 
+  // Try cross-product of two rows of (C - λI). Pick the most-independent pair.
   const r0x = a;
   const r0y = m01;
   const r0z = m02;
@@ -107,62 +106,30 @@ function principalEigenvector(
   return [best[0] / bestNorm, best[1] / bestNorm, best[2] / bestNorm];
 }
 
-/** Online RGB-channel PCA with Welford + forgetting factor. */
+/** Online RGB-channel covariance accumulator with a fixed window. */
 export class RgbPcaFusion {
-  private readonly windowSamples: number;
-  // Welford state.
-  private n = 0;
-  private mr = 0;
-  private mg = 0;
-  private mb = 0;
-  private M2_rr = 0;
-  private M2_gg = 0;
-  private M2_bb = 0;
-  private M2_rg = 0;
-  private M2_rb = 0;
-  private M2_gb = 0;
-
-  // Cached axis (recomputed every PCA_CACHE_FRAMES samples).
-  private cachedAxis: [number, number, number] | null = null;
-  private cachedEigenvalue = 0;
-  private framesSinceRefresh = 0;
+  private readonly rs: Float32Array;
+  private readonly gs: Float32Array;
+  private readonly bs: Float32Array;
+  private readonly capacity: number;
+  private head = 0;
+  private size = 0;
 
   constructor(windowSamples: number) {
-    this.windowSamples = Math.max(8, windowSamples);
+    this.capacity = windowSamples;
+    this.rs = new Float32Array(windowSamples);
+    this.gs = new Float32Array(windowSamples);
+    this.bs = new Float32Array(windowSamples);
   }
 
   pushAndProject(r: number, g: number, b: number): FusionResult {
-    // Apply forgetting factor once we exceed the nominal window — keeps
-    // the accumulator adaptive without storing all past samples.
-    if (this.n >= this.windowSamples) {
-      this.n *= FORGET_LAMBDA;
-      this.M2_rr *= FORGET_LAMBDA;
-      this.M2_gg *= FORGET_LAMBDA;
-      this.M2_bb *= FORGET_LAMBDA;
-      this.M2_rg *= FORGET_LAMBDA;
-      this.M2_rb *= FORGET_LAMBDA;
-      this.M2_gb *= FORGET_LAMBDA;
-    }
+    this.rs[this.head] = r;
+    this.gs[this.head] = g;
+    this.bs[this.head] = b;
+    this.head = (this.head + 1) % this.capacity;
+    if (this.size < this.capacity) this.size++;
 
-    this.n += 1;
-    const drOld = r - this.mr;
-    const dgOld = g - this.mg;
-    const dbOld = b - this.mb;
-    const inv = 1 / this.n;
-    this.mr += drOld * inv;
-    this.mg += dgOld * inv;
-    this.mb += dbOld * inv;
-    const drNew = r - this.mr;
-    const dgNew = g - this.mg;
-    const dbNew = b - this.mb;
-    this.M2_rr += drOld * drNew;
-    this.M2_gg += dgOld * dgNew;
-    this.M2_bb += dbOld * dbNew;
-    this.M2_rg += drOld * dgNew;
-    this.M2_rb += drOld * dbNew;
-    this.M2_gb += dgOld * dbNew;
-
-    if (this.n < 8) {
+    if (this.size < 8) {
       return {
         value: g,
         eigenvalue: 0,
@@ -170,49 +137,69 @@ export class RgbPcaFusion {
       };
     }
 
-    // Recompute axis only every PCA_CACHE_FRAMES samples.
-    this.framesSinceRefresh++;
-    if (this.cachedAxis === null || this.framesSinceRefresh >= PCA_CACHE_FRAMES) {
-      this.framesSinceRefresh = 0;
-      const denom = Math.max(1, this.n - 1);
-      const crr = this.M2_rr / denom;
-      const cgg = this.M2_gg / denom;
-      const cbb = this.M2_bb / denom;
-      const crg = this.M2_rg / denom;
-      const crb = this.M2_rb / denom;
-      const cgb = this.M2_gb / denom;
-
-      const eigs = cardanoEigenvalues(crr, cgg, cbb, crg, crb, cgb);
-      let lambda = eigs[0];
-      if (eigs[1] > lambda) lambda = eigs[1];
-      if (eigs[2] > lambda) lambda = eigs[2];
-      const axis = principalEigenvector(crr, cgg, cbb, crg, crb, cgb, lambda);
-      const sign = axis[1] < 0 ? -1 : 1;
-      this.cachedAxis = [axis[0] * sign, axis[1] * sign, axis[2] * sign];
-      this.cachedEigenvalue = lambda;
+    let mr = 0;
+    let mg = 0;
+    let mb = 0;
+    for (let i = 0; i < this.size; i++) {
+      mr += this.rs[i];
+      mg += this.gs[i];
+      mb += this.bs[i];
     }
+    mr /= this.size;
+    mg /= this.size;
+    mb /= this.size;
 
-    const axis = this.cachedAxis;
-    const value =
-      axis[0] * (r - this.mr) +
-      axis[1] * (g - this.mg) +
-      axis[2] * (b - this.mb);
-    return { value, eigenvalue: this.cachedEigenvalue, axis };
+    let crr = 0;
+    let cgg = 0;
+    let cbb = 0;
+    let crg = 0;
+    let crb = 0;
+    let cgb = 0;
+    for (let i = 0; i < this.size; i++) {
+      const dr = this.rs[i] - mr;
+      const dg = this.gs[i] - mg;
+      const db = this.bs[i] - mb;
+      crr += dr * dr;
+      cgg += dg * dg;
+      cbb += db * db;
+      crg += dr * dg;
+      crb += dr * db;
+      cgb += dg * db;
+    }
+    const inv = 1 / Math.max(1, this.size - 1);
+    crr *= inv;
+    cgg *= inv;
+    cbb *= inv;
+    crg *= inv;
+    crb *= inv;
+    cgb *= inv;
+
+    const eigs = cardanoEigenvalues(crr, cgg, cbb, crg, crb, cgb);
+    let lambda = eigs[0];
+    if (eigs[1] > lambda) lambda = eigs[1];
+    if (eigs[2] > lambda) lambda = eigs[2];
+    const axis = principalEigenvector(
+      crr,
+      cgg,
+      cbb,
+      crg,
+      crb,
+      cgb,
+      lambda,
+    );
+
+    // Sign-align with green so projection stays consistent.
+    const sign = axis[1] < 0 ? -1 : 1;
+    const ax0 = axis[0] * sign;
+    const ax1 = axis[1] * sign;
+    const ax2 = axis[2] * sign;
+
+    const value = ax0 * (r - mr) + ax1 * (g - mg) + ax2 * (b - mb);
+    return { value, eigenvalue: lambda, axis: [ax0, ax1, ax2] };
   }
 
   reset(): void {
-    this.n = 0;
-    this.mr = 0;
-    this.mg = 0;
-    this.mb = 0;
-    this.M2_rr = 0;
-    this.M2_gg = 0;
-    this.M2_bb = 0;
-    this.M2_rg = 0;
-    this.M2_rb = 0;
-    this.M2_gb = 0;
-    this.cachedAxis = null;
-    this.cachedEigenvalue = 0;
-    this.framesSinceRefresh = 0;
+    this.head = 0;
+    this.size = 0;
   }
 }

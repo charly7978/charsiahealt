@@ -19,23 +19,4 @@ export default defineConfig(({ mode }) => ({
       "@": path.resolve(__dirname, "./src"),
     },
   },
-  build: {
-    target: 'esnext',
-    sourcemap: false,
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          'react-vendor': ['react', 'react-dom'],
-          'supabase': ['@supabase/supabase-js'],
-          'ui': ['@radix-ui/react-slot', '@radix-ui/react-toast', 'lucide-react'],
-        },
-      },
-    },
-  },
-  worker: {
-    format: 'es',
-  },
-  optimizeDeps: {
-    include: ['react', 'react-dom'],
-  },
 }));
