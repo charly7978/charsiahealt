@@ -20,6 +20,12 @@ import {
 export interface UsePpgCaptureOptions {
   readonly video: HTMLVideoElement | null;
   readonly active: boolean;
+  /**
+   * If true, the hook will NOT call getUserMedia. It assumes `video` already
+   * has an attached stream (managed by another component such as CameraView).
+   * Use this to run the advanced pipeline alongside an existing camera owner.
+   */
+  readonly useExternalVideo?: boolean;
 }
 
 export interface UsePpgCaptureResult {
