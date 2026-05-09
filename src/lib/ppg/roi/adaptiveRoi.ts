@@ -190,6 +190,76 @@ export class AdaptiveRoi {
     };
   }
 
+  /**
+   * Tail end of `process()` — runs EMA smoothing on the per-tile scores and
+   * produces the weighted RGB aggregate. Public so combinePass.ts (which
+   * computes per-tile sums in a single fused loop with finger detection)
+   * can hand off without duplicating work.
+   */
+  finalizeFromSums(
+    sumR: Float32Array,
+    sumG: Float32Array,
+    sumB: Float32Array,
+    valid: Uint32Array,
+    clip: Uint32Array,
+    dark: Uint32Array,
+    total: Uint32Array,
+  ): RoiResult {
+    const n = this.cols * this.rows;
+    for (let i = 0; i < n; i++) {
+      const v = valid[i];
+      const meanR = v > 0 ? sumR[i] / v : 0;
+      const meanG = v > 0 ? sumG[i] / v : 0;
+      const meanB = v > 0 ? sumB[i] / v : 0;
+      const t = total[i];
+      const clipPenalty = t > 0 ? clip[i] / t : 1;
+      const darkPenalty = t > 0 ? dark[i] / t : 1;
+      const coverage = t > 0 ? v / t : 0;
+      const dominance = meanR - (meanG + meanB) * 0.5;
+      const score = Math.max(
+        0,
+        dominance * coverage - clipPenalty * 80 - darkPenalty * 40,
+      );
+      this.tileR[i] = meanR;
+      this.tileG[i] = meanG;
+      this.tileB[i] = meanB;
+      this.tileScore[i] = score;
+    }
+
+    if (!this.initialized) {
+      for (let i = 0; i < n; i++) this.tileBaseline[i] = this.tileScore[i];
+      this.initialized = true;
+    } else {
+      for (let i = 0; i < n; i++) {
+        this.tileBaseline[i] =
+          this.tileBaseline[i] * (1 - EMA_ALPHA) +
+          this.tileScore[i] * EMA_ALPHA;
+      }
+    }
+
+    let sumWeights = 0;
+    for (let i = 0; i < n; i++) sumWeights += this.tileBaseline[i];
+    let weightedR = 0;
+    let weightedG = 0;
+    let weightedB = 0;
+    if (sumWeights > 0) {
+      for (let i = 0; i < n; i++) {
+        const w = this.tileBaseline[i] / sumWeights;
+        this.weights[i] = w;
+        weightedR += this.tileR[i] * w;
+        weightedG += this.tileG[i] * w;
+        weightedB += this.tileB[i] * w;
+      }
+    } else {
+      this.weights.fill(0);
+    }
+    const perfusion =
+      weightedR > 0
+        ? (weightedR - (weightedG + weightedB) * 0.5) / weightedR
+        : 0;
+    return { weights: this.weights, weightedR, weightedG, weightedB, perfusion };
+  }
+
   reset(): void {
     this.initialized = false;
     this.weights.fill(0);

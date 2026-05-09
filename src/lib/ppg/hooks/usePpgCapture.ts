@@ -3,7 +3,7 @@ import { CameraController } from "../camera/cameraController";
 import { FrameLoop } from "../capture/frameLoop";
 import { FrameDownsampler } from "../capture/downsample";
 import { AdaptiveRoi } from "../roi/adaptiveRoi";
-import { classifyFrame } from "../detection/fingerDetector";
+import { classifyAndAggregate } from "../capture/combinePass";
 import {
   PPG_CONFIG,
   type CameraDiagnostics,
@@ -69,6 +69,8 @@ export function usePpgCapture(
   const lastUiUpdateRef = useRef(0);
   const fingerRef = useRef(false);
   const fpsRef = useRef(0);
+  const fingerStateRef = useRef(false);
+  const fpsStateRef = useRef(0);
   const configRef = useRef(getPpgRuntimeConfig());
 
   const stop = useCallback(async () => {
@@ -140,8 +142,16 @@ export function usePpgCapture(
         if (now - lastUiUpdateRef.current < minInterval) return;
         lastUiUpdateRef.current = now;
         setSnapshot(next);
-        setFingerDetected(fingerRef.current);
-        setFpsInstant(fpsRef.current);
+        // Gate state updates: only call setState when value actually changes.
+        if (fingerRef.current !== fingerStateRef.current) {
+          fingerStateRef.current = fingerRef.current;
+          setFingerDetected(fingerRef.current);
+        }
+        const roundedFps = Math.round(fpsRef.current);
+        if (roundedFps !== fpsStateRef.current) {
+          fpsStateRef.current = roundedFps;
+          setFpsInstant(roundedFps);
+        }
       });
 
       const loop = new FrameLoop(video, (timing) => {
@@ -150,8 +160,15 @@ export function usePpgCapture(
         const w = workerRef.current;
         if (!ds || !region || !w) return;
         const rgba = ds.capture(video);
-        const detection = classifyFrame(rgba, configRef.current.finger);
-        const aggregate = region.process(rgba, ds.width, ds.height);
+        // Single-pass: finger detection + tile aggregation share one
+        // iteration over the RGBA buffer (was two before).
+        const { detection, aggregate } = classifyAndAggregate(
+          rgba,
+          ds.width,
+          ds.height,
+          configRef.current.finger,
+          region,
+        );
         fingerRef.current = detection.fingerDetected;
         fpsRef.current = timing.fpsInstant;
 
