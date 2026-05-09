@@ -265,7 +265,7 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     endSqi();
 
     const perfusionIndex = this.calculatePerfusionIndex();
-    const livenessOk = this.livenessOkStreak >= this.LIVENESS_OK_STREAK_NEEDED;
+    void this.livenessOkStreak; // informational only
     const adjustedQuality = motionArtifact
       ? Math.max(0, this.signalQuality * 0.75)
       : this.signalQuality;
