@@ -96,11 +96,17 @@ function handleSample(payload: Float32Array): void {
   sampleCount++;
   if (!dcInitialized) {
     dcEstimate = dcSource;
+    meanR = r;
+    meanG = g;
+    meanB = b;
     dcInitialized = true;
   } else {
     // Fast convergence first second (~30 samples), then slow tracking.
     const dcAlpha = sampleCount < 30 ? 0.15 : 0.01;
     dcEstimate = dcEstimate * (1 - dcAlpha) + dcSource * dcAlpha;
+    meanR = meanR * (1 - RGB_EMA_ALPHA) + r * RGB_EMA_ALPHA;
+    meanG = meanG * (1 - RGB_EMA_ALPHA) + g * RGB_EMA_ALPHA;
+    meanB = meanB * (1 - RGB_EMA_ALPHA) + b * RGB_EMA_ALPHA;
   }
 
   const filt = bandpass.process(fused.value);
@@ -126,6 +132,11 @@ function handleSample(payload: Float32Array): void {
     kurtosis: sqi.kurtosis,
     fpsActual: fps,
     samples,
+    meanR,
+    meanG,
+    meanB,
+    dcEstimate,
+    samplesProcessed: sampleCount,
   };
   (self as unknown as Worker).postMessage(out, [snapshotBuffer.buffer]);
   snapshotBuffer = new Float32Array(filtered.capacity);
@@ -142,6 +153,10 @@ function handleReset(): void {
   dcEstimate = 0;
   dcInitialized = false;
   lastEmit = 0;
+  sampleCount = 0;
+  meanR = 0;
+  meanG = 0;
+  meanB = 0;
 }
 
 self.addEventListener("message", (event: MessageEvent<WorkerInbound>) => {
