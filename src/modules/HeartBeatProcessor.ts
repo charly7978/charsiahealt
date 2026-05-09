@@ -128,8 +128,12 @@ export class HeartBeatProcessor {
             this.rrIntervals.shift();
           }
 
-          // RAW MODE: no EMA. BPM is the instantaneous 60000 / lastIBI.
-          this.smoothBPM = 60000 / timeSinceLastPeak;
+          // Robust BPM = 60000 / median(last 5 RR). No EMA blending,
+          // no frequency fallback — but median rejects single outlier beats
+          // (standard practice: Tarvainen 2014, Kubios HRV).
+          const tail = this.rrIntervals.slice(-5).sort((a, b) => a - b);
+          const medianIBI = tail[Math.floor(tail.length / 2)] ?? timeSinceLastPeak;
+          this.smoothBPM = 60000 / medianIBI;
           this.consecutivePeaks++;
         }
 
