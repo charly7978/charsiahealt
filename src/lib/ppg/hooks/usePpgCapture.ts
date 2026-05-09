@@ -136,6 +136,11 @@ export function usePpgCapture(
           skewness: data.skewness,
           kurtosis: data.kurtosis,
           fpsActual: data.fpsActual,
+          meanR: data.meanR,
+          meanG: data.meanG,
+          meanB: data.meanB,
+          dcEstimate: data.dcEstimate,
+          samplesProcessed: data.samplesProcessed,
         };
         const now = performance.now();
         const minInterval = 1000 / PPG_CONFIG.STATE_THROTTLE_HZ;
