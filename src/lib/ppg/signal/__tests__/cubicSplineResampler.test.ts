@@ -43,11 +43,11 @@ describe("RatioOfRatios", () => {
   it("produces a finite RoR and clamped SpO2 on a clean PPG-like signal", () => {
     const r = new RatioOfRatios({ ...DEFAULT_ROR_CONFIG });
     const fs = 100;
-    // 75 BPM modulation on R (1% AC) and G (2% AC) → RoR < 1 → SpO2 > 85.
+    // 75 BPM modulation: large AC on R, small on G → RoR ≈ 1.3 → SpO2 ≈ 77.
     for (let i = 0; i < fs * 4; i++) {
       const phase = 2 * Math.PI * 1.25 * (i / fs);
-      const acR = 1.2 * Math.sin(phase);
-      const acG = 2.4 * Math.sin(phase);
+      const acR = 4.0 * Math.sin(phase);
+      const acG = 2.0 * Math.sin(phase);
       r.push(120 + acR, 80 + acG);
     }
     const reading = r.read();
