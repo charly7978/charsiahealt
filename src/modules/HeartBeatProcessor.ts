@@ -34,7 +34,14 @@ export class HeartBeatProcessor {
   private lastPeakValue = 0;
 
   private rrIntervals: number[] = [];
+  /** Per-IBI motion score at the time the beat was accepted. Parallel to rrIntervals. */
+  private rrMotionScores: number[] = [];
   private readonly MAX_RR_INTERVALS = 30;
+  /** IBIs whose motionScore exceeds this are excluded from BPM median. */
+  private readonly MOTION_TAINT_THRESHOLD = 0.6;
+  /** Above this, no new peak is accepted (frame fully rejected). */
+  private readonly MOTION_REJECT_THRESHOLD = 1.2;
+  private currentMotionScore = 0;
   private smoothBPM = 0;
   private frequencyBPM = 0;
   private periodicityScore = 0;
