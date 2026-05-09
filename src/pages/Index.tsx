@@ -43,6 +43,7 @@ import {
   subscribePpgRuntimeConfig,
   type PpgRuntimeConfig,
 } from "@/lib/ppg/config/ppgRuntimeConfig";
+import { usePpgCapture } from "@/lib/ppg/hooks/usePpgCapture";
 
 import { supabase } from "@/integrations/supabase/client";
 
