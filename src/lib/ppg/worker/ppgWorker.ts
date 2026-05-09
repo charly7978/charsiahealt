@@ -13,6 +13,8 @@ import { BandpassBiquad } from "../signal/filters";
 import { RingBuffer } from "../signal/ringBuffer";
 import { RgbPcaFusion } from "../signal/signalFusion";
 import { computeSqi, type SqiWeights } from "../signal/sqi";
+import { CubicSplineResampler } from "../signal/cubicSplineResampler";
+import { RatioOfRatios, DEFAULT_ROR_CONFIG } from "../signal/ratioOfRatios";
 
 export interface WorkerInboundSample {
   readonly type: "sample";

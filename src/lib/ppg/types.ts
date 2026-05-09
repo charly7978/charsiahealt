@@ -60,6 +60,14 @@ export interface PpgSignalSnapshot {
   /** Green-channel DC estimate; used for absorbance-style transforms. */
   readonly dcEstimate: number;
   readonly samplesProcessed: number;
+  /** Effective rate of the resampled DSP stream (Hz). */
+  readonly resampledRate: number;
+  /** Total uniform-grid samples emitted by the cubic-spline resampler. */
+  readonly resampledCount: number;
+  /** Ratio-of-Ratios (R vs G) — null when gates fail. EXPERIMENTAL. */
+  readonly ror: number | null;
+  /** Empirical SpO2 from RoR. EXPERIMENTAL — research-only, not clinical. */
+  readonly spo2Experimental: number | null;
 }
 
 export interface SafeMediaTrackCapabilities {
