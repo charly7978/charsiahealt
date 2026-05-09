@@ -355,11 +355,16 @@ export class HeartBeatProcessor {
     // === CANDIDATE SCORING ===
     let score = 0;
 
-    // Prominence gate: reject flat noise but accept real PPG
-    if (prominence < 2.2) return false;
+    // Prominence gate (motion-adaptive). Light motion (<0.6) = baseline 2.2;
+    // moderate motion ramps up to ~3.5; severe motion is already hard-rejected
+    // upstream. This rejects motion-induced spurious peaks (Tamura 2014).
+    const motionPenalty = 1 + Math.max(0, this.currentMotionScore - 0.2) * 1.2;
+    const prominenceGate = 2.2 * motionPenalty;
+    const risingGate = 0.8 * motionPenalty;
+    if (prominence < prominenceGate) return false;
 
     // Morphology gate: PPG has rising edge
-    if (risingSlope < 0.8) return false;
+    if (risingSlope < risingGate) return false;
 
     // Prominence (0-30 points)
     score += Math.min(30, prominence * 2.5);
