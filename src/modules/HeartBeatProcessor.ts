@@ -37,10 +37,17 @@ export class HeartBeatProcessor {
   /** Per-IBI motion score at the time the beat was accepted. Parallel to rrIntervals. */
   private rrMotionScores: number[] = [];
   private readonly MAX_RR_INTERVALS = 30;
-  /** IBIs whose motionScore exceeds this are excluded from BPM median. */
-  private readonly MOTION_TAINT_THRESHOLD = 0.6;
-  /** Above this, no new peak is accepted (frame fully rejected). */
-  private readonly MOTION_REJECT_THRESHOLD = 1.2;
+  /** Baseline floors — auto-calibration can only TIGHTEN further, never relax. */
+  private readonly MOTION_TAINT_BASELINE = 0.6;
+  private readonly MOTION_REJECT_BASELINE = 1.2;
+  /** Active thresholds, updated after the calibration window. */
+  private motionTaintThreshold = this.MOTION_TAINT_BASELINE;
+  private motionRejectThreshold = this.MOTION_REJECT_BASELINE;
+  /** Auto-calibration: collect motionScore for first 30 s of session. */
+  private readonly MOTION_CAL_WINDOW_MS = 30_000;
+  private motionCalSamples: number[] = [];
+  private motionCalStartMs = 0;
+  private motionCalibrated = false;
   private currentMotionScore = 0;
   private smoothBPM = 0;
   private frequencyBPM = 0;
@@ -85,6 +92,7 @@ export class HeartBeatProcessor {
     this.frameCount++;
     const now = timestamp ?? Date.now();
     this.currentMotionScore = motionScore;
+    this.updateMotionCalibration(now, motionScore);
 
     this.signalBuffer.push(filteredValue);
     this.timestampBuffer.push(now);
@@ -129,7 +137,7 @@ export class HeartBeatProcessor {
     // === MOTION GATE ===
     // Hard reject: severe motion → no peak this frame, but keep buffers
     // (graceful resume when motion subsides).
-    const motionHardReject = this.currentMotionScore >= this.MOTION_REJECT_THRESHOLD;
+    const motionHardReject = this.currentMotionScore >= this.motionRejectThreshold;
 
     if (!motionHardReject && timeSinceLastPeak >= this.MIN_PEAK_INTERVAL_MS) {
       isPeak = this.detectPeakWithScoring(timeSinceLastPeak);
@@ -151,7 +159,7 @@ export class HeartBeatProcessor {
           const tailLen = Math.min(8, this.rrIntervals.length);
           const tailIbis = this.rrIntervals.slice(-tailLen);
           const tailMot = this.rrMotionScores.slice(-tailLen);
-          const clean = tailIbis.filter((_, i) => tailMot[i] < this.MOTION_TAINT_THRESHOLD);
+          const clean = tailIbis.filter((_, i) => tailMot[i] < this.motionTaintThreshold);
           const usable = clean.length >= 2 ? clean : tailIbis;
           const sorted = [...usable].slice(-5).sort((a, b) => a - b);
           const medianIBI = sorted[Math.floor(sorted.length / 2)] ?? timeSinceLastPeak;
@@ -455,6 +463,50 @@ export class HeartBeatProcessor {
   getSQI(): number { return this.signalQualityIndex; }
   getDerivativeBuffer(): number[] { return this.derivativeBuffer.toLastNArray(this.derivativeBuffer.size); }
 
+  /** Returns the active motion thresholds (post-calibration). */
+  getMotionThresholds(): { taint: number; reject: number; calibrated: boolean } {
+    return {
+      taint: this.motionTaintThreshold,
+      reject: this.motionRejectThreshold,
+      calibrated: this.motionCalibrated,
+    };
+  }
+
+  /**
+   * Auto-calibration of motion thresholds from the user's own movement
+   * distribution during the first MOTION_CAL_WINDOW_MS of the session.
+   * After the window closes, thresholds become:
+   *   TAINT  = max(baseline, p75 × 1.3)   — outlier-resistant Tukey-style
+   *   REJECT = max(baseline, p95 × 1.5)
+   * Floors prevent a perfectly-still subject from getting absurdly low
+   * thresholds that would later flag normal micro-jitter as motion.
+   */
+  private updateMotionCalibration(nowMs: number, motionScore: number): void {
+    if (this.motionCalibrated) return;
+    if (this.motionCalStartMs === 0) {
+      this.motionCalStartMs = nowMs;
+    }
+    // Sample at most ~1 every 33ms (≈30Hz) to bound memory.
+    if (this.motionCalSamples.length === 0 ||
+        this.motionCalSamples.length < (nowMs - this.motionCalStartMs) / 33) {
+      this.motionCalSamples.push(motionScore);
+    }
+    if (nowMs - this.motionCalStartMs < this.MOTION_CAL_WINDOW_MS) return;
+
+    // Calibration window closed — finalize.
+    if (this.motionCalSamples.length < 30) {
+      // Not enough data → keep baselines.
+      this.motionCalibrated = true;
+      return;
+    }
+    const sorted = [...this.motionCalSamples].sort((a, b) => a - b);
+    const p75 = sorted[Math.floor(sorted.length * 0.75)] ?? 0;
+    const p95 = sorted[Math.floor(sorted.length * 0.95)] ?? 0;
+    this.motionTaintThreshold = Math.max(this.MOTION_TAINT_BASELINE, p75 * 1.3);
+    this.motionRejectThreshold = Math.max(this.MOTION_REJECT_BASELINE, p95 * 1.5);
+    this.motionCalibrated = true;
+    this.motionCalSamples = []; // free memory
+  }
 
   reset(): void {
     this.signalBuffer.clear();
@@ -472,6 +524,11 @@ export class HeartBeatProcessor {
     this.frameCount = 0;
     this.consecutivePeaks = 0;
     this.signalQualityIndex = 0;
+    this.motionCalSamples = [];
+    this.motionCalStartMs = 0;
+    this.motionCalibrated = false;
+    this.motionTaintThreshold = this.MOTION_TAINT_BASELINE;
+    this.motionRejectThreshold = this.MOTION_REJECT_BASELINE;
   }
 
   dispose(): void {
