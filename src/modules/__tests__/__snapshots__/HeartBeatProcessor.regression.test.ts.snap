@@ -1,0 +1,28 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`HeartBeatProcessor regression baseline > produces stable output snapshot for a 72 BPM sinusoid @ 30 fps / 12 s 1`] = `
+{
+  "bpm": 72.1784,
+  "derivTail": [
+    -1.629725,
+    -1.856057,
+    -1.747654,
+  ],
+  "isPeakCount": 11,
+  "rrFirst": 833.3333,
+  "rrLast": 833.3333,
+  "rrLen": 9,
+  "sqi": 88.9121,
+}
+`;
+
+exports[`HeartBeatProcessor regression baseline > produces stable output snapshot for a 95 BPM sinusoid @ 30 fps / 10 s 1`] = `
+{
+  "bpm": 95.459,
+  "isPeakCount": 13,
+  "rrFirst": 600,
+  "rrLast": 633.3333,
+  "rrLen": 12,
+  "sqi": 98.834,
+}
+`;

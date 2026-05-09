@@ -53,6 +53,13 @@ export interface PpgSignalSnapshot {
   readonly skewness: number;
   readonly kurtosis: number;
   readonly fpsActual: number;
+  /** Smoothed RGB means (0..255) — feed for SpO2 / lipids / glucose heads. */
+  readonly meanR: number;
+  readonly meanG: number;
+  readonly meanB: number;
+  /** Green-channel DC estimate; used for absorbance-style transforms. */
+  readonly dcEstimate: number;
+  readonly samplesProcessed: number;
 }
 
 export interface SafeMediaTrackCapabilities {

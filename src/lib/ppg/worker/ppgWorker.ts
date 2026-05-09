@@ -43,6 +43,14 @@ export interface WorkerOutboundSnapshot {
   readonly kurtosis: number;
   readonly fpsActual: number;
   readonly samples: number;
+  /** Smoothed mean R/G/B in [0..255], suitable as input to SpO2 / lipids heads. */
+  readonly meanR: number;
+  readonly meanG: number;
+  readonly meanB: number;
+  /** Current Green-channel DC estimate (used for absorbance-style metrics). */
+  readonly dcEstimate: number;
+  /** Total samples processed since worker init (or last reset). */
+  readonly samplesProcessed: number;
 }
 
 const ringCapacity = Math.max(
@@ -62,6 +70,11 @@ let dcInitialized = false;
 let snapshotBuffer = new Float32Array(ringCapacity);
 let lastEmit = 0;
 let sampleCount = 0;
+// Smoothed RGB means (EMA in RGB space) for downstream vital estimators.
+let meanR = 0;
+let meanG = 0;
+let meanB = 0;
+const RGB_EMA_ALPHA = 0.15;
 let sqiWeights: SqiWeights = {
   perfusionScale: 25,
   weightPerfusion: 0.55,
@@ -83,11 +96,17 @@ function handleSample(payload: Float32Array): void {
   sampleCount++;
   if (!dcInitialized) {
     dcEstimate = dcSource;
+    meanR = r;
+    meanG = g;
+    meanB = b;
     dcInitialized = true;
   } else {
     // Fast convergence first second (~30 samples), then slow tracking.
     const dcAlpha = sampleCount < 30 ? 0.15 : 0.01;
     dcEstimate = dcEstimate * (1 - dcAlpha) + dcSource * dcAlpha;
+    meanR = meanR * (1 - RGB_EMA_ALPHA) + r * RGB_EMA_ALPHA;
+    meanG = meanG * (1 - RGB_EMA_ALPHA) + g * RGB_EMA_ALPHA;
+    meanB = meanB * (1 - RGB_EMA_ALPHA) + b * RGB_EMA_ALPHA;
   }
 
   const filt = bandpass.process(fused.value);
@@ -113,6 +132,11 @@ function handleSample(payload: Float32Array): void {
     kurtosis: sqi.kurtosis,
     fpsActual: fps,
     samples,
+    meanR,
+    meanG,
+    meanB,
+    dcEstimate,
+    samplesProcessed: sampleCount,
   };
   (self as unknown as Worker).postMessage(out, [snapshotBuffer.buffer]);
   snapshotBuffer = new Float32Array(filtered.capacity);
@@ -129,6 +153,10 @@ function handleReset(): void {
   dcEstimate = 0;
   dcInitialized = false;
   lastEmit = 0;
+  sampleCount = 0;
+  meanR = 0;
+  meanG = 0;
+  meanB = 0;
 }
 
 self.addEventListener("message", (event: MessageEvent<WorkerInbound>) => {
