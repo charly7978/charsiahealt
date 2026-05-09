@@ -184,8 +184,6 @@ const Index = () => {
   const { 
     startProcessing, 
     stopProcessing, 
-    lastSignal, 
-    processFrame, 
     isProcessing, 
     framesProcessed,
     getRGBStats,
@@ -231,9 +229,9 @@ const Index = () => {
     context: {
       getCamera: () => cameraRef.current?.getDiagnostics?.() ?? {},
       getPipeline: () => ({
-        sqi: lastSignal?.quality ?? 0,
-        fingerDetected: !!lastSignal?.fingerDetected,
-        perfusionIndex: lastSignal?.perfusionIndex ?? 0,
+        sqi: advanced.snapshot?.sqi ?? 0,
+        fingerDetected: advanced.fingerDetected,
+        perfusionIndex: advanced.snapshot?.perfusionIndex ?? 0,
         bpm: heartRate,
         spo2: vitalSigns.spo2,
         confidence: vitalSigns.measurementConfidence,
@@ -456,7 +454,7 @@ const Index = () => {
       await saveMeasurement({
         heartRate,
         vitalSigns: dataToSave,
-        signalQuality: lastSignal?.quality || 0
+        signalQuality: advanced.snapshot?.sqi || 0
       });
     }
     
@@ -489,7 +487,7 @@ const Index = () => {
     setCalibrationProgress(0);
     
     if (import.meta.env.DEV) console.log('Medición finalizada y guardada');
-  }, [isMonitoring, isCalibrating, cameraStream, stopProcessing, forceCalibrationCompletion, resetVitalSigns, saveMeasurement, heartRate, vitalSigns, lastSignal]);
+  }, [isMonitoring, isCalibrating, cameraStream, stopProcessing, forceCalibrationCompletion, resetVitalSigns, saveMeasurement, heartRate, vitalSigns]);
 
   // === RESET COMPLETO ===
   const handleReset = useCallback(() => {
@@ -574,7 +572,7 @@ const Index = () => {
     const heartBeatResult = processHeartBeat(
       signalValue,
       contactState,
-      lastSignal.timestamp
+      Date.now()
     );
 
     setHeartbeatSignal(stableHumanSignal ? heartBeatResult.filteredValue : 0);
@@ -1210,21 +1208,21 @@ const Index = () => {
           <div className="flex-1 h-full">
             <PPGSignalMeter 
               value={heartbeatSignal}
-              quality={lastSignal?.quality || 0}
-              isFingerDetected={lastSignal?.fingerDetected || false}
+              quality={advanced.snapshot?.sqi || 0}
+              isFingerDetected={advanced.fingerDetected}
               onStartMeasurement={handleToggleMonitoring}
               onReset={handleReset}
               isMonitoring={isMonitoring}
               arrhythmiaStatus={vitalSigns.arrhythmiaStatus}
               rawArrhythmiaData={lastArrhythmiaData.current}
               preserveResults={showResults}
-              diagnosticMessage={lastSignal?.diagnostics?.message}
+              diagnosticMessage={undefined}
               isPeak={beatMarker === 1}
               bpm={heartRate}
               spo2={vitalSigns.spo2}
               rrIntervals={rrIntervals}
               elapsedTime={elapsedTime}
-              perfusionIndex={lastSignal?.perfusionIndex || 0}
+              perfusionIndex={advanced.snapshot?.perfusionIndex || 0}
               pressure={vitalSigns.pressure}
             />
           </div>
@@ -1422,7 +1420,7 @@ const Index = () => {
                     {/* Botón Análisis AI */}
                     <button
                       onClick={() => {
-                        analyzeVitals({ heartRate, vitalSigns, quality: lastSignal?.quality || 0 });
+                        analyzeVitals({ heartRate, vitalSigns, quality: advanced.snapshot?.sqi || 0 });
                         setShowAIAnalysis(true);
                       }}
                       disabled={isAnalyzing}

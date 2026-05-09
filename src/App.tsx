@@ -5,19 +5,19 @@ import NotFound from "./pages/NotFound";
 
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
-  { hasError: boolean }
+  { hasError: boolean; errorMsg: string }
 > {
   constructor(props: { children: React.ReactNode }) {
     super(props);
-    this.state = { hasError: false };
+    this.state = { hasError: false, errorMsg: '' };
   }
 
-  static getDerivedStateFromError() {
-    return { hasError: true };
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, errorMsg: `${error.message}\n${error.stack ?? ''}` };
   }
 
   componentDidCatch(error: Error) {
-    console.error("ErrorBoundary caught:", error.message);
+    console.error("ErrorBoundary caught:", error.message, error.stack);
   }
 
   render() {
@@ -26,9 +26,12 @@ class ErrorBoundary extends React.Component<
         <div style={{
           display: 'flex', flexDirection: 'column', alignItems: 'center',
           justifyContent: 'center', height: '100vh', background: '#000', color: '#fff',
-          fontFamily: 'system-ui', gap: '16px'
+          fontFamily: 'system-ui', gap: '16px', padding: '20px'
         }}>
           <p style={{ fontSize: '18px' }}>Error de renderizado</p>
+          <pre style={{ fontSize: '11px', color: '#f87171', maxWidth: '90vw', overflow: 'auto', whiteSpace: 'pre-wrap', maxHeight: '40vh' }}>
+            {this.state.errorMsg}
+          </pre>
           <button
             onClick={() => window.location.reload()}
             style={{
