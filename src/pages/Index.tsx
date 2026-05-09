@@ -172,6 +172,17 @@ const Index = () => {
     resetPpgRuntimeConfig();
     toast({ title: "✓ PPG defaults restaurados" });
   }, []);
+
+  // Advanced PPG engine (Web Worker pipeline). Runs in parallel to the
+  // legacy processor and shares the existing CameraView <video> element
+  // (no second getUserMedia call is made).
+  const [advVideoEl, setAdvVideoEl] = useState<HTMLVideoElement | null>(null);
+  const [advancedEngineEnabled, setAdvancedEngineEnabled] = useState<boolean>(true);
+  const advanced = usePpgCapture({
+    video: advVideoEl,
+    active: advancedEngineEnabled && isMonitoring && !!cameraStream && !!advVideoEl,
+    useExternalVideo: true,
+  });
   
   // HOOKS DE PROCESAMIENTO
   const { 
