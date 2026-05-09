@@ -90,6 +90,8 @@ const PPGSignalMeter = ({
   const animationRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
   const dataBufferRef = useRef<CircularBuffer | null>(null);
+  // DPR-aware backing-store scale (logical W,H -> backing pixels)
+  const dprScaleRef = useRef<{ sx: number; sy: number }>({ sx: 1, sy: 1 });
   
   const propsRef = useRef({ value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure });
   const lastPeakTimeRef = useRef(0);
@@ -689,6 +691,35 @@ const PPGSignalMeter = ({
     }
   }, []);
 
+  // DPR-aware canvas backing store sized to container
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !canvas.parentElement) return;
+    const parent = canvas.parentElement;
+
+    const resize = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const cssW = parent.clientWidth || CONFIG.CANVAS_WIDTH;
+      const cssH = parent.clientHeight || CONFIG.CANVAS_HEIGHT;
+      const bw = Math.max(1, Math.floor(cssW * dpr));
+      const bh = Math.max(1, Math.floor(cssH * dpr));
+      if (canvas.width !== bw) canvas.width = bw;
+      if (canvas.height !== bh) canvas.height = bh;
+      dprScaleRef.current = {
+        sx: bw / CONFIG.CANVAS_WIDTH,
+        sy: bh / CONFIG.CANVAS_HEIGHT,
+      };
+    };
+    resize();
+    const ro = new ResizeObserver(resize);
+    ro.observe(parent);
+    window.addEventListener('orientationchange', resize);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('orientationchange', resize);
+    };
+  }, []);
+
   // Main render loop
   useEffect(() => {
     if (isRunningRef.current) return;
@@ -712,6 +743,9 @@ const PPGSignalMeter = ({
         animationRef.current = requestAnimationFrame(render);
         return;
       }
+      // Map logical CONFIG.CANVAS coordinates to actual backing-store pixels
+      const { sx, sy } = dprScaleRef.current;
+      ctx.setTransform(sx, 0, 0, sy, 0, 0);
       
       const now = Date.now();
       if (now - lastRenderTime < frameTime) {
@@ -1149,8 +1183,6 @@ const PPGSignalMeter = ({
     <div className="fixed inset-0 bg-slate-950">
       <canvas
         ref={canvasRef}
-        width={CONFIG.CANVAS_WIDTH}
-        height={CONFIG.CANVAS_HEIGHT}
         className="w-full h-full absolute inset-0"
       />
 
