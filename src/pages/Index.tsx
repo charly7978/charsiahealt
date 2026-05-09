@@ -1154,6 +1154,24 @@ const Index = () => {
                         <div className="text-white/40">samples</div>
                         <div className="text-white">{advanced.snapshot?.samplesProcessed ?? 0}</div>
                       </div>
+                      <div>
+                        <div className="text-white/40">resampled @{advanced.snapshot?.resampledRate ?? 0}Hz</div>
+                        <div className="text-white">{advanced.snapshot?.resampledCount ?? 0}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">RoR (R/G)</div>
+                        <div className="text-white">
+                          {advanced.snapshot?.ror != null ? advanced.snapshot.ror.toFixed(3) : "—"}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">SpO₂* exp</div>
+                        <div className="text-amber-300">
+                          {advanced.snapshot?.spo2Experimental != null
+                            ? `${advanced.snapshot.spo2Experimental.toFixed(1)}%`
+                            : "—"}
+                        </div>
+                      </div>
                       <div className="col-span-2">
                         <div className="text-white/40">err</div>
                         <div className="text-amber-300 truncate">{advanced.error ?? "—"}</div>
