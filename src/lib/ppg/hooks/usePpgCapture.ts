@@ -98,16 +98,21 @@ export function usePpgCapture(
     setError(null);
     setState("starting");
     try {
-      const controller = new CameraController();
-      controllerRef.current = controller;
-      const result = await controller.start();
-      video.srcObject = result.stream;
-      try {
-        await video.play();
-      } catch {
-        // iOS may reject play() until a user gesture; the loop still runs.
+      if (!useExternalVideo) {
+        const controller = new CameraController();
+        controllerRef.current = controller;
+        const result = await controller.start();
+        video.srcObject = result.stream;
+        try {
+          await video.play();
+        } catch {
+          // iOS may reject play() until a user gesture; the loop still runs.
+        }
+        setDiagnostics(result.diagnostics);
+      } else {
+        // External owner manages the stream/torch/locks. We only consume frames.
+        setDiagnostics(null);
       }
-      setDiagnostics(result.diagnostics);
 
       const downsampler = new FrameDownsampler();
       downsamplerRef.current = downsampler;
