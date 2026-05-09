@@ -1091,6 +1091,9 @@ const Index = () => {
                         <div className="text-amber-300 truncate">{advanced.error ?? "—"}</div>
                       </div>
                     </div>
+                    <div className="mt-2 text-[10px] font-mono text-amber-300/90 border-t border-white/10 pt-2">
+                      MODO: CRUDO — sin EMA, sin gates, sin retención
+                    </div>
                   </div>
 
                   <div className="grid grid-cols-2 gap-2 mt-3">
