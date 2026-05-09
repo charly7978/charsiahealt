@@ -330,11 +330,10 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
 
       if (this.fingerConfidenceCount >= this.FINGER_CONFIRM_FRAMES) {
         this.fingerDetected = true;
-        // STABLE requires real perfusion AND sustained liveness — color alone
-        // (e.g. red plastic under flash) is not sufficient.
+        // STABLE requires real perfusion — liveness stays informational so
+        // measurement never stops while the user is testing the pipeline.
         const perfusion = this.calculatePerfusionIndex();
-        const livenessOk = this.livenessOkStreak >= this.LIVENESS_OK_STREAK_NEEDED;
-        this.contactState = (this.stableContactCount >= this.STABLE_THRESHOLD && perfusion > 0.003 && livenessOk)
+        this.contactState = (this.stableContactCount >= this.STABLE_THRESHOLD && perfusion > 0.003)
           ? 'STABLE_CONTACT'
           : 'UNSTABLE_CONTACT';
       }
