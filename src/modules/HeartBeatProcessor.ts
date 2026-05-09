@@ -126,21 +126,35 @@ export class HeartBeatProcessor {
     const timeSinceLastPeak = this.lastPeakTime > 0 ? now - this.lastPeakTime : Number.MAX_SAFE_INTEGER;
     let isPeak = false;
 
-    if (timeSinceLastPeak >= this.MIN_PEAK_INTERVAL_MS) {
+    // === MOTION GATE ===
+    // Hard reject: severe motion → no peak this frame, but keep buffers
+    // (graceful resume when motion subsides).
+    const motionHardReject = this.currentMotionScore >= this.MOTION_REJECT_THRESHOLD;
+
+    if (!motionHardReject && timeSinceLastPeak >= this.MIN_PEAK_INTERVAL_MS) {
       isPeak = this.detectPeakWithScoring(timeSinceLastPeak);
 
       if (isPeak) {
         if (this.lastPeakTime > 0 && timeSinceLastPeak <= this.MAX_PEAK_INTERVAL_MS) {
           this.rrIntervals.push(timeSinceLastPeak);
+          this.rrMotionScores.push(this.currentMotionScore);
           if (this.rrIntervals.length > this.MAX_RR_INTERVALS) {
             this.rrIntervals.shift();
+            this.rrMotionScores.shift();
           }
 
-          // Robust BPM = 60000 / median(last 5 RR). No EMA blending,
-          // no frequency fallback — but median rejects single outlier beats
-          // (standard practice: Tarvainen 2014, Kubios HRV).
-          const tail = this.rrIntervals.slice(-5).sort((a, b) => a - b);
-          const medianIBI = tail[Math.floor(tail.length / 2)] ?? timeSinceLastPeak;
+          // Robust BPM = 60000 / median(last 5 CLEAN RR).
+          // IBIs whose motionScore exceeded MOTION_TAINT_THRESHOLD are
+          // excluded (Tarvainen 2014; Kubios HRV; Tamura 2014 motion-rejection
+          // for wearable PPG). If <2 clean IBIs remain, fall back to the raw
+          // tail rather than freezing the display indefinitely.
+          const tailLen = Math.min(8, this.rrIntervals.length);
+          const tailIbis = this.rrIntervals.slice(-tailLen);
+          const tailMot = this.rrMotionScores.slice(-tailLen);
+          const clean = tailIbis.filter((_, i) => tailMot[i] < this.MOTION_TAINT_THRESHOLD);
+          const usable = clean.length >= 2 ? clean : tailIbis;
+          const sorted = [...usable].slice(-5).sort((a, b) => a - b);
+          const medianIBI = sorted[Math.floor(sorted.length / 2)] ?? timeSinceLastPeak;
           this.smoothBPM = 60000 / medianIBI;
           this.consecutivePeaks++;
         }
