@@ -90,6 +90,8 @@ const PPGSignalMeter = ({
   const animationRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
   const dataBufferRef = useRef<CircularBuffer | null>(null);
+  // DPR-aware backing-store scale (logical W,H -> backing pixels)
+  const dprScaleRef = useRef<{ sx: number; sy: number }>({ sx: 1, sy: 1 });
   
   const propsRef = useRef({ value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure });
   const lastPeakTimeRef = useRef(0);
