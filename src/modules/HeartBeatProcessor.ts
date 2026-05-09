@@ -128,20 +128,8 @@ export class HeartBeatProcessor {
             this.rrIntervals.shift();
           }
 
-          const instantBPM = 60000 / timeSinceLastPeak;
-
-          if (this.smoothBPM === 0) {
-            this.smoothBPM = instantBPM;
-          } else {
-            const relativeDiff = Math.abs(instantBPM - this.smoothBPM) / Math.max(1, this.smoothBPM);
-            let alpha = 0.25;
-            if (relativeDiff > 0.30) alpha = 0.08;
-            else if (relativeDiff > 0.18) alpha = 0.15;
-            if (this.consecutivePeaks < 5) alpha = Math.max(0.06, alpha - 0.08);
-
-            this.smoothBPM = this.smoothBPM * (1 - alpha) + instantBPM * alpha;
-          }
-
+          // RAW MODE: no EMA. BPM is the instantaneous 60000 / lastIBI.
+          this.smoothBPM = 60000 / timeSinceLastPeak;
           this.consecutivePeaks++;
         }
 
@@ -155,20 +143,9 @@ export class HeartBeatProcessor {
       this.consecutivePeaks = Math.max(0, this.consecutivePeaks - 1);
     }
 
-    // === FUSIÓN TIEMPO + FRECUENCIA ===
-    // BLOCK: never show frequency-only BPM without at least 1 confirmed time-domain peak
-    let displayBPM = this.smoothBPM;
-
-    if (this.frequencyBPM > 0 && this.consecutivePeaks >= 3) {
-      if (this.consecutivePeaks < 5 || this.signalQualityIndex < 35) {
-        // Weak signal — blend with caution
-        displayBPM = displayBPM * 0.65 + this.frequencyBPM * 0.35;
-      } else {
-        // Strong signal — trust peaks more
-        displayBPM = displayBPM * 0.88 + this.frequencyBPM * 0.12;
-      }
-    }
-    // If no peaks confirmed yet, displayBPM stays 0 — no guessing
+    // RAW MODE: no fusion blend, no frequency-domain fallback. Display
+    // exactly the instantaneous BPM from the last interval (or 0).
+    const displayBPM = this.smoothBPM;
 
     const confidence = this.calculateConfidence();
 

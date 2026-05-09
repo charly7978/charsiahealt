@@ -2,7 +2,7 @@
 
 exports[`HeartBeatProcessor regression baseline > produces stable output snapshot for a 72 BPM sinusoid @ 30 fps / 12 s 1`] = `
 {
-  "bpm": 72.1784,
+  "bpm": 72,
   "derivTail": [
     -1.629725,
     -1.856057,
@@ -18,7 +18,7 @@ exports[`HeartBeatProcessor regression baseline > produces stable output snapsho
 
 exports[`HeartBeatProcessor regression baseline > produces stable output snapshot for a 95 BPM sinusoid @ 30 fps / 10 s 1`] = `
 {
-  "bpm": 95.459,
+  "bpm": 94.7368,
   "isPeakCount": 13,
   "rrFirst": 600,
   "rrLast": 633.3333,

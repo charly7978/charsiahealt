@@ -1,77 +1,65 @@
-# Bloqueo del falso positivo "objeto rojo = dedo humano"
+# Por qué hoy aparecen ondas y vitales "lindos" sin dedo
 
-## Diagnóstico del problema
+Aunque ya removimos el bloqueo por liveness, el sistema sigue *fabricando* señales plausibles a partir de cualquier escena por **3 mecanismos acumulativos**:
 
-Hoy la detección de dedo se basa **solo en color** (rojo dominante + brillo + cobertura + flash):
+1. **Pseudo‑pulso por baseline EMA** (`PPGSignalProcessor.extractBestPulseSignal`)
+   - Se construye `rNorm = (redBaseline − rawRed) / redBaseline`, con `redBaseline` siguiendo a `rawRed` con `α = 0.02–0.04`. La diferencia entre la media lenta y el valor instantáneo es **siempre una oscilación de ~0.7–4 Hz** (justo la banda cardíaca), aún apuntando a una pared. Después se multiplica por **3200** y se mete al bandpass: lo que sale parece una onda PPG perfecta.
 
-- `detectFingerInstant()` en `PPGSignalProcessor.ts` valida `R > 80`, `R/G > 1.2`, `R - (G+B)/2 > 20`, cobertura, `fingerScore`. **Cualquier plástico rojo bajo flash cumple esto** — la firma de hemoglobina por color no distingue piel viva de pigmento inerte.
-- Una vez que pasa al estado `STABLE_CONTACT`, el gate aguas abajo (`stableHumanSignal` en `Index.tsx`) solo pide `quality >= 12` y `perfusionIndex >= 0.005`. Esos umbrales se llenan con ruido residual del AGC de cámara + micro‑movimientos de la mano, y el `BandpassFilter` (0.5–4 Hz) deja pasar cualquier oscilación lenta. El detector de picos entonces fabrica latidos sobre ruido, y `VitalSignsProcessor` empieza a publicar SpO₂/PA/glucosa/lípidos.
-- No existe ninguna comprobación de **pulsatilidad real** ni de **periodicidad cardíaca sostenida** antes de declarar contacto válido.
+2. **Suavizado y retención en `VitalSignsProcessor`**
+   - `EMA_ALPHA_STABLE = 0.20`, `EMA_ALPHA_DYNAMIC = 0.30`. Una vez que entró un valor "razonable" (SpO₂ entre 70–100, glucosa 40–400, etc.), el EMA lo conserva visible aunque la entrada se vuelva basura.
+   - `getFormattedResult()` siempre devuelve el último `measurements.*` aunque `validateRealPulse` falle (no se ponen a 0).
 
-Esto contradice la promesa del producto. La regla correcta no es "no medir si no hay dedo" — la app **siempre captura y reporta** — pero **debe reportar honestamente**: con un objeto rojo el sistema tiene que mostrar el modo `RESEARCH_ONLY` / `INVALID` con vitales en `--`, y un mensaje técnico que diga "señal no humana / sin pulsatilidad cardíaca", nunca BPM/SpO₂/PA fabricados.
+3. **Gates que se cumplen con ruido**
+   - `stableHumanSignal` solo pide `quality ≥ 12` y `perfusionIndex ≥ 0.005`. El ruido del AGC + flash sobre cualquier objeto los cumple.
+   - El detector de picos (`HeartBeatProcessor`) tiene `prominence ≥ 2.2` sobre señal **ya normalizada × 120**: el ruido amplificado lo supera trivialmente.
 
-## Objetivo
+Resultado: la app reporta lo que *parece* un humano sano porque el propio pipeline está diseñado para alisar y sostener.
 
-Añadir una **Liveness Gate** real, multi‑evidencia, que un objeto rojo inerte no pueda aprobar nunca, sin tocar UI/estética. La app sigue corriendo el pipeline 100% del tiempo; lo único que cambia es cuándo se permite **emitir vitales** y cuándo el `MeasurementGate` los marca como `INVALID` con motivo explícito.
+# Plan: modo "crudo total + solo bruto"
+
+Tu decisión:
+- **Salida visible: Crudo total** → seguir mostrando ondas y métricas siempre, aunque sean absurdas.
+- **Tratamiento: Solo bruto** → quitar EMA y retención; cada valor en pantalla es el cálculo directo del frame/ventana actual.
 
 ## Cambios
 
-### 1. `src/modules/signal-processing/PPGSignalProcessor.ts` — Liveness multi‑evidencia
+### 1. `PPGSignalProcessor.extractBestPulseSignal` — quitar el "pulso fabricado"
+- Eliminar la división por baseline EMA. La señal cruda emitida será la **verdadera intensidad media del canal** (R, G o RG) **sin restar baseline** y **sin multiplicar × 3200**.
+- El `BandpassFilter` se queda — es el que convierte cualquier DC en oscilación honesta. Pero ya no estará alimentado con un "diff vs media móvil" (que es matemáticamente un pseudo‑pulso garantizado).
+- `pulseSource.strength` será la varianza real corta (std en ventana de 30 muestras) del canal seleccionado, no `|rPulse|·1000`.
 
-Añadir un `LivenessEvaluator` privado que mantenga ventanas cortas (~4 s) sobre el canal verde filtrado y produzca un veredicto por frame. Para que `STABLE_CONTACT` se conceda **además** de los criterios cromáticos actuales, se exige TODO lo siguiente, sostenido durante ≥2 s:
+### 2. `Index.tsx` — siempre emitir, sin gate `stableHumanSignal`
+- Eliminar `stableHumanSignal` y el contador `unstableFrameCounter`. El bloque que pone vitales a 0/`INVALID` se borra.
+- `setHeartbeatSignal(heartBeatResult.filteredValue)` siempre — la onda se pinta venga de donde venga.
+- `setHeartRate(heartBeatResult.bpm)` siempre, aunque sea 0 o errático. Sin sanity gate "freezing".
+- `processVitalSigns(...)` se llama siempre con los `rrData` que produzca el `HeartBeatProcessor`, sin filtrar por `confidence > 0.18`.
+- El `VitalsSanityChecker` deja de **bloquear** la actualización: solo registra el verdict para auditoría (toast/log), pero los números mostrados son los crudos del frame.
 
-- **AC/DC mínima fisiológica**: `(rojoAC / rojoDC) >= 0.0015` Y `(verdeAC / verdeDC) >= 0.0010`. Los objetos inertes tienen `AC/DC ≈ 0` salvo ruido de cámara, que no llega a estos niveles bajo flash bloqueado.
-- **Pulsatilidad temporal** (no DC pura): varianza de la señal bandpassed normalizada por su DC en un rango cardíaco plausible.
-- **Periodicidad cardíaca**: pico de autocorrelación dominante en lag correspondiente a 40–200 BPM (0.3–1.5 s) con altura ≥0.35 sobre el pico de ruido. Los objetos inertes producen autocorrelación plana o dominada por la respiración/movimiento (<0.5 Hz).
-- **Coherencia espectral**: relación de potencia en banda 0.7–4 Hz vs banda 0–0.5 Hz (drift) ≥ 0.6.
-- **Variabilidad inter‑latido aceptable**: cuando el detector de picos engancha, los IBI no pueden ser todos idénticos (firma de simulación) ni dispersos > 40% del IBI medio.
+### 3. `VitalSignsProcessor` — eliminar EMA y retención
+- `smoothValue(...)` queda en passthrough: `return raw`. SpO₂, BP, glucosa, hemoglobina, lípidos se actualizan con el cálculo directo de la ventana actual.
+- `getFormattedResult()`: si la última iteración no produjo un valor (no hubo ciclos / RR insuficientes), devolver **0** para esa métrica en vez del previo. Sin "soft hold".
+- Quitar la guarda `if (!hasRealPulse) return getFormattedResult()` que congelaba previos: si no hay pulso, todo a 0 ese frame.
+- Eliminar las ventanas de validación (`spo2 > 70 && < 100`, etc.) que **descartaban** valores extremos: ahora se publica el número crudo, sea 42 o 187. Esto es exactamente el "ver la realidad" que pediste.
 
-Salida del evaluador: `livenessScore ∈ [0,1]` y `livenessReason: 'OK' | 'NO_PULSATILITY' | 'NO_PERIODICITY' | 'DRIFT_ONLY' | 'CONSTANT_IBI' | 'INERT_DC'`.
+### 4. `HeartBeatProcessor` — quitar suavizado de BPM
+- Reemplazar `smoothBPM` por `instantBPM = 60000 / lastIBI` directamente.
+- Quitar el blend tiempo+frecuencia (`displayBPM = ... * 0.88 + frequencyBPM * 0.12`). Devolver solo el BPM instantáneo del último intervalo válido. Si no hay último intervalo: 0.
+- Mantener `MIN_PEAK_INTERVAL_MS` y la detección de picos como están — no toco el detector, solo dejo de mentir alisando.
 
-Integración en `updateContactState`:
-- `STABLE_CONTACT` requiere `instantDetected && livenessScore >= 0.6` durante ≥`STABLE_THRESHOLD` frames.
-- Si liveness cae `<0.4`, degradar inmediatamente a `UNSTABLE_CONTACT` (sin esperar `FINGER_LOST_FRAMES`) con `livenessReason` propagado.
-- Exponer `livenessScore`, `livenessReason` en el `ProcessedSignal` (campo nuevo, retro‑compatible).
+### 5. UI — etiqueta de modo
+- En el panel técnico ya existente (`advanced.*` / debug), añadir una línea visible permanente:
+  `MODO: CRUDO — sin EMA, sin gates, sin retención`
+  para que quede claro que lo que se ve es exactamente lo que el algoritmo decodifica frame a frame.
 
-### 2. `src/pages/Index.tsx` — Gate de emisión honesto
-
-- Reemplazar `stableHumanSignal` por `humanPlausibility = stableContact && livenessScore >= 0.55 && perfusionIndex >= 0.008 && quality >= 25`. Subir umbrales para evitar que ruido residual del AGC los cruce.
-- Cuando `humanPlausibility === false`:
-  - Mantener la captura, el waveform y los diagnósticos visibles (sin tocar UI).
-  - Forzar `vitals.measurementConfidence = 'INVALID'`, vitales en cero, BPM en `--`.
-  - Mostrar en el panel técnico ya existente el motivo (`livenessReason`) y el `livenessScore`. Sin nuevos componentes visuales: usar el bloque `advanced.*` actual.
-- Bloquear el guardado de la sesión (`useSaveMeasurement`) si nunca hubo `humanPlausibility === true` durante la ventana de 60 s; en su lugar, registrar la sesión como `quality = 'NO_HUMAN_SIGNAL'` para auditoría.
-
-### 3. `src/modules/vital-signs/VitalSignsProcessor.ts` — Cinturón de seguridad
-
-- En `processSignal`, exigir `livenessScore >= 0.55` (recibido del input ampliado) para promover `measurementConfidence` por encima de `INVALID`. Hoy ya existe `MeasurementGate`; sumar `liveness` como precondición dura para SpO₂, PA, glucosa y lípidos.
-- No tocar las fórmulas ni la calibración: solo el gate.
-
-### 4. Tests de regresión
-
-Crear `src/modules/signal-processing/__tests__/Liveness.test.ts`:
-
-- **Caso A — DC puro (objeto rojo inerte)**: alimentar 6 s de señal con R/G/B constantes y ruido gaussiano de σ=0.5 sobre 250. Esperar `livenessScore < 0.2`, `livenessReason ∈ {INERT_DC, NO_PULSATILITY}`, `contactState !== 'STABLE_CONTACT'`.
-- **Caso B — sinusoide cardíaca sintética**: 1.2 Hz sobre DC=180 con amplitud 4. Esperar `livenessScore >= 0.7` y `STABLE_CONTACT` tras los frames de confirmación.
-- **Caso C — drift lento sin pulso** (0.3 Hz): esperar `livenessReason === 'DRIFT_ONLY'`.
-- **Caso D — IBI constante** (señal cuadrada perfecta): esperar `livenessReason === 'CONSTANT_IBI'`.
-
-Ampliar `HeartBeatProcessor.regression.test.ts` para confirmar que con `livenessScore=0` el flujo aguas arriba no promueve vitales.
-
-### 5. Tipos
-
-- Extender `ProcessedSignal` (`src/types/signal.d.ts`) con `livenessScore: number; livenessReason: string;`.
-- Extender el snapshot del worker / `PpgSignalSnapshot` solo si Index.tsx lo necesita; preferiblemente mantener la liveness exclusivamente en el path legado (`PPGSignalProcessor`) que ya alimenta los vitales — el worker avanzado se queda como diagnóstico.
-
-## Detalles técnicos
-
-- Toda la matemática nueva (autocorrelación, AC/DC, varianza espectral) usa `Float64Array` con `NumericRingBuffer` ya existente — sin GC en hot path.
-- Autocorrelación de 4 s a Fs≈30 Hz = 120 muestras, lags 9–45: O(n·k) ≈ 4 320 ops/frame, despreciable.
-- Sin cambios de diseño visual ni de paleta. Sin nuevos botones. Solo se enriquece el panel técnico avanzado existente y el motivo de `INVALID` que ya muestra el bloque de vitales.
-- Sin simulaciones, sin `Math.max` para forzar rangos, sin defaults fabricados — coherente con las memorias del proyecto.
+## Lo que NO cambia
+- Captura de cámara, ROI, `BandpassFilter`, `LivenessEvaluator` (queda como telemetría informativa), `ArrhythmiaProcessor`, persistencia, UI estética.
+- No se reintroducen restricciones de "no dedo = no medir". La app **siempre mide**.
 
 ## Resultado esperado
+- Apuntando a una pared/objeto rojo: la onda mostrará el ruido real del sensor (mucho más errática y de menor amplitud que ahora), BPM saltará entre 0 y valores incoherentes, SpO₂/PA/glucosa cambiarán cuadro a cuadro o se quedarán en 0. Eso es la **prueba honesta** de que el algoritmo está procesando lo que llega de la cámara.
+- Con dedo real + flash: el verdadero pulso fisiológico aparece como una oscilación coherente real (no fabricada por baseline‑EMA), y como tal sí produce BPM/SpO₂ estables.
 
-- Con dedo: comportamiento idéntico, latencia de adquisición similar (1–2 s extra solo cuando la señal es marginal).
-- Con objeto rojo / pared roja / dedo sin flash: BPM en `--`, SpO₂/PA/glucosa/lípidos en `--`, panel técnico explica `INVALID — NO_PULSATILITY` o `INERT_DC`. La app sigue capturando y mostrando waveform plano.
-- Tests verdes y `tsc` limpio.
+## Tests
+- Actualizar `HeartBeatProcessor.regression.test.ts` (snapshot) para reflejar BPM instantáneo sin EMA.
+- Ajustar `Liveness.test.ts` solo para que no asuma valores suavizados.
+- `tsc` limpio.
