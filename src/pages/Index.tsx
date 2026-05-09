@@ -646,10 +646,17 @@ const Index = () => {
     
     const signalValue = lastSignal.filteredValue;
     const contactState = (lastSignal as any).contactState || (lastSignal.fingerDetected ? 'STABLE_CONTACT' : 'NO_CONTACT');
+    const livenessScore = (lastSignal as any).livenessScore ?? 0;
+    const livenessReason = (lastSignal as any).livenessReason ?? 'WARMING_UP';
+    // Honest gate: requires real human PPG (sustained periodicity in cardiac
+    // band). A red object under flash satisfies color/perfusion thresholds
+    // but never reaches livenessScore >= 0.55, so vitals stay at "--".
     const stableHumanSignal =
       contactState === 'STABLE_CONTACT' &&
-      (lastSignal.quality || 0) >= 12 &&
-      (lastSignal.perfusionIndex || 0) >= 0.005;
+      livenessScore >= 0.55 &&
+      livenessReason === 'OK' &&
+      (lastSignal.quality || 0) >= 25 &&
+      (lastSignal.perfusionIndex || 0) >= 0.008;
 
     const heartBeatResult = processHeartBeat(
       signalValue,
