@@ -3,7 +3,7 @@ import { CameraController } from "../camera/cameraController";
 import { FrameLoop } from "../capture/frameLoop";
 import { FrameDownsampler } from "../capture/downsample";
 import { AdaptiveRoi } from "../roi/adaptiveRoi";
-import { classifyFrame } from "../detection/fingerDetector";
+import { classifyAndAggregate } from "../capture/combinePass";
 import {
   PPG_CONFIG,
   type CameraDiagnostics,
