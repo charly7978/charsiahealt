@@ -224,7 +224,7 @@ const Index = () => {
     context: {
       getCamera: () => cameraRef.current?.getDiagnostics?.() ?? {},
       getPipeline: () => ({
-        sqi: advanced.snapshot?.sqi ?? 0,
+        sqi: (advanced.snapshot?.sqi ?? 0) * 100,
         fingerDetected: advanced.fingerDetected,
         perfusionIndex: advanced.snapshot?.perfusionIndex ?? 0,
         bpm: heartRate,
@@ -445,7 +445,7 @@ const Index = () => {
       await saveMeasurement({
         heartRate,
         vitalSigns: dataToSave,
-        signalQuality: advanced.snapshot?.sqi || 0
+        signalQuality: (advanced.snapshot?.sqi || 0) * 100
       });
     }
     
@@ -552,11 +552,12 @@ const Index = () => {
 
     const signalValue = snap.filtered[snap.filtered.length - 1];
     const contactState = advanced.fingerDetected ? 'STABLE_CONTACT' as const : 'NO_CONTACT' as const;
-    const quality = snap.sqi ?? 0;
+    const quality = snap.sqi ?? 0;           // Worker SQI: range [0, 1]
+    const qualityPct = quality * 100;          // Scale to 0-100 for UI
     const perfIdx = snap.perfusionIndex ?? 0;
     const stableHumanSignal =
       contactState === 'STABLE_CONTACT' &&
-      quality >= 12 &&
+      quality >= 0.12 &&
       perfIdx >= 0.005;
 
     const heartBeatResult = processHeartBeat(
@@ -1202,7 +1203,7 @@ const Index = () => {
           <div className="flex-1 h-full">
             <PPGSignalMeter 
               value={heartbeatSignal}
-              quality={advanced.snapshot?.sqi || 0}
+              quality={(advanced.snapshot?.sqi || 0) * 100}
               isFingerDetected={advanced.fingerDetected}
               onStartMeasurement={handleToggleMonitoring}
               onReset={handleReset}
@@ -1414,7 +1415,7 @@ const Index = () => {
                     {/* Botón Análisis AI */}
                     <button
                       onClick={() => {
-                        analyzeVitals({ heartRate, vitalSigns, quality: advanced.snapshot?.sqi || 0 });
+                        analyzeVitals({ heartRate, vitalSigns, quality: (advanced.snapshot?.sqi || 0) * 100 });
                         setShowAIAnalysis(true);
                       }}
                       disabled={isAnalyzing}
