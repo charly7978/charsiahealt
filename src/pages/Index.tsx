@@ -1090,6 +1090,59 @@ const Index = () => {
                     Cambios en vivo, sin reiniciar la cámara. Persiste en este dispositivo.
                   </p>
 
+                  {/* Advanced engine live readout */}
+                  <div className="mt-3 rounded border border-white/10 bg-black/30 p-2">
+                    <div className="flex items-center justify-between">
+                      <div className="text-[11px] font-medium text-white/80">
+                        Advanced engine (Web Worker)
+                      </div>
+                      <label className="flex items-center gap-1 text-[10px] text-white/60">
+                        <input
+                          type="checkbox"
+                          checked={advancedEngineEnabled}
+                          onChange={(e) => setAdvancedEngineEnabled(e.target.checked)}
+                        />
+                        on
+                      </label>
+                    </div>
+                    <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-white/70">
+                      <div>
+                        <div className="text-white/40">state</div>
+                        <div className="text-white">{advanced.state}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">finger</div>
+                        <div className={advanced.fingerDetected ? "text-emerald-400" : "text-rose-400"}>
+                          {advanced.fingerDetected ? "yes" : "no"}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">fps</div>
+                        <div className="text-white">{advanced.fpsInstant.toFixed(1)}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">SQI</div>
+                        <div className="text-white">{(advanced.snapshot?.sqi ?? 0).toFixed(2)}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">PI%</div>
+                        <div className="text-white">{((advanced.snapshot?.perfusionIndex ?? 0) * 100).toFixed(2)}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">skew</div>
+                        <div className="text-white">{(advanced.snapshot?.skewness ?? 0).toFixed(2)}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">kurt</div>
+                        <div className="text-white">{(advanced.snapshot?.kurtosis ?? 0).toFixed(2)}</div>
+                      </div>
+                      <div className="col-span-2">
+                        <div className="text-white/40">err</div>
+                        <div className="text-amber-300 truncate">{advanced.error ?? "—"}</div>
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-2 gap-2 mt-3">
                     <label className="text-[11px] text-white/70">
                       ROI cols: <span className="text-white">{ppgCfg.roi.cols}</span>
