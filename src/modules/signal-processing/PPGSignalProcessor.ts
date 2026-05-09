@@ -1,5 +1,6 @@
 import type { ProcessedSignal, ProcessingError, SignalProcessor as SignalProcessorInterface, ContactState } from '../../types/signal';
 import { BandpassFilter } from './BandpassFilter';
+import { LivenessEvaluator, type LivenessVerdict } from './LivenessEvaluator';
 import { createLogger, ppgPerf } from '../../utils/logger';
 import {
   DEFAULT_BACKPRESSURE_CONFIG,
@@ -114,6 +115,22 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   private sourceScores: { [key: string]: number } = {};
   private lastSourceSwitch = 0;
   private readonly SOURCE_HYSTERESIS_MS = 2000;
+
+  // === LIVENESS GATE ===
+  private readonly liveness = new LivenessEvaluator(5, 30);
+  private lastLiveness: LivenessVerdict = {
+    score: 0,
+    reason: 'WARMING_UP',
+    acdcRed: 0,
+    acdcGreen: 0,
+    autocorrPeak: 0,
+    autocorrLag: 0,
+    cardiacToDriftRatio: 0,
+  };
+  private livenessFrameCounter = 0;
+  private readonly LIVENESS_EVAL_EVERY = 6; // ≈5 Hz at 30 fps; cheap.
+  private livenessOkStreak = 0;
+  private readonly LIVENESS_OK_STREAK_NEEDED = 8; // need consistent OK before STABLE.
 
   constructor(
     public onSignalReady?: (signal: ProcessedSignal) => void,
