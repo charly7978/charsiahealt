@@ -576,26 +576,25 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.blueBaseline = this.blueBaseline * (1 - alpha) + rawBlue * alpha;
   }
 
-  // === MULTI-SOURCE COMPETITIVE EXTRACTION ===
+  // === MULTI-SOURCE RAW EXTRACTION ===
+  // RAW MODE: emit the actual channel intensity (no baseline subtraction, no
+  // ×3200 amplification). The downstream BandpassFilter removes DC honestly.
+  // This means: pointing at a wall, the input is a quasi-static value plus
+  // sensor noise — the bandpass output will be small jitter, NOT a fabricated
+  // cardiac-band sinusoid. With a real finger+flash, true pulsatile changes
+  // in mean intensity drive the filter and produce a real PPG wave.
   private extractBestPulseSignal(
-    rawRed: number, rawGreen: number, rawBlue: number, motionArtifact: boolean
+    rawRed: number, rawGreen: number, rawBlue: number, _motionArtifact: boolean
   ): { value: number; label: string; strength: number } {
-    const rNorm = this.redBaseline > 0 ? (this.redBaseline - rawRed) / this.redBaseline : 0;
-    const gNorm = this.greenBaseline > 0 ? (this.greenBaseline - rawGreen) / this.greenBaseline : 0;
-    const bNorm = this.blueBaseline > 0 ? (this.blueBaseline - rawBlue) / this.blueBaseline : 0;
-
-    const clamp = (v: number) => this.clamp(v, -0.04, 0.04);
-    const rPulse = clamp(rNorm);
-    const gPulse = clamp(gNorm);
-
-    // Source candidates (CHROM removed — amplifies noise without finger)
+    void rawBlue;
+    // Source candidates: raw channel means.
     const sources: { [key: string]: number } = {
-      R: rPulse * 3200,
-      G: gPulse * 3200,
-      RG: this.blendRG(rPulse, gPulse, rawRed, rawGreen, motionArtifact) * 3200,
+      R: rawRed,
+      G: rawGreen,
+      RG: (rawRed + rawGreen) * 0.5,
     };
 
-    // Update per-source buffers
+    // Update per-source buffers (still useful for ranking on real variance).
     for (const key of Object.keys(sources)) {
       this.sourceBuffers[key].push(sources[key]);
       if (this.sourceBuffers[key].length > 120) {
@@ -603,13 +602,22 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       }
     }
 
-    // Rank sources every ~1 second (30 frames)
     if (this.frameCount % 30 === 0 && this.redBuffer.length >= 60) {
       this.rankSources();
     }
 
-    const value = this.clamp(sources[this.activeSource] ?? sources['RG'], -80, 80);
-    const strength = Math.max(Math.abs(rPulse), Math.abs(gPulse)) * 1000;
+    const value = sources[this.activeSource] ?? sources['RG'];
+
+    // Strength = real short-window std of the active source (not a
+    // fabricated metric derived from baseline-EMA division).
+    const buf = this.sourceBuffers[this.activeSource] ?? this.sourceBuffers['RG'];
+    let strength = 0;
+    if (buf.length >= 8) {
+      const recent = buf.slice(-30);
+      const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
+      const variance = recent.reduce((a, v) => a + (v - mean) ** 2, 0) / recent.length;
+      strength = Math.sqrt(variance);
+    }
 
     return { value, label: this.activeSource, strength };
   }
