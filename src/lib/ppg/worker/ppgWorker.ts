@@ -53,6 +53,14 @@ export interface WorkerOutboundSnapshot {
   readonly dcEstimate: number;
   /** Total samples processed since worker init (or last reset). */
   readonly samplesProcessed: number;
+  /** Effective rate of the resampled DSP stream (Hz). */
+  readonly resampledRate: number;
+  /** Total uniform-grid samples emitted by the cubic-spline resampler. */
+  readonly resampledCount: number;
+  /** Ratio-of-Ratios (R vs G). EXPERIMENTAL — null when gates fail. */
+  readonly ror: number | null;
+  /** Empirical SpO2 from RoR. EXPERIMENTAL — research-only, not clinical. */
+  readonly spo2Experimental: number | null;
 }
 
 const ringCapacity = Math.max(
@@ -84,6 +92,32 @@ let sqiWeights: SqiWeights = {
   weightKurtosis: 0.2,
 };
 const EMIT_INTERVAL_MS = 1000 / PPG_CONFIG.STATE_THROTTLE_HZ;
+
+// --- Cubic-spline resampler (fixed 100 Hz) feeding the RoR estimator ----
+// The bandpass / heartbeat path keeps running at the camera FPS to preserve
+// numerical compatibility with HeartBeatProcessor; the resampled stream is a
+// parallel DSP path used by RoR (and exposed for downstream FFT consumers).
+const RESAMPLED_RATE = 100;
+const splineR = new CubicSplineResampler(RESAMPLED_RATE);
+const splineG = new CubicSplineResampler(RESAMPLED_RATE);
+const ror = new RatioOfRatios({ ...DEFAULT_ROR_CONFIG, sampleRate: RESAMPLED_RATE });
+let resampledCount = 0;
+let lastRoR: number | null = null;
+let lastSpo2: number | null = null;
+// Scratch holders so the resampler emit callback never closes over allocs.
+let lastResampledR = 0;
+let lastResampledG = 0;
+let pendingR = false;
+let pendingG = false;
+
+function onResampledR(_t: number, v: number): void {
+  lastResampledR = v;
+  pendingR = true;
+}
+function onResampledG(_t: number, v: number): void {
+  lastResampledG = v;
+  pendingG = true;
+}
 
 function handleSample(payload: Float32Array): void {
   const r = payload[0];
