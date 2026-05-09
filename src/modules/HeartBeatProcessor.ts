@@ -92,6 +92,7 @@ export class HeartBeatProcessor {
     this.frameCount++;
     const now = timestamp ?? Date.now();
     this.currentMotionScore = motionScore;
+    this.updateMotionCalibration(now, motionScore);
 
     this.signalBuffer.push(filteredValue);
     this.timestampBuffer.push(now);
