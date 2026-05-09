@@ -141,6 +141,10 @@ export function usePpgCapture(
           meanB: data.meanB,
           dcEstimate: data.dcEstimate,
           samplesProcessed: data.samplesProcessed,
+          resampledRate: data.resampledRate,
+          resampledCount: data.resampledCount,
+          ror: data.ror,
+          spo2Experimental: data.spo2Experimental,
         };
         const now = performance.now();
         const minInterval = 1000 / PPG_CONFIG.STATE_THROTTLE_HZ;
