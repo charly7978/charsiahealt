@@ -808,6 +808,9 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.blueDC = 0; this.blueAC = 0;
     this.sourceBuffers = { R: [], G: [], RG: [] };
     this.bandpassFilter.reset();
+    this.liveness.reset();
+    this.livenessOkStreak = 0;
+    this.livenessFrameCounter = 0;
   }
 
   reset(): void {
@@ -847,6 +850,14 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.resetBaselines();
     this.bandpassFilter.setSampleRate(this.estimatedSampleRate);
     this.bandpassFilter.reset();
+    this.liveness.reset();
+    this.livenessOkStreak = 0;
+    this.livenessFrameCounter = 0;
+    this.lastLiveness = {
+      score: 0, reason: 'WARMING_UP',
+      acdcRed: 0, acdcGreen: 0,
+      autocorrPeak: 0, autocorrLag: 0, cardiacToDriftRatio: 0,
+    };
   }
 
   private handleMotionEvent = (event: DeviceMotionEvent) => {
