@@ -576,22 +576,28 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.blueBaseline = this.blueBaseline * (1 - alpha) + rawBlue * alpha;
   }
 
-  // === MULTI-SOURCE RAW EXTRACTION ===
-  // RAW MODE: emit the actual channel intensity (no baseline subtraction, no
-  // ×3200 amplification). The downstream BandpassFilter removes DC honestly.
-  // This means: pointing at a wall, the input is a quasi-static value plus
-  // sensor noise — the bandpass output will be small jitter, NOT a fabricated
-  // cardiac-band sinusoid. With a real finger+flash, true pulsatile changes
-  // in mean intensity drive the filter and produce a real PPG wave.
+  // === MULTI-SOURCE PPG EXTRACTION (Elgendi 2013, Allen 2007) ===
+  // Detrending = (channel − slow baseline). This is the standard PPG
+  // preprocessing step — it removes DC and very-low-frequency drift while
+  // preserving the cardiac AC. A modest gain (×80) brings the AC into the
+  // numeric range expected by the downstream bandpass + peak detector
+  // (prominence ≥ 2.2). NO ×3200 amplification (that was hiding noise as
+  // signal). Without contact, the contact-gate above already emits 0 →
+  // no fabricated waves can leak through.
+  private readonly PULSE_GAIN = 80;
   private extractBestPulseSignal(
     rawRed: number, rawGreen: number, rawBlue: number, _motionArtifact: boolean
   ): { value: number; label: string; strength: number } {
     void rawBlue;
-    // Source candidates: raw channel means.
+    // Detrended AC components (channel − slow EMA baseline).
+    const rAC = this.redBaseline > 0 ? (rawRed - this.redBaseline) : 0;
+    const gAC = this.greenBaseline > 0 ? (rawGreen - this.greenBaseline) : 0;
+    // Inverted convention: as blood volume increases, reflected light DROPS.
+    // Multiply by −1 so peaks correspond to systolic up-strokes (Allen 2007).
     const sources: { [key: string]: number } = {
-      R: rawRed,
-      G: rawGreen,
-      RG: (rawRed + rawGreen) * 0.5,
+      R: -rAC * this.PULSE_GAIN,
+      G: -gAC * this.PULSE_GAIN,
+      RG: -((rAC + gAC) * 0.5) * this.PULSE_GAIN,
     };
 
     // Update per-source buffers (still useful for ranking on real variance).
