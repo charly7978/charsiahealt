@@ -178,6 +178,13 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
 
     if (this.contactState === 'NO_CONTACT') {
       this.signalQuality = 0;
+      this.liveness.reset();
+      this.livenessOkStreak = 0;
+      this.lastLiveness = {
+        score: 0, reason: 'WARMING_UP',
+        acdcRed: 0, acdcGreen: 0,
+        autocorrPeak: 0, autocorrLag: 0, cardiacToDriftRatio: 0,
+      };
       this.onSignalReady({
         timestamp,
         rawValue: 0,
@@ -190,6 +197,8 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
         perfusionIndex: 0,
         rawRed: roi.rawRed,
         rawGreen: roi.rawGreen,
+        livenessScore: 0,
+        livenessReason: 'WARMING_UP',
         diagnostics: {
           message: `BUSCANDO DEDO C:${(roi.coverageRatio * 100).toFixed(0)}%`,
           hasPulsatility: false,
