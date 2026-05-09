@@ -648,7 +648,8 @@ const Index = () => {
     const heartBeatResult = processHeartBeat(
       signalValue,
       contactState,
-      lastSignal.timestamp
+      lastSignal.timestamp,
+      lastSignal.motionScore ?? 0
     );
 
     // RAW MODE: paint the waveform at all times, regardless of contact.
