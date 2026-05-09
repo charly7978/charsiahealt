@@ -1,5 +1,6 @@
 import type { ProcessedSignal, ProcessingError, SignalProcessor as SignalProcessorInterface, ContactState } from '../../types/signal';
 import { BandpassFilter } from './BandpassFilter';
+import { LivenessEvaluator, type LivenessVerdict } from './LivenessEvaluator';
 import { createLogger, ppgPerf } from '../../utils/logger';
 import {
   DEFAULT_BACKPRESSURE_CONFIG,
@@ -115,6 +116,22 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   private lastSourceSwitch = 0;
   private readonly SOURCE_HYSTERESIS_MS = 2000;
 
+  // === LIVENESS GATE ===
+  private readonly liveness = new LivenessEvaluator(5, 30);
+  private lastLiveness: LivenessVerdict = {
+    score: 0,
+    reason: 'WARMING_UP',
+    acdcRed: 0,
+    acdcGreen: 0,
+    autocorrPeak: 0,
+    autocorrLag: 0,
+    cardiacToDriftRatio: 0,
+  };
+  private livenessFrameCounter = 0;
+  private readonly LIVENESS_EVAL_EVERY = 6; // ≈5 Hz at 30 fps; cheap.
+  private livenessOkStreak = 0;
+  private readonly LIVENESS_OK_STREAK_NEEDED = 8; // need consistent OK before STABLE.
+
   constructor(
     public onSignalReady?: (signal: ProcessedSignal) => void,
     public onError?: (error: ProcessingError) => void
@@ -161,6 +178,13 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
 
     if (this.contactState === 'NO_CONTACT') {
       this.signalQuality = 0;
+      this.liveness.reset();
+      this.livenessOkStreak = 0;
+      this.lastLiveness = {
+        score: 0, reason: 'WARMING_UP',
+        acdcRed: 0, acdcGreen: 0,
+        autocorrPeak: 0, autocorrLag: 0, cardiacToDriftRatio: 0,
+      };
       this.onSignalReady({
         timestamp,
         rawValue: 0,
@@ -173,6 +197,8 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
         perfusionIndex: 0,
         rawRed: roi.rawRed,
         rawGreen: roi.rawGreen,
+        livenessScore: 0,
+        livenessReason: 'WARMING_UP',
         diagnostics: {
           message: `BUSCANDO DEDO C:${(roi.coverageRatio * 100).toFixed(0)}%`,
           hasPulsatility: false,
@@ -214,6 +240,23 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       this.filteredBuffer.shift();
     }
 
+    // Feed liveness with the bandpassed signal + current FPS estimate.
+    this.liveness.pushFiltered(filtered, this.estimatedSampleRate);
+    this.livenessFrameCounter++;
+    if (this.livenessFrameCounter >= this.LIVENESS_EVAL_EVERY) {
+      this.livenessFrameCounter = 0;
+      this.lastLiveness = this.liveness.evaluate(
+        this.redAC, this.redDC, this.greenAC, this.greenDC,
+      );
+      if (this.lastLiveness.score >= 0.55 && this.lastLiveness.reason === 'OK') {
+        this.livenessOkStreak = Math.min(this.livenessOkStreak + 1, 100);
+      } else if (this.lastLiveness.score < 0.30) {
+        this.livenessOkStreak = 0;
+      } else {
+        this.livenessOkStreak = Math.max(0, this.livenessOkStreak - 1);
+      }
+    }
+
     const endDeriv = ppgPerf.start('derivatives');
     this.calculateDerivatives();
     endDeriv();
@@ -222,12 +265,18 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     endSqi();
 
     const perfusionIndex = this.calculatePerfusionIndex();
+    const livenessOk = this.livenessOkStreak >= this.LIVENESS_OK_STREAK_NEEDED;
     const adjustedQuality = motionArtifact
       ? Math.max(0, this.signalQuality * 0.75)
       : this.signalQuality;
-    const gatedQuality = this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.005
+    // Hard liveness gate: without sustained periodicity, quality is capped low.
+    const liveGated = livenessOk
       ? adjustedQuality
-      : Math.min(18, adjustedQuality * 0.45);
+      : Math.min(15, adjustedQuality * 0.30);
+    const gatedQuality = this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.005 && livenessOk
+      ? liveGated
+      : Math.min(18, liveGated * 0.45);
+
 
     const now = Date.now();
     if (now - this.lastLogTime >= 2000) {
@@ -256,13 +305,16 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       perfusionIndex,
       rawRed: roi.rawRed,
       rawGreen: roi.rawGreen,
+      livenessScore: this.lastLiveness.score,
+      livenessReason: this.lastLiveness.reason,
       diagnostics: {
         message:
           `${pulseSource.label}:${pulseSource.strength.toFixed(1)} ` +
           `PI:${perfusionIndex.toFixed(2)} C:${(this.smoothedCoverage * 100).toFixed(0)} ` +
-          `${this.contactState}${motionArtifact ? ' MOV' : ''}`,
-        hasPulsatility: this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.05 && pulseSource.strength > 1.5,
-        pulsatilityValue: this.contactState === 'STABLE_CONTACT' ? Math.max(perfusionIndex, pulseSource.strength * 0.02) : 0,
+          `${this.contactState}${motionArtifact ? ' MOV' : ''} ` +
+          `LIV:${(this.lastLiveness.score * 100).toFixed(0)}/${this.lastLiveness.reason}`,
+        hasPulsatility: this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.05 && pulseSource.strength > 1.5 && livenessOk,
+        pulsatilityValue: this.contactState === 'STABLE_CONTACT' && livenessOk ? Math.max(perfusionIndex, pulseSource.strength * 0.02) : 0,
       },
     });
   }
@@ -279,9 +331,11 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
 
       if (this.fingerConfidenceCount >= this.FINGER_CONFIRM_FRAMES) {
         this.fingerDetected = true;
-        // Require real perfusion for STABLE — not just visual contact
+        // STABLE requires real perfusion AND sustained liveness — color alone
+        // (e.g. red plastic under flash) is not sufficient.
         const perfusion = this.calculatePerfusionIndex();
-        this.contactState = (this.stableContactCount >= this.STABLE_THRESHOLD && perfusion > 0.003)
+        const livenessOk = this.livenessOkStreak >= this.LIVENESS_OK_STREAK_NEEDED;
+        this.contactState = (this.stableContactCount >= this.STABLE_THRESHOLD && perfusion > 0.003 && livenessOk)
           ? 'STABLE_CONTACT'
           : 'UNSTABLE_CONTACT';
       }
@@ -754,6 +808,9 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.blueDC = 0; this.blueAC = 0;
     this.sourceBuffers = { R: [], G: [], RG: [] };
     this.bandpassFilter.reset();
+    this.liveness.reset();
+    this.livenessOkStreak = 0;
+    this.livenessFrameCounter = 0;
   }
 
   reset(): void {
@@ -793,6 +850,14 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.resetBaselines();
     this.bandpassFilter.setSampleRate(this.estimatedSampleRate);
     this.bandpassFilter.reset();
+    this.liveness.reset();
+    this.livenessOkStreak = 0;
+    this.livenessFrameCounter = 0;
+    this.lastLiveness = {
+      score: 0, reason: 'WARMING_UP',
+      acdcRed: 0, acdcGreen: 0,
+      autocorrPeak: 0, autocorrLag: 0, cardiacToDriftRatio: 0,
+    };
   }
 
   private handleMotionEvent = (event: DeviceMotionEvent) => {

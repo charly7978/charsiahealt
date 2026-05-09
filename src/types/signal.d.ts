@@ -19,6 +19,10 @@ export interface ProcessedSignal {
   perfusionIndex?: number;
   rawRed?: number;
   rawGreen?: number;
+  /** Multi-evidence liveness score in [0,1]. 0 means no human PPG detected. */
+  livenessScore?: number;
+  /** Reason code from the liveness evaluator (e.g. INERT_DC, NO_PERIODICITY). */
+  livenessReason?: string;
   diagnostics?: {
     message: string;
     hasPulsatility: boolean;
