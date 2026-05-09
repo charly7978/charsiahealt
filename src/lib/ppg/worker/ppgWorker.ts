@@ -61,6 +61,7 @@ let dcEstimate = 0;
 let dcInitialized = false;
 let snapshotBuffer = new Float32Array(ringCapacity);
 let lastEmit = 0;
+let sampleCount = 0;
 let sqiWeights: SqiWeights = {
   perfusionScale: 25,
   weightPerfusion: 0.55,
@@ -79,11 +80,14 @@ function handleSample(payload: Float32Array): void {
 
   const fused = fusion.pushAndProject(r, g, b);
   const dcSource = g; // Green channel is the standard PPG DC reference.
+  sampleCount++;
   if (!dcInitialized) {
     dcEstimate = dcSource;
     dcInitialized = true;
   } else {
-    dcEstimate = dcEstimate * 0.99 + dcSource * 0.01;
+    // Fast convergence first second (~30 samples), then slow tracking.
+    const dcAlpha = sampleCount < 30 ? 0.15 : 0.01;
+    dcEstimate = dcEstimate * (1 - dcAlpha) + dcSource * dcAlpha;
   }
 
   const filt = bandpass.process(fused.value);
