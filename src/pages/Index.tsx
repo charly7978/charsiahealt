@@ -43,6 +43,7 @@ import {
   subscribePpgRuntimeConfig,
   type PpgRuntimeConfig,
 } from "@/lib/ppg/config/ppgRuntimeConfig";
+import { usePpgCapture } from "@/lib/ppg/hooks/usePpgCapture";
 
 import { supabase } from "@/integrations/supabase/client";
 
@@ -171,6 +172,17 @@ const Index = () => {
     resetPpgRuntimeConfig();
     toast({ title: "✓ PPG defaults restaurados" });
   }, []);
+
+  // Advanced PPG engine (Web Worker pipeline). Runs in parallel to the
+  // legacy processor and shares the existing CameraView <video> element
+  // (no second getUserMedia call is made).
+  const [advVideoEl, setAdvVideoEl] = useState<HTMLVideoElement | null>(null);
+  const [advancedEngineEnabled, setAdvancedEngineEnabled] = useState<boolean>(true);
+  const advanced = usePpgCapture({
+    video: advVideoEl,
+    active: advancedEngineEnabled && isMonitoring && !!cameraStream && !!advVideoEl,
+    useExternalVideo: true,
+  });
   
   // HOOKS DE PROCESAMIENTO
   const { 
@@ -465,6 +477,8 @@ const Index = () => {
   const handleStreamReady = useCallback((stream: MediaStream) => {
     console.log('📹 Stream recibido');
     setCameraStream(stream);
+    // Hand the same <video> element to the advanced engine.
+    setAdvVideoEl(cameraRef.current?.getVideoElement() ?? null);
     
     // Esperar a que el video esté listo y comenzar captura
     setTimeout(() => {
@@ -535,7 +549,7 @@ const Index = () => {
     
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
-      setCameraStream(null);
+      setCameraStream(null); setAdvVideoEl(null);
     }
     
     setIsMonitoring(false);
@@ -580,7 +594,7 @@ const Index = () => {
     
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
-      setCameraStream(null);
+      setCameraStream(null); setAdvVideoEl(null);
     }
     
     setIsMonitoring(false);
@@ -1075,6 +1089,59 @@ const Index = () => {
                   <p className="text-[10px] text-white/40 mt-1">
                     Cambios en vivo, sin reiniciar la cámara. Persiste en este dispositivo.
                   </p>
+
+                  {/* Advanced engine live readout */}
+                  <div className="mt-3 rounded border border-white/10 bg-black/30 p-2">
+                    <div className="flex items-center justify-between">
+                      <div className="text-[11px] font-medium text-white/80">
+                        Advanced engine (Web Worker)
+                      </div>
+                      <label className="flex items-center gap-1 text-[10px] text-white/60">
+                        <input
+                          type="checkbox"
+                          checked={advancedEngineEnabled}
+                          onChange={(e) => setAdvancedEngineEnabled(e.target.checked)}
+                        />
+                        on
+                      </label>
+                    </div>
+                    <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-white/70">
+                      <div>
+                        <div className="text-white/40">state</div>
+                        <div className="text-white">{advanced.state}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">finger</div>
+                        <div className={advanced.fingerDetected ? "text-emerald-400" : "text-rose-400"}>
+                          {advanced.fingerDetected ? "yes" : "no"}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">fps</div>
+                        <div className="text-white">{advanced.fpsInstant.toFixed(1)}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">SQI</div>
+                        <div className="text-white">{(advanced.snapshot?.sqi ?? 0).toFixed(2)}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">PI%</div>
+                        <div className="text-white">{((advanced.snapshot?.perfusionIndex ?? 0) * 100).toFixed(2)}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">skew</div>
+                        <div className="text-white">{(advanced.snapshot?.skewness ?? 0).toFixed(2)}</div>
+                      </div>
+                      <div>
+                        <div className="text-white/40">kurt</div>
+                        <div className="text-white">{(advanced.snapshot?.kurtosis ?? 0).toFixed(2)}</div>
+                      </div>
+                      <div className="col-span-2">
+                        <div className="text-white/40">err</div>
+                        <div className="text-amber-300 truncate">{advanced.error ?? "—"}</div>
+                      </div>
+                    </div>
+                  </div>
 
                   <div className="grid grid-cols-2 gap-2 mt-3">
                     <label className="text-[11px] text-white/70">

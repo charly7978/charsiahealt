@@ -20,6 +20,12 @@ import {
 export interface UsePpgCaptureOptions {
   readonly video: HTMLVideoElement | null;
   readonly active: boolean;
+  /**
+   * If true, the hook will NOT call getUserMedia. It assumes `video` already
+   * has an attached stream (managed by another component such as CameraView).
+   * Use this to run the advanced pipeline alongside an existing camera owner.
+   */
+  readonly useExternalVideo?: boolean;
 }
 
 export interface UsePpgCaptureResult {
@@ -43,7 +49,7 @@ export interface UsePpgCaptureResult {
 export function usePpgCapture(
   options: UsePpgCaptureOptions,
 ): UsePpgCaptureResult {
-  const { video, active } = options;
+  const { video, active, useExternalVideo = false } = options;
 
   const [state, setState] = useState<PpgCaptureState>("idle");
   const [diagnostics, setDiagnostics] = useState<CameraDiagnostics | null>(
@@ -92,16 +98,21 @@ export function usePpgCapture(
     setError(null);
     setState("starting");
     try {
-      const controller = new CameraController();
-      controllerRef.current = controller;
-      const result = await controller.start();
-      video.srcObject = result.stream;
-      try {
-        await video.play();
-      } catch {
-        // iOS may reject play() until a user gesture; the loop still runs.
+      if (!useExternalVideo) {
+        const controller = new CameraController();
+        controllerRef.current = controller;
+        const result = await controller.start();
+        video.srcObject = result.stream;
+        try {
+          await video.play();
+        } catch {
+          // iOS may reject play() until a user gesture; the loop still runs.
+        }
+        setDiagnostics(result.diagnostics);
+      } else {
+        // External owner manages the stream/torch/locks. We only consume frames.
+        setDiagnostics(null);
       }
-      setDiagnostics(result.diagnostics);
 
       const downsampler = new FrameDownsampler();
       downsamplerRef.current = downsampler;
@@ -154,13 +165,13 @@ export function usePpgCapture(
       loopRef.current = loop;
       loop.start();
 
-      setState(result.state);
+      setState(controllerRef.current?.getState() ?? "running");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Capture failed.");
       setState("error");
       await stop();
     }
-  }, [video, stop]);
+  }, [video, stop, useExternalVideo]);
 
   useEffect(() => {
     if (active) void start();
