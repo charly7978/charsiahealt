@@ -269,13 +269,12 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     const adjustedQuality = motionArtifact
       ? Math.max(0, this.signalQuality * 0.75)
       : this.signalQuality;
-    // Hard liveness gate: without sustained periodicity, quality is capped low.
-    const liveGated = livenessOk
+    // Continuous-measurement policy: liveness is informational only. The
+    // pipeline keeps emitting raw decoded vitals at all times so the real
+    // behavior of the algorithm can be observed and audited end-to-end.
+    const gatedQuality = this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.005
       ? adjustedQuality
-      : Math.min(15, adjustedQuality * 0.30);
-    const gatedQuality = this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.005 && livenessOk
-      ? liveGated
-      : Math.min(18, liveGated * 0.45);
+      : Math.min(18, adjustedQuality * 0.45);
 
 
     const now = Date.now();
