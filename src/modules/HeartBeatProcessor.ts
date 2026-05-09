@@ -12,10 +12,25 @@ export class HeartBeatProcessor {
   private readonly MIN_PEAK_INTERVAL_MS = 330;
   private readonly MAX_PEAK_INTERVAL_MS = 2000;
 
-  private signalBuffer: number[] = [];
-  private derivativeBuffer: number[] = [];
-  private timestampBuffer: number[] = [];
+import { NumericRingBuffer } from "../lib/ppg/signal/NumericRingBuffer";
+
+export class HeartBeatProcessor {
+  private readonly MIN_PEAK_INTERVAL_MS = 330;
+  private readonly MAX_PEAK_INTERVAL_MS = 2000;
+
   private readonly BUFFER_SIZE = 300;
+  private signalBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+  private derivativeBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+  private timestampBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+
+  // Reusable scratch buffers — avoid per-frame allocation in hot path.
+  private scratchGate: number[] = [];
+  private scratchNorm: number[] = [];
+  private scratchPeriod: number[] = [];
+  private scratchSampleRate: number[] = [];
+  private scratchSqi: number[] = [];
+  private scratchPeakSig: number[] = [];
+  private scratchPeakDeriv: number[] = [];
 
   private lastPeakTime = 0;
   private peakThreshold = 4.0;
