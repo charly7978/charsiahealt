@@ -1183,8 +1183,6 @@ const PPGSignalMeter = ({
     <div className="fixed inset-0 bg-slate-950">
       <canvas
         ref={canvasRef}
-        width={CONFIG.CANVAS_WIDTH}
-        height={CONFIG.CANVAS_HEIGHT}
         className="w-full h-full absolute inset-0"
       />
 
