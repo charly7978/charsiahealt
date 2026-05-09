@@ -136,7 +136,7 @@ export class HeartBeatProcessor {
     // === MOTION GATE ===
     // Hard reject: severe motion → no peak this frame, but keep buffers
     // (graceful resume when motion subsides).
-    const motionHardReject = this.currentMotionScore >= this.MOTION_REJECT_THRESHOLD;
+    const motionHardReject = this.currentMotionScore >= this.motionRejectThreshold;
 
     if (!motionHardReject && timeSinceLastPeak >= this.MIN_PEAK_INTERVAL_MS) {
       isPeak = this.detectPeakWithScoring(timeSinceLastPeak);
@@ -158,7 +158,7 @@ export class HeartBeatProcessor {
           const tailLen = Math.min(8, this.rrIntervals.length);
           const tailIbis = this.rrIntervals.slice(-tailLen);
           const tailMot = this.rrMotionScores.slice(-tailLen);
-          const clean = tailIbis.filter((_, i) => tailMot[i] < this.MOTION_TAINT_THRESHOLD);
+          const clean = tailIbis.filter((_, i) => tailMot[i] < this.motionTaintThreshold);
           const usable = clean.length >= 2 ? clean : tailIbis;
           const sorted = [...usable].slice(-5).sort((a, b) => a - b);
           const medianIBI = sorted[Math.floor(sorted.length / 2)] ?? timeSinceLastPeak;
