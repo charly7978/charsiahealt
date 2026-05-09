@@ -1,5 +1,6 @@
 import type { ProcessedSignal, ProcessingError, SignalProcessor as SignalProcessorInterface, ContactState } from '../../types/signal';
 import { BandpassFilter } from './BandpassFilter';
+import { NumericRingBuffer } from '../../lib/ppg/signal/NumericRingBuffer';
 import { createLogger, ppgPerf } from '../../utils/logger';
 import {
   DEFAULT_BACKPRESSURE_CONFIG,
@@ -52,16 +53,16 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   private readonly tileBuffer: { red: number; green: number; blue: number; count: number }[] =
     Array.from({ length: this.TILE_COLUMNS * this.TILE_ROWS }, () => ({ red: 0, green: 0, blue: 0, count: 0 }));
 
-  // Buffers
-  private rawBuffer: number[] = [];
-  private filteredBuffer: number[] = [];
-  private redBuffer: number[] = [];
-  private greenBuffer: number[] = [];
-  private blueBuffer: number[] = [];
-  private vpgBuffer: number[] = [];
-  private apgBuffer: number[] = [];
-  private tileConfidence: number[] = new Array(25).fill(0);
-  private frameIntervalBuffer: number[] = [];
+  // Buffers — pre-allocated ring buffers (zero GC pressure in hot path)
+  private rawBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+  private filteredBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+  private redBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+  private greenBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+  private blueBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+  private vpgBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+  private apgBuffer = new NumericRingBuffer(this.BUFFER_SIZE);
+  private readonly tileConfidence = new Float32Array(25);
+  private frameIntervalBuffer = new NumericRingBuffer(60);
 
   // AC/DC
   private redDC = 0;
@@ -109,7 +110,7 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   private readonly MOTION_THRESHOLD = 0.6;
 
   // === MULTI-SOURCE RANKING (CHROM eliminado — amplifica ruido sin dedo) ===
-  private sourceBuffers: { [key: string]: number[] } = {};
+  private sourceBuffers: { [key: string]: NumericRingBuffer } = {};
   private activeSource: string = 'RG';
   private sourceScores: { [key: string]: number } = {};
   private lastSourceSwitch = 0;
@@ -120,7 +121,7 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     public onError?: (error: ProcessingError) => void
   ) {
     this.bandpassFilter = new BandpassFilter(this.estimatedSampleRate);
-    this.sourceBuffers = { R: [], G: [], RG: [] };
+    this.sourceBuffers = { R: new NumericRingBuffer(120), G: new NumericRingBuffer(120), RG: new NumericRingBuffer(120) };
     this.sourceScores = { R: 0, G: 0, RG: 0 };
   }
 
@@ -188,13 +189,8 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.redBuffer.push(roi.rawRed);
     this.greenBuffer.push(roi.rawGreen);
     this.blueBuffer.push(roi.rawBlue);
-    if (this.redBuffer.length > this.BUFFER_SIZE) {
-      this.redBuffer.shift();
-      this.greenBuffer.shift();
-      this.blueBuffer.shift();
-    }
 
-    if (this.redBuffer.length >= 36) {
+    if (this.redBuffer.size >= 36) {
       this.calculateACDCPrecise();
     }
 
@@ -202,17 +198,11 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     const pulseSource = this.extractBestPulseSignal(roi.rawRed, roi.rawGreen, roi.rawBlue, motionArtifact);
 
     this.rawBuffer.push(pulseSource.value);
-    if (this.rawBuffer.length > this.BUFFER_SIZE) {
-      this.rawBuffer.shift();
-    }
 
     const endFilt = ppgPerf.start('bandpass');
     const filtered = this.bandpassFilter.filter(pulseSource.value);
     endFilt();
     this.filteredBuffer.push(filtered);
-    if (this.filteredBuffer.length > this.BUFFER_SIZE) {
-      this.filteredBuffer.shift();
-    }
 
     const endDeriv = ppgPerf.start('derivatives');
     this.calculateDerivatives();
@@ -389,13 +379,11 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     if (delta < 10 || delta > 100) return;
 
     this.frameIntervalBuffer.push(delta);
-    if (this.frameIntervalBuffer.length > 30) {
-      this.frameIntervalBuffer.shift();
-    }
 
-    if (this.frameIntervalBuffer.length < 8) return;
+    if (this.frameIntervalBuffer.size < 8) return;
 
-    const sorted = [...this.frameIntervalBuffer].sort((a, b) => a - b);
+    const intervals = this.frameIntervalBuffer.toLastNArray(this.frameIntervalBuffer.size);
+    const sorted = intervals.sort((a, b) => a - b);
     const median = sorted[Math.floor(sorted.length / 2)] ?? 33;
     const estimatedFps = this.clamp(1000 / median, 20, 40);
 
@@ -464,8 +452,8 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
         const dominanceScore = this.clamp((redDominance - 10) / 35, 0, 1);
         const frameScore = redRatioScore * 0.45 + dominanceScore * 0.4 + brightnessScore * 0.15;
 
-        this.tileConfidence[index] = this.tileConfidence[index] * 0.75 + frameScore * centerBias * 0.25;
-        const combinedScore = this.tileConfidence[index] * 0.7 + frameScore * 0.3;
+        this.tileConfidence[index] = this.tileConfidence[index]! * 0.75 + frameScore * centerBias * 0.25;
+        const combinedScore = this.tileConfidence[index]! * 0.7 + frameScore * 0.3;
 
         return { red, green, blue, total, redDominance, rednessRatio, centerBias, frameScore, combinedScore, temporalScore: this.tileConfidence[index] };
       });
@@ -546,13 +534,10 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     // Update per-source buffers
     for (const key of Object.keys(sources)) {
       this.sourceBuffers[key].push(sources[key]);
-      if (this.sourceBuffers[key].length > 120) {
-        this.sourceBuffers[key].shift();
-      }
     }
 
     // Rank sources every ~1 second (30 frames)
-    if (this.frameCount % 30 === 0 && this.redBuffer.length >= 60) {
+    if (this.frameCount % 30 === 0 && this.redBuffer.size >= 60) {
       this.rankSources();
     }
 
@@ -593,9 +578,9 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
 
     for (const key of Object.keys(this.sourceBuffers)) {
       const buf = this.sourceBuffers[key];
-      if (buf.length < 45) continue;
+      if (buf.size < 45) continue;
 
-      const recent = buf.slice(-90);
+      const recent = buf.toLastNArray(Math.min(90, buf.size));
       const score = this.computeSourceScore(recent);
       this.sourceScores[key] = score;
 
@@ -633,17 +618,28 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     return Math.max(0, snr * 15 - clipPenalty);
   }
 
+  // Scratch arrays for AC/DC — reused each call, no per-frame allocation.
+  private readonly _acdcScratchR: number[] = [];
+  private readonly _acdcScratchG: number[] = [];
+  private readonly _acdcScratchB: number[] = [];
+
   private calculateACDCPrecise(): void {
-    const windowSize = Math.min(this.ACDC_WINDOW, this.redBuffer.length);
+    const windowSize = Math.min(this.ACDC_WINDOW, this.redBuffer.size);
     if (windowSize < 36) return;
 
-    const redW = this.redBuffer.slice(-windowSize);
-    const greenW = this.greenBuffer.slice(-windowSize);
-    const blueW = this.blueBuffer.slice(-windowSize);
+    const redW = this.redBuffer.copyLastN(windowSize, this._acdcScratchR);
+    const greenW = this.greenBuffer.copyLastN(windowSize, this._acdcScratchG);
+    const blueW = this.blueBuffer.copyLastN(windowSize, this._acdcScratchB);
 
-    this.redDC = redW.reduce((a, b) => a + b, 0) / redW.length;
-    this.greenDC = greenW.reduce((a, b) => a + b, 0) / greenW.length;
-    this.blueDC = blueW.reduce((a, b) => a + b, 0) / blueW.length;
+    let redSum = 0, greenSum = 0, blueSum = 0;
+    for (let i = 0; i < windowSize; i++) {
+      redSum += redW[i];
+      greenSum += greenW[i];
+      blueSum += blueW[i];
+    }
+    this.redDC = redSum / windowSize;
+    this.greenDC = greenSum / windowSize;
+    this.blueDC = blueSum / windowSize;
 
     if (this.redDC < 5 || this.greenDC < 5) return;
 
@@ -674,25 +670,23 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   }
 
   private calculateDerivatives(): void {
-    const n = this.filteredBuffer.length;
+    const n = this.filteredBuffer.size;
 
     if (n >= 3) {
-      const vpg = (this.filteredBuffer[n - 1] - this.filteredBuffer[n - 3]) / 2;
+      const vpg = (this.filteredBuffer.at(n - 1) - this.filteredBuffer.at(n - 3)) / 2;
       this.vpgBuffer.push(vpg);
-      if (this.vpgBuffer.length > this.BUFFER_SIZE) this.vpgBuffer.shift();
     }
 
-    if (this.vpgBuffer.length >= 3) {
-      const vn = this.vpgBuffer.length;
-      const apg = (this.vpgBuffer[vn - 1] - this.vpgBuffer[vn - 3]) / 2;
+    if (this.vpgBuffer.size >= 3) {
+      const vn = this.vpgBuffer.size;
+      const apg = (this.vpgBuffer.at(vn - 1) - this.vpgBuffer.at(vn - 3)) / 2;
       this.apgBuffer.push(apg);
-      if (this.apgBuffer.length > this.BUFFER_SIZE) this.apgBuffer.shift();
     }
   }
 
   // === SQI UNIFICADO - ÚNICA FUENTE DE VERDAD ===
   private calculateSignalQuality(): number {
-    if (this.filteredBuffer.length < 24) return 0;
+    if (this.filteredBuffer.size < 24) return 0;
     if (this.contactState === 'NO_CONTACT') return 0;
 
     const perfusionIndex = this.calculatePerfusionIndex();
@@ -703,7 +697,7 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     // Gate: red must dominate (hemoglobin signature)
     if (redDominance < 15) return 0;
 
-    const recent = this.filteredBuffer.slice(-90);
+    const recent = this.filteredBuffer.toLastNArray(Math.min(90, this.filteredBuffer.size));
     const sorted = [...recent].sort((a, b) => a - b);
     const p10 = sorted[Math.floor((sorted.length - 1) * 0.1)] ?? 0;
     const p90 = sorted[Math.floor((sorted.length - 1) * 0.9)] ?? 0;
@@ -742,30 +736,30 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   }
 
   private resetSignalTrackingBuffers(): void {
-    this.rawBuffer = [];
-    this.filteredBuffer = [];
-    this.redBuffer = [];
-    this.greenBuffer = [];
-    this.blueBuffer = [];
-    this.vpgBuffer = [];
-    this.apgBuffer = [];
+    this.rawBuffer.clear();
+    this.filteredBuffer.clear();
+    this.redBuffer.clear();
+    this.greenBuffer.clear();
+    this.blueBuffer.clear();
+    this.vpgBuffer.clear();
+    this.apgBuffer.clear();
     this.redDC = 0; this.redAC = 0;
     this.greenDC = 0; this.greenAC = 0;
     this.blueDC = 0; this.blueAC = 0;
-    this.sourceBuffers = { R: [], G: [], RG: [] };
+    this.sourceBuffers = { R: new NumericRingBuffer(120), G: new NumericRingBuffer(120), RG: new NumericRingBuffer(120) };
     this.bandpassFilter.reset();
   }
 
   reset(): void {
-    this.rawBuffer = [];
-    this.filteredBuffer = [];
-    this.redBuffer = [];
-    this.greenBuffer = [];
-    this.blueBuffer = [];
-    this.vpgBuffer = [];
-    this.apgBuffer = [];
-    this.tileConfidence = new Array(25).fill(0);
-    this.frameIntervalBuffer = [];
+    this.rawBuffer.clear();
+    this.filteredBuffer.clear();
+    this.redBuffer.clear();
+    this.greenBuffer.clear();
+    this.blueBuffer.clear();
+    this.vpgBuffer.clear();
+    this.apgBuffer.clear();
+    this.tileConfidence.fill(0);
+    this.frameIntervalBuffer.clear();
     this.frameCount = 0;
     this.lastLogTime = 0;
     this.lastFrameTimestamp = 0;
@@ -786,7 +780,7 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.blueDC = 0; this.blueAC = 0;
     this.motionScore = 0;
     this.lastAcceleration = { x: 0, y: 0, z: 0 };
-    this.sourceBuffers = { R: [], G: [], RG: [] };
+    this.sourceBuffers = { R: new NumericRingBuffer(120), G: new NumericRingBuffer(120), RG: new NumericRingBuffer(120) };
     this.sourceScores = { R: 0, G: 0, RG: 0 };
     this.activeSource = 'RG';
     this.lastSourceSwitch = 0;

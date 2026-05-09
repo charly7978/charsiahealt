@@ -33,7 +33,7 @@ export class HeartBeatProcessor {
   private peakThreshold = 4.0;
   private lastPeakValue = 0;
 
-  private rrIntervals: number[] = [];
+  private rrIntervals = new NumericRingBuffer(30);
   private readonly MAX_RR_INTERVALS = 30;
   private smoothBPM = 0;
   private frequencyBPM = 0;
@@ -124,9 +124,6 @@ export class HeartBeatProcessor {
       if (isPeak) {
         if (this.lastPeakTime > 0 && timeSinceLastPeak <= this.MAX_PEAK_INTERVAL_MS) {
           this.rrIntervals.push(timeSinceLastPeak);
-          if (this.rrIntervals.length > this.MAX_RR_INTERVALS) {
-            this.rrIntervals.shift();
-          }
 
           const instantBPM = 60000 / timeSinceLastPeak;
 
@@ -292,9 +289,10 @@ export class HeartBeatProcessor {
     const slopeFactor = Math.min(1, meanAbsDeriv / 1.0) * 14;
 
     let rrFactor = 0;
-    if (this.rrIntervals.length >= 3) {
-      const m = this.rrIntervals.reduce((a, b) => a + b, 0) / this.rrIntervals.length;
-      const v = this.rrIntervals.reduce((a, rr) => a + (rr - m) ** 2, 0) / this.rrIntervals.length;
+    if (this.rrIntervals.size >= 3) {
+      const rrArr = this.rrIntervals.toLastNArray(this.rrIntervals.size);
+      const m = rrArr.reduce((a, b) => a + b, 0) / rrArr.length;
+      const v = rrArr.reduce((a, rr) => a + (rr - m) ** 2, 0) / rrArr.length;
       const cv = Math.sqrt(v) / Math.max(1, m);
       rrFactor = Math.max(0, 1 - cv * 2) * 22;
     }
@@ -312,8 +310,8 @@ export class HeartBeatProcessor {
   }
 
   private getExpectedRR(): number {
-    if (this.rrIntervals.length >= 3) {
-      const recent = this.rrIntervals.slice(-6).sort((a, b) => a - b);
+    if (this.rrIntervals.size >= 3) {
+      const recent = this.rrIntervals.toLastNArray(Math.min(6, this.rrIntervals.size)).sort((a, b) => a - b);
       return recent[Math.floor(recent.length / 2)] ?? recent[0] ?? 0;
     }
     if (this.frequencyBPM > 0) return 60000 / this.frequencyBPM;
@@ -401,12 +399,13 @@ export class HeartBeatProcessor {
     const sqiFactor = this.signalQualityIndex / 100;
     const peakSupport = Math.min(1, this.consecutivePeaks / 5);
 
-    if (this.rrIntervals.length < 2) {
+    if (this.rrIntervals.size < 2) {
       return this.clamp(sqiFactor * 0.22 + peakSupport * 0.2 + this.periodicityScore * 0.3, 0, 0.6);
     }
 
-    const mean = this.rrIntervals.reduce((a, b) => a + b, 0) / this.rrIntervals.length;
-    const variance = this.rrIntervals.reduce((a, rr) => a + (rr - mean) ** 2, 0) / this.rrIntervals.length;
+    const rrArr = this.rrIntervals.toLastNArray(this.rrIntervals.size);
+    const mean = rrArr.reduce((a, b) => a + b, 0) / rrArr.length;
+    const variance = rrArr.reduce((a, rr) => a + (rr - mean) ** 2, 0) / rrArr.length;
     const cv = Math.sqrt(variance) / Math.max(1, mean);
     const rrStability = this.clamp(1 - cv * 1.7, 0, 1);
 
@@ -442,7 +441,7 @@ export class HeartBeatProcessor {
     return Math.min(max, Math.max(min, value));
   }
 
-  getRRIntervals(): number[] { return [...this.rrIntervals]; }
+  getRRIntervals(): number[] { return this.rrIntervals.toLastNArray(this.rrIntervals.size); }
   getLastPeakTime(): number { return this.lastPeakTime; }
   getSQI(): number { return this.signalQualityIndex; }
   getDerivativeBuffer(): number[] { return this.derivativeBuffer.toLastNArray(this.derivativeBuffer.size); }
@@ -452,7 +451,7 @@ export class HeartBeatProcessor {
     this.signalBuffer.clear();
     this.derivativeBuffer.clear();
     this.timestampBuffer.clear();
-    this.rrIntervals = [];
+    this.rrIntervals.clear();
     this.smoothBPM = 0;
     this.frequencyBPM = 0;
     this.periodicityScore = 0;

@@ -91,10 +91,6 @@ const Index = () => {
   const arrhythmiaDetectedRef = useRef(false);
   const lastArrhythmiaData = useRef<{ timestamp: number; rmssd: number; rrVariation: number; } | null>(null);
   const cameraRef = useRef<CameraViewHandle>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
-  const frameLoopRef = useRef<number | null>(null);
-  const isProcessingRef = useRef(false);
   // anti-sim-allow: reason="Wires up the runtime detector for fabricated vitals streams." ref="GUARDRAIL-DIST-RUNTIME"
   // Runtime guardrail: detect implausible vitals streams.
   const [sanityProfileId, setSanityProfileId] = useState<string>(() => getActiveProfileId());
@@ -292,18 +288,8 @@ const Index = () => {
     }
   }, [currentStride, isMonitoring, getBackpressureConfig]);
 
-  // CANVAS PARA CAPTURA
-  useEffect(() => {
-    if (!canvasRef.current) {
-      canvasRef.current = document.createElement('canvas');
-      canvasRef.current.width = 320;
-      canvasRef.current.height = 240;
-      ctxRef.current = canvasRef.current.getContext('2d', { 
-        willReadFrequently: true,
-        alpha: false 
-      });
-    }
-  }, []);
+  // (Canvas de captura eliminado — el pipeline del Worker reemplaza
+  // la captura de píxeles en el hilo principal.)
 
   // PANTALLA COMPLETA
   const enterFullScreen = async () => {
@@ -376,63 +362,14 @@ const Index = () => {
     }
   }, [lastValidResults, isMonitoring]);
 
-  // === LOOP DE CAPTURA — requestVideoFrameCallback con fallback RAF ===
-  const startFrameLoop = useCallback(() => {
-    if (isProcessingRef.current) return;
-    isProcessingRef.current = true;
-    
-    const canvas = canvasRef.current;
-    const ctx = ctxRef.current;
-    if (!canvas || !ctx) {
-      isProcessingRef.current = false;
-      return;
-    }
-
-    const captureOneFrame = () => {
-      if (!isProcessingRef.current) return;
-      const video = cameraRef.current?.getVideoElement();
-      if (!video || video.readyState < 2 || video.videoWidth === 0) {
-        frameLoopRef.current = requestAnimationFrame(() => captureOneFrame());
-        return;
-      }
-      try {
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        processFrame(imageData);
-      } catch {}
-      scheduleNext(video);
-    };
-
-    const scheduleNext = (video: HTMLVideoElement) => {
-      if (!isProcessingRef.current) return;
-      if ('requestVideoFrameCallback' in video) {
-        (video as any).requestVideoFrameCallback((_now: number, metadata: any) => {
-          ppgPerf.markFrame(metadata);
-          captureOneFrame();
-        });
-      } else {
-        ppgPerf.markFrame();
-        frameLoopRef.current = requestAnimationFrame(() => captureOneFrame());
-      }
-    };
-    
-    console.log('🎬 Captura iniciada (requestVideoFrameCallback)');
-    captureOneFrame();
-  }, [processFrame]);
-
-  const stopFrameLoop = useCallback(() => {
-    isProcessingRef.current = false;
-    if (frameLoopRef.current) {
-      cancelAnimationFrame(frameLoopRef.current);
-      frameLoopRef.current = null;
-    }
-  }, []);
+  // (Frame loop del hilo principal eliminado — toda la captura y DSP
+  // ahora corre en el Web Worker vía usePpgCapture.)
 
   // === INICIO DE MONITOREO ===
   const startMonitoring = useCallback(() => {
     if (isMonitoring) return;
     
-    console.log('🚀 Iniciando monitoreo...');
+    if (import.meta.env.DEV) console.log('Iniciando monitoreo...');
     
     if (navigator.vibrate) {
       navigator.vibrate([200]);
@@ -475,39 +412,19 @@ const Index = () => {
 
   // === CUANDO LA CÁMARA ESTÁ LISTA ===
   const handleStreamReady = useCallback((stream: MediaStream) => {
-    console.log('📹 Stream recibido');
+    if (import.meta.env.DEV) console.log('Stream recibido');
     setCameraStream(stream);
     // Hand the same <video> element to the advanced engine.
     setAdvVideoEl(cameraRef.current?.getVideoElement() ?? null);
-    
-    // Esperar a que el video esté listo y comenzar captura
-    setTimeout(() => {
-      const video = cameraRef.current?.getVideoElement();
-      if (video && video.readyState >= 2) {
-        console.log('✅ Video listo:', video.videoWidth, 'x', video.videoHeight);
-        startFrameLoop();
-      } else {
-        // Reintentar
-        const checkReady = setInterval(() => {
-          const v = cameraRef.current?.getVideoElement();
-          if (v && v.readyState >= 2 && v.videoWidth > 0) {
-            clearInterval(checkReady);
-            console.log('✅ Video listo (retry):', v.videoWidth, 'x', v.videoHeight);
-            startFrameLoop();
-          }
-        }, 100);
-        
-        // Timeout después de 5 segundos
-        setTimeout(() => clearInterval(checkReady), 5000);
-      }
-    }, 500);
-  }, [startFrameLoop]);
+    // El Worker pipeline (usePpgCapture) arranca automáticamente cuando
+    // active=true y el video element está disponible.
+  }, []);
 
   // === FINALIZAR MEDICIÓN ===
   const finalizeMeasurement = useCallback(async () => {
     if (!isMonitoring) return;
     
-    console.log('🛑 Finalizando medición...');
+    if (import.meta.env.DEV) console.log('Finalizando medición...');
     
     // Sonido de finalización
     playCompletionSound();
@@ -516,8 +433,7 @@ const Index = () => {
     if (navigator.vibrate) {
       navigator.vibrate([100, 50, 100, 50, 200]);
     }
-    // Detener loop primero
-    stopFrameLoop();
+    // Detener loop primero (ya no hay frame loop del main thread)
     
     // Detener timer
     if (measurementTimerRef.current) {
@@ -572,14 +488,12 @@ const Index = () => {
     setElapsedTime(0);
     setCalibrationProgress(0);
     
-    console.log('✅ Medición finalizada y guardada');
-  }, [isMonitoring, isCalibrating, cameraStream, stopFrameLoop, stopProcessing, forceCalibrationCompletion, resetVitalSigns, saveMeasurement, heartRate, vitalSigns, lastSignal]);
+    if (import.meta.env.DEV) console.log('Medición finalizada y guardada');
+  }, [isMonitoring, isCalibrating, cameraStream, stopProcessing, forceCalibrationCompletion, resetVitalSigns, saveMeasurement, heartRate, vitalSigns, lastSignal]);
 
   // === RESET COMPLETO ===
   const handleReset = useCallback(() => {
-    console.log('🔄 Reset completo...');
-    
-    stopFrameLoop();
+    if (import.meta.env.DEV) console.log('Reset completo...');
     
     if (measurementTimerRef.current) {
       clearInterval(measurementTimerRef.current);
@@ -632,8 +546,8 @@ const Index = () => {
     setCalibrationProgress(0);
     arrhythmiaDetectedRef.current = false;
     
-    console.log('✅ Reset completado');
-  }, [cameraStream, stopFrameLoop, stopProcessing, fullResetVitalSigns, resetHeartBeat]);
+    if (import.meta.env.DEV) console.log('Reset completado');
+  }, [cameraStream, stopProcessing, fullResetVitalSigns, resetHeartBeat]);
 
   // === PROCESAR SEÑAL PPG ===
   const vitalSignsFrameCounter = useRef<number>(0);
@@ -642,14 +556,20 @@ const Index = () => {
   const VITALS_PROCESS_EVERY_N_FRAMES = 3;
   
   useEffect(() => {
-    if (!lastSignal || !isMonitoring) return;
-    
-    const signalValue = lastSignal.filteredValue;
-    const contactState = (lastSignal as any).contactState || (lastSignal.fingerDetected ? 'STABLE_CONTACT' : 'NO_CONTACT');
+    if (!isMonitoring) return;
+
+    // Use the worker pipeline snapshot as the signal source.
+    const snap = advanced.snapshot;
+    if (!snap || !snap.filtered || snap.filtered.length === 0) return;
+
+    const signalValue = snap.filtered[snap.filtered.length - 1];
+    const contactState = advanced.fingerDetected ? 'STABLE_CONTACT' as const : 'NO_CONTACT' as const;
+    const quality = snap.sqi ?? 0;
+    const perfIdx = snap.perfusionIndex ?? 0;
     const stableHumanSignal =
       contactState === 'STABLE_CONTACT' &&
-      (lastSignal.quality || 0) >= 12 &&
-      (lastSignal.perfusionIndex || 0) >= 0.005;
+      quality >= 12 &&
+      perfIdx >= 0.005;
 
     const heartBeatResult = processHeartBeat(
       signalValue,
@@ -758,7 +678,7 @@ const Index = () => {
       }
 
       const vitals = processVitalSigns(
-        lastSignal.filteredValue,
+        signalValue,
         heartBeatResult.rrData && heartBeatResult.rrData.intervals.length >= 2 && heartBeatResult.confidence > 0.18
           ? heartBeatResult.rrData
           : undefined
@@ -793,7 +713,7 @@ const Index = () => {
         }
       }
     }
-  }, [lastSignal, isMonitoring, processHeartBeat, processVitalSigns, setRGBData, getRGBStats]);
+  }, [advanced.snapshot, advanced.fingerDetected, isMonitoring, processHeartBeat, processVitalSigns, setRGBData, getRGBStats]);
 
   // AUTO-FINALIZAR a los 60 segundos (1 minuto)
   useEffect(() => {
