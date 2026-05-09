@@ -312,8 +312,8 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
           `PI:${perfusionIndex.toFixed(2)} C:${(this.smoothedCoverage * 100).toFixed(0)} ` +
           `${this.contactState}${motionArtifact ? ' MOV' : ''} ` +
           `LIV:${(this.lastLiveness.score * 100).toFixed(0)}/${this.lastLiveness.reason}`,
-        hasPulsatility: this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.05 && pulseSource.strength > 1.5 && livenessOk,
-        pulsatilityValue: this.contactState === 'STABLE_CONTACT' && livenessOk ? Math.max(perfusionIndex, pulseSource.strength * 0.02) : 0,
+        hasPulsatility: this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.05 && pulseSource.strength > 1.5,
+        pulsatilityValue: this.contactState === 'STABLE_CONTACT' ? Math.max(perfusionIndex, pulseSource.strength * 0.02) : 0,
       },
     });
   }
