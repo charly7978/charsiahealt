@@ -231,6 +231,23 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       this.filteredBuffer.shift();
     }
 
+    // Feed liveness with the bandpassed signal + current FPS estimate.
+    this.liveness.pushFiltered(filtered, this.estimatedSampleRate);
+    this.livenessFrameCounter++;
+    if (this.livenessFrameCounter >= this.LIVENESS_EVAL_EVERY) {
+      this.livenessFrameCounter = 0;
+      this.lastLiveness = this.liveness.evaluate(
+        this.redAC, this.redDC, this.greenAC, this.greenDC,
+      );
+      if (this.lastLiveness.score >= 0.55 && this.lastLiveness.reason === 'OK') {
+        this.livenessOkStreak = Math.min(this.livenessOkStreak + 1, 100);
+      } else if (this.lastLiveness.score < 0.30) {
+        this.livenessOkStreak = 0;
+      } else {
+        this.livenessOkStreak = Math.max(0, this.livenessOkStreak - 1);
+      }
+    }
+
     const endDeriv = ppgPerf.start('derivatives');
     this.calculateDerivatives();
     endDeriv();
@@ -239,12 +256,18 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     endSqi();
 
     const perfusionIndex = this.calculatePerfusionIndex();
+    const livenessOk = this.livenessOkStreak >= this.LIVENESS_OK_STREAK_NEEDED;
     const adjustedQuality = motionArtifact
       ? Math.max(0, this.signalQuality * 0.75)
       : this.signalQuality;
-    const gatedQuality = this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.005
+    // Hard liveness gate: without sustained periodicity, quality is capped low.
+    const liveGated = livenessOk
       ? adjustedQuality
-      : Math.min(18, adjustedQuality * 0.45);
+      : Math.min(15, adjustedQuality * 0.30);
+    const gatedQuality = this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.005 && livenessOk
+      ? liveGated
+      : Math.min(18, liveGated * 0.45);
+
 
     const now = Date.now();
     if (now - this.lastLogTime >= 2000) {
@@ -273,13 +296,16 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       perfusionIndex,
       rawRed: roi.rawRed,
       rawGreen: roi.rawGreen,
+      livenessScore: this.lastLiveness.score,
+      livenessReason: this.lastLiveness.reason,
       diagnostics: {
         message:
           `${pulseSource.label}:${pulseSource.strength.toFixed(1)} ` +
           `PI:${perfusionIndex.toFixed(2)} C:${(this.smoothedCoverage * 100).toFixed(0)} ` +
-          `${this.contactState}${motionArtifact ? ' MOV' : ''}`,
-        hasPulsatility: this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.05 && pulseSource.strength > 1.5,
-        pulsatilityValue: this.contactState === 'STABLE_CONTACT' ? Math.max(perfusionIndex, pulseSource.strength * 0.02) : 0,
+          `${this.contactState}${motionArtifact ? ' MOV' : ''} ` +
+          `LIV:${(this.lastLiveness.score * 100).toFixed(0)}/${this.lastLiveness.reason}`,
+        hasPulsatility: this.contactState === 'STABLE_CONTACT' && perfusionIndex >= 0.05 && pulseSource.strength > 1.5 && livenessOk,
+        pulsatilityValue: this.contactState === 'STABLE_CONTACT' && livenessOk ? Math.max(perfusionIndex, pulseSource.strength * 0.02) : 0,
       },
     });
   }
