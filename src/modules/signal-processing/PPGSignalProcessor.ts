@@ -35,6 +35,8 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   private readonly ACDC_WINDOW = 180;
   private readonly TILE_COLUMNS = 5;
   private readonly TILE_ROWS = 5;
+  private readonly POS_WINDOW = 32;
+  private posWindow: { r: number; g: number; b: number }[] = [];
 
   // === BACKPRESSURE / ADAPTIVE STRIDE ===
   // Stride de muestreo de píxeles dentro del ROI. 3 = baseline (cada 3 píxeles).
@@ -110,7 +112,7 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
 
   // === MULTI-SOURCE RANKING (CHROM eliminado — amplifica ruido sin dedo) ===
   private sourceBuffers: { [key: string]: number[] } = {};
-  private activeSource: string = 'RG';
+  private activeSource: string = 'POS';
   private sourceScores: { [key: string]: number } = {};
   private lastSourceSwitch = 0;
   private readonly SOURCE_HYSTERESIS_MS = 2000;
@@ -120,8 +122,8 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     public onError?: (error: ProcessingError) => void
   ) {
     this.bandpassFilter = new BandpassFilter(this.estimatedSampleRate);
-    this.sourceBuffers = { R: [], G: [], RG: [] };
-    this.sourceScores = { R: 0, G: 0, RG: 0 };
+    this.sourceBuffers = { R: [], G: [], RG: [], POS: [] };
+    this.sourceScores = { R: 0, G: 0, RG: 0, POS: 0 };
   }
 
   async initialize(): Promise<void> {
@@ -524,6 +526,37 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.blueBaseline = this.blueBaseline * (1 - alpha) + rawBlue * alpha;
   }
 
+  private computePOS(rawRed: number, rawGreen: number, rawBlue: number): number {
+    this.posWindow.push({ r: rawRed, g: rawGreen, b: rawBlue });
+    if (this.posWindow.length > this.POS_WINDOW) {
+      this.posWindow.shift();
+    }
+
+    if (this.posWindow.length < this.POS_WINDOW) return 0;
+
+    let meanR = 0, meanG = 0, meanB = 0;
+    for (const p of this.posWindow) {
+      meanR += p.r;
+      meanG += p.g;
+      meanB += p.b;
+    }
+    meanR /= this.posWindow.length;
+    meanG /= this.posWindow.length;
+    meanB /= this.posWindow.length;
+
+    if (meanR < 1 || meanG < 1 || meanB < 1) return 0;
+
+    const last = this.posWindow[this.posWindow.length - 1];
+    const rn = last.r / meanR;
+    const gn = last.g / meanG;
+    const bn = last.b / meanB;
+
+    const xs = (rn - gn) / Math.SQRT2;
+    const ys = (rn + gn - 2 * bn) / Math.sqrt(6);
+
+    return this.clamp((xs - ys) * 3200, -80, 80);
+  }
+
   // === MULTI-SOURCE COMPETITIVE EXTRACTION ===
   private extractBestPulseSignal(
     rawRed: number, rawGreen: number, rawBlue: number, motionArtifact: boolean
@@ -536,14 +569,15 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     const rPulse = clamp(rNorm);
     const gPulse = clamp(gNorm);
 
-    // Source candidates (CHROM removed — amplifies noise without finger)
+    const posValue = this.computePOS(rawRed, rawGreen, rawBlue);
+
     const sources: { [key: string]: number } = {
       R: rPulse * 3200,
       G: gPulse * 3200,
       RG: this.blendRG(rPulse, gPulse, rawRed, rawGreen, motionArtifact) * 3200,
+      POS: posValue,
     };
 
-    // Update per-source buffers
     for (const key of Object.keys(sources)) {
       this.sourceBuffers[key].push(sources[key]);
       if (this.sourceBuffers[key].length > 120) {
@@ -551,13 +585,12 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
       }
     }
 
-    // Rank sources every ~1 second (30 frames)
     if (this.frameCount % 30 === 0 && this.redBuffer.length >= 60) {
       this.rankSources();
     }
 
-    const value = this.clamp(sources[this.activeSource] ?? sources['RG'], -80, 80);
-    const strength = Math.max(Math.abs(rPulse), Math.abs(gPulse)) * 1000;
+    const value = this.clamp(sources[this.activeSource] ?? sources['POS'], -80, 80);
+    const strength = Math.max(Math.abs(rPulse), Math.abs(gPulse), Math.abs(posValue / 100)) * 1000;
 
     return { value, label: this.activeSource, strength };
   }
@@ -752,7 +785,8 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.redDC = 0; this.redAC = 0;
     this.greenDC = 0; this.greenAC = 0;
     this.blueDC = 0; this.blueAC = 0;
-    this.sourceBuffers = { R: [], G: [], RG: [] };
+    this.posWindow = [];
+    this.sourceBuffers = { R: [], G: [], RG: [], POS: [] };
     this.bandpassFilter.reset();
   }
 
@@ -786,10 +820,11 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     this.blueDC = 0; this.blueAC = 0;
     this.motionScore = 0;
     this.lastAcceleration = { x: 0, y: 0, z: 0 };
-    this.sourceBuffers = { R: [], G: [], RG: [] };
-    this.sourceScores = { R: 0, G: 0, RG: 0 };
-    this.activeSource = 'RG';
+    this.sourceBuffers = { R: [], G: [], RG: [], POS: [] };
+    this.sourceScores = { R: 0, G: 0, RG: 0, POS: 0 };
+    this.activeSource = 'POS';
     this.lastSourceSwitch = 0;
+    this.posWindow = [];
     this.resetBaselines();
     this.bandpassFilter.setSampleRate(this.estimatedSampleRate);
     this.bandpassFilter.reset();
@@ -821,21 +856,22 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
     if (this.motionListenerActive) return;
     try {
       if (typeof DeviceMotionEvent !== 'undefined') {
-        if (typeof (DeviceMotionEvent as any).requestPermission === 'function') {
-          (DeviceMotionEvent as any).requestPermission()
+        const requestPermission = (DeviceMotionEvent as unknown as { requestPermission?: () => Promise<string> }).requestPermission;
+        if (typeof requestPermission === 'function') {
+          requestPermission()
             .then((state: string) => {
               if (state === 'granted') {
                 window.addEventListener('devicemotion', this.handleMotionEvent, { passive: true });
                 this.motionListenerActive = true;
               }
             })
-            .catch(() => {});
+            .catch(() => { /* ignore */ });
         } else {
           window.addEventListener('devicemotion', this.handleMotionEvent, { passive: true });
           this.motionListenerActive = true;
         }
       }
-    } catch {}
+    } catch { /* ignore */ }
   }
 
   private stopMotionListener(): void {

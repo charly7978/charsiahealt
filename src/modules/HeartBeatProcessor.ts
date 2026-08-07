@@ -43,13 +43,13 @@ export class HeartBeatProcessor {
     const unlock = async () => {
       if (this.audioUnlocked) return;
       try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         this.audioContext = new AudioContextClass();
         await this.audioContext.resume();
         this.audioUnlocked = true;
         document.removeEventListener('touchstart', unlock);
         document.removeEventListener('click', unlock);
-      } catch {}
+      } catch { /* ignore */ }
     };
     document.addEventListener('touchstart', unlock, { passive: true });
     document.addEventListener('click', unlock, { passive: true });
@@ -223,49 +223,109 @@ export class HeartBeatProcessor {
     return this.clamp(1000 / median, 20, 40);
   }
 
-  private estimatePeriodicity(): { bpm: number; score: number } {
-    if (this.signalBuffer.length < 60) return { bpm: 0, score: 0 };
+  private fft(signal: number[]): { real: number[]; imag: number[] } {
+    const n = signal.length;
+    if (n <= 1) return { real: signal, imag: signal.map(() => 0) };
 
-    const sampleRate = this.estimateSampleRate();
-    const windowLen = this.consecutivePeaks < 3 ? 120 : 180;
-    const recentSignal = this.normalizeWindow(this.signalBuffer.slice(-windowLen), windowLen);
-    const mean = recentSignal.reduce((s, v) => s + v, 0) / recentSignal.length;
-    const centered = recentSignal.map((v) => v - mean);
-    const energy = centered.reduce((s, v) => s + v * v, 0);
+    const bits = Math.log2(n);
+    if (!Number.isInteger(bits)) {
+      const pow2 = 1 << Math.ceil(bits);
+      const padded = new Array(pow2).fill(0);
+      for (let i = 0; i < n; i++) padded[i] = signal[i];
+      return this.fft(padded);
+    }
 
-    if (energy < 1800) return { bpm: 0, score: 0 };
+    const real = new Array(n).fill(0);
+    const imag = new Array(n).fill(0);
 
-    const minLag = Math.max(5, Math.round((sampleRate * 60) / 200));
-    const maxLag = Math.min(centered.length - 8, Math.round((sampleRate * 60) / 38));
+    for (let i = 0; i < n; i++) {
+      const j = parseInt(i.toString(2).padStart(bits, '0').split('').reverse().join(''), 2);
+      real[j] = signal[i];
+    }
 
-    let bestLag = 0;
-    let bestScore = 0;
-    const expectedRR = this.getExpectedRR();
-    const expectedLag = expectedRR > 0 ? Math.round((expectedRR / 1000) * sampleRate) : 0;
+    for (let s = 1; s <= bits; s++) {
+      const m = 1 << s;
+      const mPrev = m >> 1;
+      const wReal = Math.cos(-2 * Math.PI / m);
+      const wImag = Math.sin(-2 * Math.PI / m);
 
-    for (let lag = minLag; lag <= maxLag; lag++) {
-      let cross = 0, eA = 0, eB = 0;
-      for (let i = lag; i < centered.length; i++) {
-        cross += centered[i] * centered[i - lag];
-        eA += centered[i] ** 2;
-        eB += centered[i - lag] ** 2;
-      }
-      if (eA === 0 || eB === 0) continue;
-
-      const correlation = cross / Math.sqrt(eA * eB);
-      const rhythmBias = expectedLag > 0
-        ? 1 - Math.min(0.2, Math.abs(lag - expectedLag) / Math.max(1, expectedLag) * 0.12)
-        : 1;
-      const weighted = correlation * rhythmBias;
-
-      if (weighted > bestScore) {
-        bestScore = weighted;
-        bestLag = lag;
+      for (let k = 0; k < n; k += m) {
+        let wr = 1, wi = 0;
+        for (let j = 0; j < mPrev; j++) {
+          const tReal = wr * real[k + j + mPrev] - wi * imag[k + j + mPrev];
+          const tImag = wr * imag[k + j + mPrev] + wi * real[k + j + mPrev];
+          real[k + j + mPrev] = real[k + j] - tReal;
+          imag[k + j + mPrev] = imag[k + j] - tImag;
+          real[k + j] = real[k + j] + tReal;
+          imag[k + j] = imag[k + j] + tImag;
+          const wTemp = wr;
+          wr = wr * wReal - wi * wImag;
+          wi = wTemp * wImag + wi * wReal;
+        }
       }
     }
 
-    if (bestLag === 0 || bestScore < 0.2) return { bpm: 0, score: Math.max(0, bestScore) };
-    return { bpm: (60 * sampleRate) / bestLag, score: this.clamp(bestScore, 0, 1) };
+    return { real, imag };
+  }
+
+  private welchPSD(signal: number[]): number[] {
+    const windowSize = 128;
+    const hopSize = 64;
+    const numWindows = Math.max(1, Math.floor((signal.length - windowSize) / hopSize));
+
+    const hannWindow = new Array(windowSize).fill(0).map((_, i) => 0.5 * (1 - Math.cos(2 * Math.PI * i / (windowSize - 1))));
+
+    const psd = new Array(windowSize).fill(0);
+
+    for (let w = 0; w < numWindows; w++) {
+      const start = w * hopSize;
+      const segment = signal.slice(start, start + windowSize).map((v, i) => v * hannWindow[i]);
+      const { real, imag } = this.fft(segment);
+
+      for (let k = 0; k < windowSize; k++) {
+        const mag = real[k] * real[k] + imag[k] * imag[k];
+        psd[k] += mag / numWindows;
+      }
+    }
+
+    const psdOneSided = new Array(windowSize / 2).fill(0);
+    for (let k = 0; k < windowSize / 2; k++) {
+      psdOneSided[k] = k === 0 ? psd[k] : 2 * psd[k];
+    }
+
+    return psdOneSided;
+  }
+
+  private estimatePeriodicity(): { bpm: number; score: number } {
+    if (this.signalBuffer.length < 64) return { bpm: 0, score: 0 };
+
+    const sampleRate = this.estimateSampleRate();
+    const signal = this.normalizeWindow(this.signalBuffer.slice(-256), 256);
+
+    const mean = signal.reduce((s, v) => s + v, 0) / signal.length;
+    const centered = signal.map((v) => v - mean);
+
+    const psd = this.welchPSD(centered);
+
+    const minBin = Math.max(1, Math.floor(0.667 * psd.length / (sampleRate / 2)));
+    const maxBin = Math.min(psd.length - 1, Math.floor(3.0 * psd.length / (sampleRate / 2)));
+
+    let bestBin = minBin;
+    let bestPower = 0;
+    for (let k = minBin; k <= maxBin; k++) {
+      if (psd[k] > bestPower) {
+        bestPower = psd[k];
+        bestBin = k;
+      }
+    }
+
+    const freq = (bestBin * sampleRate) / (2 * psd.length);
+    const bpm = freq * 60;
+
+    const noiseFloor = psd.slice(minBin, maxBin).reduce((a, b) => a + b, 0) / Math.max(1, maxBin - minBin + 1);
+    const score = bestPower > 0 ? Math.min(1, (bestPower - noiseFloor) / (bestPower + noiseFloor + 1e-9)) : 0;
+
+    return { bpm: this.clamp(bpm, 40, 180), score: this.clamp(score, 0, 1) };
   }
 
   private calculateSQI(range: number, periodicityScore: number): number {
@@ -401,7 +461,7 @@ export class HeartBeatProcessor {
   }
 
   private vibrate(): void {
-    try { if (navigator.vibrate) navigator.vibrate(55); } catch {}
+    try { if (navigator.vibrate) navigator.vibrate(55); } catch { /* ignore */ }
   }
 
   private async playBeep(): Promise<void> {
@@ -422,7 +482,7 @@ export class HeartBeatProcessor {
       osc.start(t);
       osc.stop(t + 0.12);
       this.lastBeepTime = now;
-    } catch {}
+    } catch { /* ignore */ }
   }
 
   private clamp(value: number, min: number, max: number): number {
