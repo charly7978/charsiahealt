@@ -1,4 +1,3 @@
-import { HeartBeatProcessor } from '../modules/HeartBeatProcessor';
 
 export type ContactState = 'NO_CONTACT' | 'UNSTABLE_CONTACT' | 'STABLE_CONTACT';
 
@@ -39,10 +38,4 @@ export interface SignalProcessor {
   calibrate: () => Promise<boolean>;
   onSignalReady?: (signal: ProcessedSignal) => void;
   onError?: (error: ProcessingError) => void;
-}
-
-declare global {
-  interface Window {
-    heartBeatProcessor: HeartBeatProcessor;
-  }
 }

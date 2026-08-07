@@ -3,7 +3,8 @@ let audioCtx: AudioContext | null = null;
 
 const getAudioContext = (): AudioContext => {
   if (!audioCtx) {
-    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    audioCtx = new Ctor();
   }
   return audioCtx;
 };
@@ -39,30 +40,6 @@ export const playCompletionSound = () => {
 
       offset += durations[i] + 0.06;
     });
-  } catch (e) {
-    console.log('Audio no disponible:', e);
-  }
-};
-
-/**
- * Beep corto de alerta (para arritmias)
- */
-export const playAlertBeep = () => {
-  try {
-    const ctx = getAudioContext();
-    const now = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-
-    osc.type = 'square';
-    osc.frequency.setValueAtTime(660, now);
-    gain.gain.setValueAtTime(0.15, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
-
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(now);
-    osc.stop(now + 0.2);
   } catch (e) {
     console.log('Audio no disponible:', e);
   }

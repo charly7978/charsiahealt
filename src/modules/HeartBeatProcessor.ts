@@ -36,6 +36,11 @@ export class HeartBeatProcessor {
   private consecutivePeaks = 0;
   private signalQualityIndex = 0;
 
+  // El análisis frecuencial (FFT/Welch) es caro en el main thread; se recalcula
+  // a ~3 Hz (cada 10 frames a 30fps) y el BPM mostrado ya se suaviza por EMA.
+  private readonly PERIODICITY_EVERY_N_FRAMES = 10;
+  private periodicityCounter = 0;
+
   constructor() {
     this.setupAudio();
   }
@@ -95,16 +100,18 @@ export class HeartBeatProcessor {
     const windowLen = this.consecutivePeaks < 3 ? 90 : 150;
     const { normalizedValue, range } = this.normalizeSignal(filteredValue, windowLen);
     
-    const periodicity = this.estimatePeriodicity();
-    this.periodicityScore = periodicity.score;
-
-    if (periodicity.bpm > 0) {
-      this.frequencyBPM = this.frequencyBPM === 0
-        ? periodicity.bpm
-        : this.frequencyBPM * 0.82 + periodicity.bpm * 0.18;
-    } else {
-      this.frequencyBPM = this.frequencyBPM * 0.94;
+    if (this.periodicityCounter % this.PERIODICITY_EVERY_N_FRAMES === 0) {
+      const periodicity = this.estimatePeriodicity();
+      this.periodicityScore = periodicity.score;
+      if (periodicity.bpm > 0) {
+        this.frequencyBPM = this.frequencyBPM === 0
+          ? periodicity.bpm
+          : this.frequencyBPM * 0.82 + periodicity.bpm * 0.18;
+      } else {
+        this.frequencyBPM = this.frequencyBPM * 0.94;
+      }
     }
+    this.periodicityCounter++;
 
     this.signalQualityIndex = this.calculateSQI(range, this.periodicityScore);
 
@@ -272,7 +279,7 @@ export class HeartBeatProcessor {
     const hopSize = 64;
     const numWindows = Math.max(1, Math.floor((signal.length - windowSize) / hopSize));
 
-    const hannWindow = new Array(windowSize).fill(0).map((_, i) => 0.5 * (1 - Math.cos(2 * Math.PI * i / (windowSize - 1))));
+    const hannWindow = HANN_128;
 
     const psd = new Array(windowSize).fill(0);
 
@@ -549,3 +556,13 @@ export class HeartBeatProcessor {
     if (this.audioContext) this.audioContext.close().catch(() => {});
   }
 }
+
+/** Ventana Hann de 128 muestras precalculada (constante, sin GC por llamada). */
+const HANN_128: number[] = (() => {
+  const size = 128;
+  const w = new Array(size);
+  for (let i = 0; i < size; i++) {
+    w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (size - 1)));
+  }
+  return w;
+})();

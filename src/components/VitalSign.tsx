@@ -38,7 +38,7 @@ const VitalSign = ({
     
     if (typeof value === 'string') {
       switch(label) {
-        case 'PRESIÓN ARTERIAL':
+        case 'PRESIÓN ARTERIAL': {
           const pressureParts = value.split('/');
           if (pressureParts.length === 2) {
             const systolic = parseInt(pressureParts[0], 10);
@@ -49,7 +49,8 @@ const VitalSign = ({
             }
           }
           return '';
-        case 'COLESTEROL/TRIGL.':
+        }
+        case 'COLESTEROL/TRIGL.': {
           const lipidParts = value.split('/');
           if (lipidParts.length === 2) {
             const cholesterol = parseInt(lipidParts[0], 10);
@@ -62,7 +63,8 @@ const VitalSign = ({
             }
           }
           return '';
-        case 'ARRITMIAS':
+        }
+        case 'ARRITMIAS': {
           const arrhythmiaParts = value.split('|');
           if (arrhythmiaParts.length === 2) {
             const status = arrhythmiaParts[0];
@@ -77,6 +79,7 @@ const VitalSign = ({
             }
           }
           return '';
+        }
         default:
           return '';
       }

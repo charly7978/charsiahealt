@@ -3,15 +3,17 @@ import { PPGSignalProcessor } from '../PPGSignalProcessor';
 import { HeartBeatProcessor } from '../../HeartBeatProcessor';
 import type { ProcessedSignal } from '../../../types/signal';
 
+type GlobalWithImageData = typeof globalThis & { ImageData?: typeof ImageData };
+
 const ImageDataCtor: typeof ImageData =
-  (globalThis as any).ImageData ??
+  (globalThis as GlobalWithImageData).ImageData ??
   class {
     data: Uint8ClampedArray; width: number; height: number;
     constructor(data: Uint8ClampedArray, w: number, h: number) {
       this.data = data; this.width = w; this.height = h;
     }
-  } as any;
-(globalThis as any).ImageData = ImageDataCtor;
+  } as unknown as typeof ImageData;
+(globalThis as GlobalWithImageData).ImageData = ImageDataCtor;
 
 /**
  * Genera un frame red-dominant pulsátil. Patrón espacialmente uniforme para

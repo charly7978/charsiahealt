@@ -53,9 +53,9 @@ export const useHealthAnalysis = () => {
       }
 
       setAnalysis(result.analysis);
-    } catch (err: any) {
+    } catch (err) {
       console.error('Error análisis AI:', err);
-      const msg = err?.message || 'Error desconocido';
+      const msg = err instanceof Error ? err.message : 'Error desconocido';
       if (msg.includes('429') || msg.includes('rate')) {
         toast({ title: "Demasiadas solicitudes", description: "Intenta de nuevo en unos segundos.", variant: "destructive", duration: 4000 });
       } else if (msg.includes('402') || msg.includes('payment') || msg.includes('créditos')) {

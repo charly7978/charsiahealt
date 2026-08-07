@@ -1,6 +1,6 @@
 # Auditoría de Depuración del Repositorio
 
-**Fecha:** 2026-05-09
+**Fecha:** 2026-05-09 (actualizado 2026-08-07)
 **Objetivo:** repositorio sin archivos huérfanos, código duplicado ni APIs obsoletas.
 
 ## Archivos eliminados
@@ -10,8 +10,21 @@
 | `src/components/CameraPreview.tsx` | Componente obsoleto, reemplazado por `CameraView.tsx`. Cero importadores. |
 | `src/components/MonitorButton.tsx` | Botón legacy no usado en ningún lado. |
 | `src/utils/qualityUtils.ts` | Utilidad sin importadores; lógica de calidad vive en `PPGSignalProcessor`. |
-| `src/lib/ppg/**` (12 archivos) | Librería duplicada de la lógica ya implementada en `PPGSignalProcessor` / `BandpassFilter`. Sin cablear. |
 | API `setArrhythmiaState` (no-op) en `useHeartBeatProcessor` | Era función vacía; las arritmias se gestionan en `ArrhythmiaProcessor`. Eliminadas también las 3 llamadas en `Index.tsx`. |
+| `src/App.css` | Huérfano (solo se importa `index.css`). |
+| `src/components/ui/use-toast.ts` | Shim duplicado; todos los imports apuntan a `@/hooks/use-toast`. |
+| Exports muertos: `playAlertBeep`, `setLogLevel`/`getLogLevel`, `getPpgRuntimeDefaults`, `resetBackpressureConfig`, global `Window.heartBeatProcessor`, `FrameSample` | Cero importadores verificados. |
+
+## Consolidaciones
+
+| Cambio | Motivo |
+|---|---|
+| `BandpassFilter` ahora es wrapper de `BandpassBiquad` (`src/lib/ppg/signal/filters.ts`) | Había dos implementaciones Butterworth biquad casi idénticas. |
+| `Toaster` montado en `App.tsx` | Las llamadas a `toast()` despachaban al state sin portal Radix: los toasts nunca se mostraban. |
+| `usePpgCapture` con guard de generación (runId) | `start()` asíncrono podía crear un worker zombi si `active` cambiaba durante el arranque. |
+| `HeartBeatProcessor`: FFT/Welch throttled a ~3 Hz + ventana Hann cacheada | El hotspot del main thread (allocs por frame) se redujo sin cambiar la salida (el BPM se suaviza por EMA). |
+| `PPGSignalMeter`: bucle RAF único con throttle + buffer 840×1680 | El doble bucle RAF dibujaba ~90 fps sobre un buffer 1400×2800; ahora 30 fps sobre 3.5× menos píxeles. |
+| Advanced engine (Web Worker) desactivado por defecto | Pipeline de diagnóstico que duplicaba la captura de frames; sigue disponible en Ajustes. |
 
 ## Mapa de dependencias actual (limpio)
 
@@ -22,7 +35,7 @@ CameraView (MediaStream + torch)
 useSignalProcessor → PPGSignalProcessor
    │   • extractROI (5×5 tiles, exclusión de saturados)
    │   • multi-source (R / G / RG)
-   │   • BandpassFilter (Butterworth 0.3–5 Hz IIR)
+   │   • BandpassFilter (wrapper de BandpassBiquad, Butterworth 0.3–5 Hz IIR)
    │   • SQI unificado, perfusion index, contact state
    ▼
 ProcessedSignal
@@ -39,24 +52,34 @@ Index.tsx (UI)
    ├─► PPGSignalMeter (oscilloscope canvas, full-screen)
    ├─► VitalSign × N (con `--` cuando valor = 0)
    └─► useSaveMeasurement (Supabase persist al finalizar 60s)
+
+Pipeline avanzado opcional (Ajustes → "Advanced engine"): src/lib/ppg/**
+   usePpgCapture → worker ppgWorker (PCA + bandpass + SQI) — solo diagnóstico.
 ```
 
 ## Verificación tras limpieza
 
-- `rg "CameraPreview|MonitorButton|qualityUtils|lib/ppg|setArrhythmiaState"` → **0 referencias** en `src/`.
-- Build TypeScript sin errores.
+- `check:orphans` → OK (se arregló el falso positivo de imports `?worker` de Vite).
+- `check:no-sim` (source) → OK. Se arregló el scanner: los marcadores `// anti-sim-allow:` no se reconocían en archivos CRLF (`.` no cruza `\r`), lo que disparaba un falso positivo en `vitalsSanity.ts:1`.
+- `check:no-sim:dist` → OK (2 archivos / 532.9 KB escaneados tras build).
+- `npm run lint` → 0 errores (eran ~47 en la línea base: `any`, `no-empty`, `no-case-declarations`, `require()` en tailwind; todos corregidos).
+- `npm run typecheck` sin errores.
+- `npm run build` → OK (último build 2.9s).
+- `npm test` → 20 tests pasando (incluidos los 5 de `BandpassFilter` tras el wrapper).
 - Cada archivo restante en `src/` está importado por al menos otro archivo (excepto `App.tsx` y `main.tsx` que son entry-points, y los `.d.ts` que son ambient types).
 
-## Inventario final (38 archivos `.ts/.tsx`)
+## Inventario final
 
-- **Páginas:** `Index.tsx`, `Auth.tsx`, `NotFound.tsx`
-- **Componentes:** `CameraView`, `PPGSignalMeter`, `VitalSign` + UI primitives (button, card, input, toast, sonner, toaster)
-- **Hooks:** `useSignalProcessor`, `useHeartBeatProcessor`, `useVitalSignsProcessor`, `useHealthAnalysis`, `useSaveMeasurement`, `use-toast`
+- **Páginas:** `Index.tsx`, `NotFound.tsx`
+- **Componentes:** `CameraView`, `PPGSignalMeter`, `VitalSign` + UI primitives (toast, toaster)
+- **Hooks:** `useSignalProcessor`, `useHeartBeatProcessor`, `useVitalSignsProcessor`, `useHealthAnalysis`, `useSaveMeasurement`, `usePerfTelemetry`, `use-toast`
 - **Módulos signal-processing:** `PPGSignalProcessor`, `BandpassFilter`
 - **Módulos vital-signs:** `VitalSignsProcessor`, `BloodPressureProcessor`, `PPGFeatureExtractor`, `arrhythmia-processor`
 - **Módulos:** `HeartBeatProcessor`
-- **Utils:** `arrhythmiaUtils`, `soundUtils`, `CircularBuffer`, `lib/utils`
+- **Pipeline avanzado (diagnóstico):** `lib/ppg/**` (worker + filtros + SQI + ROI)
+- **Utils:** `arrhythmiaUtils`, `soundUtils`, `CircularBuffer`, `lib/utils`, `logger`
 - **Tipos:** `signal.d.ts`, `media-stream.d.ts`, `screen-orientation.d.ts`, `vite-env.d.ts`
 - **Integración:** `supabase/client.ts`, `supabase/types.ts`
 
 No queda código duplicado, obsoleto, ni APIs no-op. El cableado es lineal y unidireccional.
+

@@ -29,12 +29,14 @@ const PATTERNS = [
 ];
 
 // ---------- Centralized allowlist ----------
+// Entries with `dist: true` belong to the dist scanner (check-no-simulation-dist.mjs)
+// and are ignored here; source entries require a `file` to be scoped.
 const ALLOWLIST_PATH = "scripts/anti-sim-allowlist.json";
 let ALLOWLIST = [];
 if (existsSync(ALLOWLIST_PATH)) {
   try {
     const raw = JSON.parse(readFileSync(ALLOWLIST_PATH, "utf8"));
-    ALLOWLIST = Array.isArray(raw.entries) ? raw.entries : [];
+    ALLOWLIST = (Array.isArray(raw.entries) ? raw.entries : []).filter(e => e && e.dist !== true);
   } catch (e) {
     console.error(`❌ Failed to parse ${ALLOWLIST_PATH}: ${e.message}`);
     process.exit(1);
@@ -85,7 +87,9 @@ const violations = [];
 const malformedMarkers = [];
 for (const file of walk(ROOT)) {
   const text = readFileSync(file, "utf8");
-  const lines = text.split("\n");
+  // Normalize CRLF so `\r` no longer breaks the inline-marker regex (dot and
+  // `$` do not cross a line terminator).
+  const lines = text.split("\n").map((l) => l.replace(/\r$/, ""));
   const fileRel = relative(".", file);
   lines.forEach((line, i) => {
     const marker = inlineMarkerValid(line);

@@ -2,7 +2,7 @@
 declare global {
   interface ScreenOrientation {
     angle: number;
-    onchange: ((this: ScreenOrientation, ev: Event) => any) | null;
+    onchange: ((this: ScreenOrientation, ev: Event) => void) | null;
     type: OrientationType;
     lock(orientation: OrientationType): Promise<void>;
     unlock(): void;

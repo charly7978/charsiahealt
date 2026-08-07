@@ -18,21 +18,16 @@ const ORDER: Record<LogLevel, number> = {
 
 function resolveLevel(): LogLevel {
   try {
-    const env = (import.meta as any)?.env?.VITE_LOG_LEVEL as LogLevel | undefined;
+    const env = (import.meta as unknown as { env?: Record<string, unknown> })?.env
+      ?.VITE_LOG_LEVEL as LogLevel | undefined;
     if (env && env in ORDER) return env;
-  } catch {}
+  } catch {
+    /* entorno sin import.meta (test/node) */
+  }
   return 'info';
 }
 
-let currentLevel: LogLevel = resolveLevel();
-
-export function setLogLevel(level: LogLevel) {
-  currentLevel = level;
-}
-
-export function getLogLevel(): LogLevel {
-  return currentLevel;
-}
+const currentLevel: LogLevel = resolveLevel();
 
 function emit(level: LogLevel, scope: string, args: unknown[]) {
   if (ORDER[level] < ORDER[currentLevel]) return;

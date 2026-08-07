@@ -66,12 +66,18 @@ export function usePpgCapture(
   const roiRef = useRef<AdaptiveRoi | null>(null);
   const workerRef = useRef<Worker | null>(null);
 
+  // Contador de generación: cada start()/stop() invalida las secuencias en
+  // vuelo y evita que un start() asíncrono siga creando un worker zombi
+  // después de que el efecto de limpieza haya parado la captura.
+  const runIdRef = useRef(0);
+
   const lastUiUpdateRef = useRef(0);
   const fingerRef = useRef(false);
   const fpsRef = useRef(0);
   const configRef = useRef(getPpgRuntimeConfig());
 
   const stop = useCallback(async () => {
+    runIdRef.current += 1;
     loopRef.current?.stop();
     loopRef.current = null;
     if (workerRef.current) {
@@ -95,6 +101,7 @@ export function usePpgCapture(
       setError("Video element not ready.");
       return;
     }
+    const runId = ++runIdRef.current;
     setError(null);
     setState("starting");
     try {
@@ -102,18 +109,21 @@ export function usePpgCapture(
         const controller = new CameraController();
         controllerRef.current = controller;
         const result = await controller.start();
+        if (runIdRef.current !== runId) return;
         video.srcObject = result.stream;
         try {
           await video.play();
         } catch {
           // iOS may reject play() until a user gesture; the loop still runs.
         }
+        if (runIdRef.current !== runId) return;
         setDiagnostics(result.diagnostics);
       } else {
         // External owner manages the stream/torch/locks. We only consume frames.
         setDiagnostics(null);
       }
 
+      if (runIdRef.current !== runId) return;
       const downsampler = new FrameDownsampler();
       downsamplerRef.current = downsampler;
       const cfg = configRef.current;
@@ -124,6 +134,7 @@ export function usePpgCapture(
       workerRef.current = worker;
       worker.postMessage({ type: "config", sqi: cfg.sqi });
       worker.addEventListener("message", (ev: MessageEvent<WorkerOutboundSnapshot>) => {
+        if (runIdRef.current !== runId) return;
         const data = ev.data;
         if (!data || data.type !== "snapshot") return;
         const truncated = data.filtered.slice(0, data.samples);
@@ -165,8 +176,10 @@ export function usePpgCapture(
       loopRef.current = loop;
       loop.start();
 
+      if (runIdRef.current !== runId) return;
       setState(controllerRef.current?.getState() ?? "running");
     } catch (err) {
+      if (runIdRef.current !== runId) return;
       setError(err instanceof Error ? err.message : "Capture failed.");
       setState("error");
       await stop();

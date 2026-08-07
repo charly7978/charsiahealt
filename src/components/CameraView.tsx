@@ -5,6 +5,24 @@ export interface CameraViewHandle {
   getDiagnostics: () => Record<string, unknown>;
 }
 
+/** Extensiones no estándar (torch) de las constraints/settings de cámara. */
+interface TorchConstraint extends MediaTrackConstraintSet {
+  torch?: boolean;
+}
+interface TorchSettings extends MediaTrackSettings {
+  torch?: boolean;
+}
+interface CameraConstraintsEx extends MediaTrackConstraintSet {
+  torch?: boolean;
+  iso?: number;
+  exposureCompensation?: number;
+}
+type MediaTrackCapabilitiesEx = MediaTrackCapabilities & {
+  torch?: boolean;
+  iso?: { min: number; max: number };
+  exposureCompensation?: { min: number; max: number };
+};
+
 interface CameraViewProps {
   onStreamReady?: (stream: MediaStream) => void;
   isMonitoring: boolean;
@@ -40,7 +58,7 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({
           label: track.label,
           readyState: track.readyState,
           settings,
-          torchSupported: !!(caps as any).torch,
+          torchSupported: !!(caps as Record<string, unknown>).torch,
         };
       } catch {
         return { active: true, error: 'caps_unavailable' };
@@ -56,11 +74,11 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({
         // Apagar flash primero
         for (const track of streamRef.current.getVideoTracks()) {
           try {
-            const caps = track.getCapabilities?.() as any;
+            const caps = track.getCapabilities?.();
             if (caps?.torch) {
-              await track.applyConstraints({ advanced: [{ torch: false } as any] });
+              await track.applyConstraints({ advanced: [{ torch: false } as TorchConstraint] });
             }
-          } catch {}
+          } catch { /* ignore */ }
           track.stop();
         }
         streamRef.current = null;
@@ -98,7 +116,7 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({
               });
               
               const track = testStream.getVideoTracks()[0];
-              const caps = track.getCapabilities?.() as any;
+              const caps = track.getCapabilities?.() as MediaTrackCapabilitiesEx;
               const hasTorch = caps?.torch === true;
               
               testStream.getTracks().forEach(t => t.stop());
@@ -107,7 +125,7 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({
                 console.log('✅ Cámara principal encontrada:', device.label);
                 return device.deviceId;
               }
-            } catch {}
+            } catch { /* ignore */ }
           }
         }
         
@@ -119,7 +137,7 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({
             });
             
             const track = testStream.getVideoTracks()[0];
-            const caps = track.getCapabilities?.() as any;
+            const caps = track.getCapabilities?.() as MediaTrackCapabilitiesEx;
             const hasTorch = caps?.torch === true;
             
             testStream.getTracks().forEach(t => t.stop());
@@ -128,7 +146,7 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({
               console.log('✅ Cámara con torch encontrada:', device.label);
               return device.deviceId;
             }
-          } catch {}
+          } catch { /* ignore */ }
         }
         
         return null;
@@ -207,7 +225,7 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({
             video.onloadedmetadata = async () => {
               try {
                 await video.play();
-              } catch {}
+              } catch { /* ignore */ }
               resolve();
             };
           });
@@ -222,11 +240,11 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({
           let flashActivated = false;
           for (let attempt = 0; attempt < 5 && !flashActivated; attempt++) {
             try {
-              const caps = track.getCapabilities?.() as any;
+              const caps = track.getCapabilities?.() as MediaTrackCapabilitiesEx;
               if (caps?.torch) {
-                await track.applyConstraints({ advanced: [{ torch: true } as any] });
+                await track.applyConstraints({ advanced: [{ torch: true } as TorchConstraint] });
                 
-                const settings = track.getSettings() as any;
+                const settings = track.getSettings() as TorchSettings;
                 if (settings?.torch === true) {
                   flashActivated = true;
                   console.log('🔦 Flash ACTIVADO (verificado)');
@@ -251,8 +269,8 @@ const CameraView = forwardRef<CameraViewHandle, CameraViewProps>(({
           // PASO 6: Estabilizar frame rate/exposición/ISO/WB para fortalecer señal PPG útil
           await new Promise(r => setTimeout(r, 300));
           try {
-            const caps = track.getCapabilities?.() as any;
-            const lockConstraints: any[] = [];
+            const caps = track.getCapabilities?.() as MediaTrackCapabilitiesEx;
+            const lockConstraints: CameraConstraintsEx[] = [];
             
             if (caps?.frameRate) {
               lockConstraints.push({ frameRate: 30 });

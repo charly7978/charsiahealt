@@ -10,7 +10,7 @@ import { useSaveMeasurement } from "@/hooks/useSaveMeasurement";
 import { useHealthAnalysis } from "@/hooks/useHealthAnalysis";
 import PPGSignalMeter from "@/components/PPGSignalMeter";
 import { VitalSignsResult } from "@/modules/vital-signs/VitalSignsProcessor";
-import { toast } from "@/components/ui/use-toast";
+import { toast } from "@/hooks/use-toast";
 import { ppgPerf } from "@/utils/logger";
 import { usePerfTelemetry, getPerfConsent, setPerfConsent } from "@/hooks/usePerfTelemetry";
 import type { BackpressureConfig } from "@/lib/perf/backpressureConfig";
@@ -46,6 +46,37 @@ import {
 import { usePpgCapture } from "@/lib/ppg/hooks/usePpgCapture";
 
 import { supabase } from "@/integrations/supabase/client";
+
+interface VideoFrameMetadata {
+  mediaTime?: number;
+  presentationTime?: number;
+  expectedDisplayTime?: number;
+  width?: number;
+  height?: number;
+  presentedFrames?: number;
+  processingDuration?: number;
+}
+
+/** Compara los campos mostrados de dos resultados de vitales (evita re-renders
+ *  cuando el procesador devuelve un objeto nuevo con los mismos valores). */
+function vitalsEqual(a: VitalSignsResult, b: VitalSignsResult): boolean {
+  return (
+    a.spo2 === b.spo2 &&
+    a.glucose === b.glucose &&
+    a.hemoglobin === b.hemoglobin &&
+    a.pressure.systolic === b.pressure.systolic &&
+    a.pressure.diastolic === b.pressure.diastolic &&
+    a.pressure.confidence === b.pressure.confidence &&
+    a.lipids.totalCholesterol === b.lipids.totalCholesterol &&
+    a.lipids.triglycerides === b.lipids.triglycerides &&
+    a.arrhythmiaStatus === b.arrhythmiaStatus &&
+    a.arrhythmiaCount === b.arrhythmiaCount &&
+    a.signalQuality === b.signalQuality &&
+    a.measurementConfidence === b.measurementConfidence &&
+    a.isCalibrating === b.isCalibrating &&
+    a.calibrationProgress === b.calibrationProgress
+  );
+}
 
 const Index = () => {
   // ESTADOS PRINCIPALES
@@ -95,6 +126,10 @@ const Index = () => {
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const frameLoopRef = useRef<number | null>(null);
   const isProcessingRef = useRef(false);
+  const vitalSignsFrameCounter = useRef<number>(0);
+  const unstableFrameCounter = useRef<number>(0);
+  const latestArrhythmiaCountRef = useRef<number>(0);
+  const prevRRIntervalsRef = useRef<number[]>([]);
   // anti-sim-allow: reason="Wires up the runtime detector for fabricated vitals streams." ref="GUARDRAIL-DIST-RUNTIME"
   // Runtime guardrail: detect implausible vitals streams.
   const [sanityProfileId, setSanityProfileId] = useState<string>(() => getActiveProfileId());
@@ -173,11 +208,11 @@ const Index = () => {
     toast({ title: "✓ PPG defaults restaurados" });
   }, []);
 
-  // Advanced PPG engine (Web Worker pipeline). Runs in parallel to the
-  // legacy processor and shares the existing CameraView <video> element
-  // (no second getUserMedia call is made).
+  // Advanced PPG engine (Web Worker pipeline). Es un panel de diagnóstico
+  // (sus resultados solo se muestran en Ajustes): se desactiva por defecto para
+  // no duplicar la captura de frames del pipeline principal.
   const [advVideoEl, setAdvVideoEl] = useState<HTMLVideoElement | null>(null);
-  const [advancedEngineEnabled, setAdvancedEngineEnabled] = useState<boolean>(true);
+  const [advancedEngineEnabled, setAdvancedEngineEnabled] = useState<boolean>(false);
   const advanced = usePpgCapture({
     video: advVideoEl,
     active: advancedEngineEnabled && isMonitoring && !!cameraStream && !!advVideoEl,
@@ -306,14 +341,15 @@ const Index = () => {
   }, []);
 
   // PANTALLA COMPLETA
-  const enterFullScreen = async () => {
+  const enterFullScreen = useCallback(async () => {
     if (isFullscreen) return;
     try {
       const docEl = document.documentElement;
+      const webkitDocEl = docEl as unknown as { webkitRequestFullscreen?: () => Promise<void> };
       if (docEl.requestFullscreen) {
         await docEl.requestFullscreen();
-      } else if ((docEl as any).webkitRequestFullscreen) {
-        await (docEl as any).webkitRequestFullscreen();
+      } else if (webkitDocEl.webkitRequestFullscreen) {
+        await webkitDocEl.webkitRequestFullscreen();
       }
       if (screen.orientation?.lock) {
         await screen.orientation.lock('portrait').catch(() => {});
@@ -322,28 +358,31 @@ const Index = () => {
     } catch (err) {
       console.log('Error pantalla completa:', err);
     }
-  };
+  }, [isFullscreen]);
   
-  const exitFullScreen = () => {
+  const exitFullScreen = useCallback(() => {
     if (!isFullscreen) return;
     try {
+      const doc = document as unknown as { webkitExitFullscreen?: () => void };
       if (document.exitFullscreen) {
         document.exitFullscreen();
-      } else if ((document as any).webkitExitFullscreen) {
-        (document as any).webkitExitFullscreen();
+      } else if (doc.webkitExitFullscreen) {
+        doc.webkitExitFullscreen();
       }
       screen.orientation?.unlock();
       setIsFullscreen(false);
-    } catch {}
-  };
+    } catch {
+      /* ignore */
+    }
+  }, [isFullscreen]);
 
   useEffect(() => {
     const timer = setTimeout(() => enterFullScreen(), 1000);
     
     const handleFullscreenChange = () => {
+      const doc = document as unknown as { webkitFullscreenElement?: Element };
       setIsFullscreen(Boolean(
-        document.fullscreenElement || 
-        (document as any).webkitFullscreenElement
+        document.fullscreenElement || doc.webkitFullscreenElement
       ));
     };
     
@@ -355,7 +394,7 @@ const Index = () => {
       document.removeEventListener('fullscreenchange', handleFullscreenChange);
       document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
     };
-  }, []);
+  }, [enterFullScreen]);
 
   // PREVENIR SCROLL
   useEffect(() => {
@@ -399,14 +438,21 @@ const Index = () => {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         processFrame(imageData);
-      } catch {}
+      } catch {
+        /* frame fallido: se omite sin parar el loop */
+      }
       scheduleNext(video);
     };
 
     const scheduleNext = (video: HTMLVideoElement) => {
       if (!isProcessingRef.current) return;
       if ('requestVideoFrameCallback' in video) {
-        (video as any).requestVideoFrameCallback((_now: number, metadata: any) => {
+        const vfcVideo = video as HTMLVideoElement & {
+          requestVideoFrameCallback?: (
+            cb: (now: number, metadata: VideoFrameMetadata) => void
+          ) => number;
+        };
+        vfcVideo.requestVideoFrameCallback?.((_now: number, metadata: VideoFrameMetadata) => {
           ppgPerf.markFrame(metadata);
           captureOneFrame();
         });
@@ -607,6 +653,8 @@ const Index = () => {
     arrhythmiaBeatsRef.current = 0;
     lastArrhythmiaCountForBeatsRef.current = 0;
     unstableFrameCounter.current = 0;
+    latestArrhythmiaCountRef.current = 0;
+    prevRRIntervalsRef.current = [];
     setHeartbeatSignal(0);
     setBeatMarker(0);
     setRRIntervals([]);
@@ -636,8 +684,6 @@ const Index = () => {
   }, [cameraStream, stopFrameLoop, stopProcessing, fullResetVitalSigns, resetHeartBeat]);
 
   // === PROCESAR SEÑAL PPG ===
-  const vitalSignsFrameCounter = useRef<number>(0);
-  const unstableFrameCounter = useRef<number>(0);
   const UNSTABLE_ZERO_THRESHOLD = 15; // ~0.5s de señal mala antes de borrar vitales
   const VITALS_PROCESS_EVERY_N_FRAMES = 3;
   
@@ -668,6 +714,8 @@ const Index = () => {
         vitalSignsFrameCounter.current = 0;
         setBeatMarker(0);
         setRRIntervals([]);
+        prevRRIntervalsRef.current = [];
+        latestArrhythmiaCountRef.current = 0;
         setArrhythmiaCount("--");
         arrhythmiaDetectedRef.current = false;
         setVitalSigns(prev => (
@@ -731,7 +779,9 @@ const Index = () => {
       setBeatMarker(1);
       setTimeout(() => setBeatMarker(0), 300);
       totalBeatsRef.current++;
-      const currentArrCount = vitalSigns.arrhythmiaCount || 0;
+      // Se compara contra un ref siempre actualizado (no un closure stale del
+      // estado vitalSigns) para no depender de re-renders intermedios.
+      const currentArrCount = latestArrhythmiaCountRef.current;
       if (currentArrCount > lastArrhythmiaCountForBeatsRef.current) {
         arrhythmiaBeatsRef.current++;
         lastArrhythmiaCountForBeatsRef.current = currentArrCount;
@@ -739,7 +789,12 @@ const Index = () => {
     }
 
     if (heartBeatResult.rrData?.intervals) {
-      setRRIntervals(heartBeatResult.rrData.intervals.slice(-5));
+      const nextRR = heartBeatResult.rrData.intervals.slice(-5);
+      const prevRR = prevRRIntervalsRef.current;
+      if (prevRR.length !== nextRR.length || prevRR.some((v, i) => v !== nextRR[i])) {
+        prevRRIntervalsRef.current = nextRR;
+        setRRIntervals(nextRR);
+      }
     }
 
     vitalSignsFrameCounter.current++;
@@ -764,7 +819,7 @@ const Index = () => {
           : undefined
       );
 
-      setVitalSigns(vitals);
+      setVitalSigns(prev => (vitalsEqual(prev, vitals) ? prev : vitals));
 
       if (heartBeatResult.rrData && heartBeatResult.rrData.intervals.length >= 2 && heartBeatResult.confidence > 0.18 && vitals.measurementConfidence !== 'INVALID') {
         const arrhythmiaStatus = vitals.arrhythmiaStatus;
@@ -773,6 +828,7 @@ const Index = () => {
           const parts = arrhythmiaStatus.split('|');
           const count = parts.length > 1 ? parts[1] : "0";
           setArrhythmiaCount(count);
+          latestArrhythmiaCountRef.current = vitals.arrhythmiaCount || 0;
 
           const isArrhythmiaDetected = arrhythmiaStatus.includes("ARRITMIA DETECTADA");
           if (isArrhythmiaDetected !== arrhythmiaDetectedRef.current) {
@@ -1063,7 +1119,7 @@ const Index = () => {
                         className="text-xs px-2 py-1 rounded bg-white/15 hover:bg-white/25 border border-white/20">
                         CSV
                       </button>
-                      <button type="button" onClick={() => { clearPersistedAuditLog(); setAuditNegativeCount(c => c); }}
+                      <button type="button" onClick={() => { clearPersistedAuditLog(); setAuditNegativeCount(0); }}
                         className="text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 border border-white/10">
                         Borrar
                       </button>

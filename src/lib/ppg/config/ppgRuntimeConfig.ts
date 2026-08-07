@@ -132,10 +132,6 @@ export function getPpgRuntimeConfig(): PpgRuntimeConfig {
   return current;
 }
 
-export function getPpgRuntimeDefaults(): PpgRuntimeConfig {
-  return DEFAULTS;
-}
-
 export function setPpgRuntimeConfig(partial: Partial<PpgRuntimeConfig>): PpgRuntimeConfig {
   current = sanitize(deepMerge(current, partial));
   persist(current);

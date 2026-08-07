@@ -35,9 +35,11 @@ function walk(dir, acc = []) {
 }
 
 function tryResolve(spec, fromFile) {
+  // Vite query suffix (e.g. "./worker?worker") — strip before resolving.
+  const cleanSpec = spec.split('?')[0];
   let base;
-  if (spec.startsWith('@/')) base = join(SRC, spec.slice(2));
-  else if (spec.startsWith('./') || spec.startsWith('../')) base = resolve(dirname(fromFile), spec);
+  if (cleanSpec.startsWith('@/')) base = join(SRC, cleanSpec.slice(2));
+  else if (cleanSpec.startsWith('./') || cleanSpec.startsWith('../')) base = resolve(dirname(fromFile), cleanSpec);
   else return null; // package import
 
   const candidates = [

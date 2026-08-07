@@ -28,8 +28,10 @@ interface PPGSignalMeterProps {
 }
 
 const CONFIG = {
-  CANVAS_WIDTH: 1400,
-  CANVAS_HEIGHT: 2800,
+  // Buffer interno 2x el viewport típico de móvil (420 CSS px de ancho).
+  // Suficiente nitidez; ~3.5x menos píxeles que 1400x2800 para el llenado por frame.
+  CANVAS_WIDTH: 840,
+  CANVAS_HEIGHT: 1680,
   WINDOW_MS: 2800,
   TARGET_FPS: 30,
   BUFFER_SIZE: 400,
@@ -109,6 +111,7 @@ const PPGSignalMeter = ({
 
   const gridCacheRef = useRef<HTMLCanvasElement | null>(null);
   const gridDirtyRef = useRef(true);
+  const frameCounterRef = useRef(0);
 
   const getPlotArea = useCallback(() => {
     const { CANVAS_WIDTH: W, CANVAS_HEIGHT: H, PLOT_AREA } = CONFIG;
@@ -677,31 +680,34 @@ const PPGSignalMeter = ({
     const canvas = canvasRef.current;
     const buffer = dataBufferRef.current;
     if (!canvas || !buffer) {
-      animationRef.current = requestAnimationFrame(render);
       return;
     }
     
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) {
-      animationRef.current = requestAnimationFrame(render);
       return;
     }
     
     const now = Date.now();
-    const frameTime = 1500 / CONFIG.TARGET_FPS;
-    
+    const frameTime = 1000 / CONFIG.TARGET_FPS;
+
     const { value: signalValue, isFingerDetected: detected, arrhythmiaStatus: arrStatus, preserveResults: preserve, isPeak: peak } = propsRef.current;
     const plot = getPlotArea();
     const { WINDOW_MS, COLORS } = CONFIG;
     
     ensureGridCache(ctx);
-    drawAmplitudeScale(ctx);
-    drawTimeScale(ctx);
-    drawVitalInfo(ctx, now);
-    drawClinicalPanel(ctx);
+    
+    // Los paneles de texto/escalas son contenido estático con números que
+    // cambian lento; se redibujan a media frecuencia para aligerar el frame.
+    const tick = (frameCounterRef.current += 1);
+    if (tick % 2 === 1) {
+      drawAmplitudeScale(ctx);
+      drawTimeScale(ctx);
+      drawVitalInfo(ctx, now);
+      drawClinicalPanel(ctx);
+    }
     
     if (preserve && !detected) {
-      animationRef.current = requestAnimationFrame(render);
       return;
     }
     
@@ -1080,15 +1086,15 @@ const PPGSignalMeter = ({
     ctx.fillRect(lx + 320, legendY - 5, 12, 2);
     ctx.fillStyle = COLORS.TEXT_SECONDARY;
     ctx.fillText('IBI', lx + 338, legendY);
-    
-    animationRef.current = requestAnimationFrame(render);
   }, [ensureGridCache, drawAmplitudeScale, drawTimeScale, drawVitalInfo, drawClinicalPanel, getPlotArea]);
 
   useEffect(() => {
     if (isRunningRef.current) return;
     isRunningRef.current = true;
     
-    const frameTime = 1500 / CONFIG.TARGET_FPS;
+    // Bucle único con throttle: la señal se pinta a TARGET_FPS y los paneles
+    // estáticos se refrescan a media frecuencia dentro de render().
+    const frameTime = 1000 / CONFIG.TARGET_FPS;
     let lastRenderTime = 0;
     
     const renderLoop = () => {
@@ -1102,6 +1108,7 @@ const PPGSignalMeter = ({
       lastRenderTime = now;
       
       render();
+      animationRef.current = requestAnimationFrame(renderLoop);
     };
     
     animationRef.current = requestAnimationFrame(renderLoop);

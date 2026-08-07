@@ -32,20 +32,6 @@ export interface CameraDiagnostics {
   readonly notes: readonly string[];
 }
 
-export interface FrameSample {
-  readonly timestamp: number;
-  readonly mediaTime: number;
-  readonly presentedFrames: number;
-  readonly droppedFrames: number;
-  readonly fpsInstant: number;
-  readonly r: number;
-  readonly g: number;
-  readonly b: number;
-  readonly perfusion: number;
-  readonly fingerDetected: boolean;
-  readonly roiWeights: Float32Array;
-}
-
 export interface PpgSignalSnapshot {
   readonly filtered: Float32Array;
   readonly sqi: number;

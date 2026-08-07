@@ -11,16 +11,17 @@ export function getPerfConsent(): boolean {
 }
 
 export function setPerfConsent(value: boolean): void {
-  try { localStorage.setItem(CONSENT_KEY, value ? '1' : '0'); } catch {}
+  try { localStorage.setItem(CONSENT_KEY, value ? '1' : '0'); } catch { /* ignore */ }
 }
 
 function deviceInfo() {
   const nav = typeof navigator !== 'undefined' ? navigator : null;
   const scr = typeof screen !== 'undefined' ? screen : null;
+  const navWithMemory = nav as Navigator & { deviceMemory?: number };
   return {
     userAgent: nav?.userAgent ?? 'unknown',
     hardwareConcurrency: nav?.hardwareConcurrency ?? 0,
-    deviceMemory: (nav as any)?.deviceMemory ?? 0,
+    deviceMemory: navWithMemory.deviceMemory ?? 0,
     screen: scr ? { w: scr.width, h: scr.height } : null,
     dpr: typeof window !== 'undefined' ? window.devicePixelRatio : 1,
   };
@@ -79,7 +80,7 @@ export function usePerfTelemetry(opts: {
       const pending = await drainBuffer();
       if (pending.length) {
         const rows = pending.map((p) => ({ ...(p.payload as object), user_id: user.id }));
-        const { error } = await supabase.from('perf_snapshots').insert(rows as any);
+        const { error } = await supabase.from('perf_snapshots').insert(rows as never);
         if (!error) await deleteIds(pending.map((p) => p.id));
       }
 
@@ -101,7 +102,7 @@ export function usePerfTelemetry(opts: {
         app_version: APP_VERSION,
         consent_given: true,
       };
-      const { error } = await supabase.from('perf_snapshots').insert(row as any);
+      const { error } = await supabase.from('perf_snapshots').insert(row as never);
       if (error) {
         await bufferSnapshot(row);
       }
