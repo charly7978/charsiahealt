@@ -111,7 +111,6 @@ const PPGSignalMeter = ({
 
   const gridCacheRef = useRef<HTMLCanvasElement | null>(null);
   const gridDirtyRef = useRef(true);
-  const frameCounterRef = useRef(0);
 
   const getPlotArea = useCallback(() => {
     const { CANVAS_WIDTH: W, CANVAS_HEIGHT: H, PLOT_AREA } = CONFIG;
@@ -689,7 +688,6 @@ const PPGSignalMeter = ({
     }
     
     const now = Date.now();
-    const frameTime = 1000 / CONFIG.TARGET_FPS;
 
     const { value: signalValue, isFingerDetected: detected, arrhythmiaStatus: arrStatus, preserveResults: preserve, isPeak: peak } = propsRef.current;
     const plot = getPlotArea();
@@ -697,15 +695,12 @@ const PPGSignalMeter = ({
     
     ensureGridCache(ctx);
     
-    // Los paneles de texto/escalas son contenido estático con números que
-    // cambian lento; se redibujan a media frecuencia para aligerar el frame.
-    const tick = (frameCounterRef.current += 1);
-    if (tick % 2 === 1) {
-      drawAmplitudeScale(ctx);
-      drawTimeScale(ctx);
-      drawVitalInfo(ctx, now);
-      drawClinicalPanel(ctx);
-    }
+    // Los paneles deben redibujarse en CADA frame: ensureGridCache repinta el
+    // fondo opaco, que borraría lo dibujado en el frame anterior.
+    drawAmplitudeScale(ctx);
+    drawTimeScale(ctx);
+    drawVitalInfo(ctx, now);
+    drawClinicalPanel(ctx);
     
     if (preserve && !detected) {
       return;

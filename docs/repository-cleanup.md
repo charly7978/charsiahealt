@@ -13,6 +13,7 @@
 | API `setArrhythmiaState` (no-op) en `useHeartBeatProcessor` | Era función vacía; las arritmias se gestionan en `ArrhythmiaProcessor`. Eliminadas también las 3 llamadas en `Index.tsx`. |
 | `src/App.css` | Huérfano (solo se importa `index.css`). |
 | `src/components/ui/use-toast.ts` | Shim duplicado; todos los imports apuntan a `@/hooks/use-toast`. |
+| `src/components/ui/toaster.tsx` | Portal Radix nunca montado (revertido en 2026-08-07: los `toast()` siguen despachando al store sin UI, comportamiento original). |
 | Exports muertos: `playAlertBeep`, `setLogLevel`/`getLogLevel`, `getPpgRuntimeDefaults`, `resetBackpressureConfig`, global `Window.heartBeatProcessor`, `FrameSample` | Cero importadores verificados. |
 
 ## Consolidaciones
@@ -20,7 +21,7 @@
 | Cambio | Motivo |
 |---|---|
 | `BandpassFilter` ahora es wrapper de `BandpassBiquad` (`src/lib/ppg/signal/filters.ts`) | Había dos implementaciones Butterworth biquad casi idénticas. |
-| `Toaster` montado en `App.tsx` | Las llamadas a `toast()` despachaban al state sin portal Radix: los toasts nunca se mostraban. |
+| `usePpgCapture` con guard de generación (runId) | `start()` asíncrono podía crear un worker zombi si `active` cambiaba durante el arranque. |
 | `usePpgCapture` con guard de generación (runId) | `start()` asíncrono podía crear un worker zombi si `active` cambiaba durante el arranque. |
 | `HeartBeatProcessor`: FFT/Welch throttled a ~3 Hz + ventana Hann cacheada | El hotspot del main thread (allocs por frame) se redujo sin cambiar la salida (el BPM se suaviza por EMA). |
 | `PPGSignalMeter`: bucle RAF único con throttle + buffer 840×1680 | El doble bucle RAF dibujaba ~90 fps sobre un buffer 1400×2800; ahora 30 fps sobre 3.5× menos píxeles. |
@@ -71,7 +72,7 @@ Pipeline avanzado opcional (Ajustes → "Advanced engine"): src/lib/ppg/**
 ## Inventario final
 
 - **Páginas:** `Index.tsx`, `NotFound.tsx`
-- **Componentes:** `CameraView`, `PPGSignalMeter`, `VitalSign` + UI primitives (toast, toaster)
+- **Componentes:** `CameraView`, `PPGSignalMeter`, `VitalSign` + UI primitives (toast hook)
 - **Hooks:** `useSignalProcessor`, `useHeartBeatProcessor`, `useVitalSignsProcessor`, `useHealthAnalysis`, `useSaveMeasurement`, `usePerfTelemetry`, `use-toast`
 - **Módulos signal-processing:** `PPGSignalProcessor`, `BandpassFilter`
 - **Módulos vital-signs:** `VitalSignsProcessor`, `BloodPressureProcessor`, `PPGFeatureExtractor`, `arrhythmia-processor`
