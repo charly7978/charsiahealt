@@ -98,12 +98,12 @@ const PPGSignalMeter = ({
 
   // ---------- CÁMARA 3D (proyección en perspectiva manual, sin librerías) ----------
   const computeCamera = useCallback((now: number) => {
-    const pitch = (24 + 2.4 * Math.sin(now / 9000)) * Math.PI / 180;
+    const pitch = (38 + 2.4 * Math.sin(now / 9000)) * Math.PI / 180;
     const yaw = 2.6 * Math.sin(now / 13000 + 1.7) * Math.PI / 180;
     return {
       cth: Math.cos(pitch), sth: Math.sin(pitch),
       cph: Math.cos(yaw), sph: Math.sin(yaw),
-      H: 650, D: 2600, F: 2350,
+      H: 700, D: 2600, F: 2350,
       cx: 420, cy: 700
     };
   }, []);
@@ -493,7 +493,7 @@ const PPGSignalMeter = ({
   const draw3DStage = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
     const { COLORS } = CONFIG;
     const { preserveResults, isFingerDetected: detected } = propsRef.current;
-    const stage = { x0: 60, x1: 780, y0: 272, y1: 1252 };
+    const stage = { x0: 58, x1: 782, y0: 268, y1: 1260 };
     const cam = computeCamera(now);
     const proj = (x: number, y: number, z: number) => project(x, y, z, cam);
 
@@ -503,10 +503,10 @@ const PPGSignalMeter = ({
     ctx.clip();
 
     // Plano 3D: polígono (línea trasera y delantera del plano en pantalla)
-    const plBackL = proj(-340, 0, -900);
-    const plBackR = proj(340, 0, -900);
-    const plFrontL = proj(-340, 0, 0);
-    const plFrontR = proj(340, 0, 0);
+    const plBackL = proj(-420, 0, -900);
+    const plBackR = proj(420, 0, -900);
+    const plFrontL = proj(-420, 0, 0);
+    const plFrontR = proj(420, 0, 0);
     const planeGrad = ctx.createLinearGradient(0, plBackL.sy, 0, plFrontL.sy);
     planeGrad.addColorStop(0, 'rgba(6, 22, 34, 0.35)');
     planeGrad.addColorStop(1, 'rgba(10, 40, 30, 0.55)');
@@ -523,7 +523,7 @@ const PPGSignalMeter = ({
     ctx.strokeStyle = 'rgba(61, 246, 168, 0.10)';
     ctx.lineWidth = 1;
     for (let i = 0; i <= 10; i++) {
-      const x = -340 + (i / 10) * 680;
+      const x = -420 + (i / 10) * 840;
       const a = proj(x, 0, -900);
       const b = proj(x, 0, 0);
       ctx.beginPath();
@@ -533,8 +533,8 @@ const PPGSignalMeter = ({
     }
     for (let i = 0; i <= 8; i++) {
       const z = -900 + (i / 8) * 900;
-      const a = proj(-340, 0, z);
-      const b = proj(340, 0, z);
+      const a = proj(-420, 0, z);
+      const b = proj(420, 0, z);
       ctx.beginPath();
       ctx.moveTo(a.sx, a.sy);
       ctx.lineTo(b.sx, b.sy);
@@ -555,9 +555,9 @@ const PPGSignalMeter = ({
 
     // Ticks de tiempo a lo largo de la línea de la onda (z = -380)
     for (let s = 0; s <= 2.8; s += 0.5) {
-      const x = -330 + (s / 2.8) * 660;
+      const x = -380 + (s / 2.8) * 760;
       const a = proj(x, 0, -380);
-      const b = proj(x, 12, -380);
+      const b = proj(x, 20, -380);
       ctx.strokeStyle = 'rgba(77, 215, 254, 0.30)';
       ctx.lineWidth = 1.2;
       ctx.beginPath();
@@ -633,10 +633,10 @@ const PPGSignalMeter = ({
           const pt = pointsList[i];
           const age = now - pt.time;
           if (age > CONFIG.WINDOW_MS) continue;
-          const x = -330 + ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS) * 660;
+          const x = -380 + ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS) * 760;
           const z = -380 + (age / CONFIG.WINDOW_MS) * 130;
           const normalizedY = (stats.max - pt.value) / stats.range;
-          const worldY = (normalizedY - 0.5) * 560 * ampBoost;
+          const worldY = (normalizedY - 0.5) * 1520 * ampBoost;
           const p = proj(x, worldY, z);
           const pp = proj(x, 0, z);
           proj3.push({ sx: p.sx, sy: p.sy, syPlane: pp.sy, isArr: pt.isArrhythmia, x, y: worldY, zc: p.zc });
@@ -689,10 +689,10 @@ const PPGSignalMeter = ({
           }
           if (currentRun.length > 1) runs.push({ pts: currentRun, arr: currentArr });
 
-          // Vallas de profundidad (cada 4 muestras) — refuerza el 3D
-          ctx.strokeStyle = 'rgba(61, 246, 168, 0.10)';
+          // Vallas de profundidad (cada 3 muestras) — refuerza el 3D
+          ctx.strokeStyle = 'rgba(61, 246, 168, 0.13)';
           ctx.lineWidth = 1;
-          for (let i = 0; i < proj3.length; i += 4) {
+          for (let i = 0; i < proj3.length; i += 3) {
             const c = proj3[i];
             ctx.beginPath();
             ctx.moveTo(c.sx, c.sy);
@@ -741,8 +741,8 @@ const PPGSignalMeter = ({
 
           // Barrido luminoso en el borde actual
           const last = proj3[proj3.length - 1];
-          const beamTop = proj(last.x, Math.max(0, last.y) + 190, -380);
-          const beamBottom = proj(last.x, -60, -380);
+          const beamTop = proj(last.x, 1300, -380);
+          const beamBottom = proj(last.x, -1000, -380);
           const beamGrad = ctx.createLinearGradient(beamTop.sx - 70, 0, beamTop.sx + 6, 0);
           const beamPulse = 0.14 + 0.08 * Math.sin(now / 240) + 0.10 * beatPulse;
           beamGrad.addColorStop(0, 'rgba(61, 246, 168, 0)');
@@ -758,14 +758,14 @@ const PPGSignalMeter = ({
 
           // Picos, valles e IBI (en espacio 3D proyectado)
           const history = beatHistoryRef.current;
-          const peaks: { sx: number; sy: number; zc: number; isArrhythmia: boolean; time: number }[] = [];
+          const peaks: { sx: number; sy: number; syPlane: number; zc: number; isArrhythmia: boolean; time: number }[] = [];
           const valleys: { sx: number; sy: number }[] = [];
 
           for (const beat of history) {
             const age = now - beat.time;
             if (age > CONFIG.WINDOW_MS || age < 0) continue;
-            const x = -330 + ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS) * 660;
-            if (x < -335 || x > 335) continue;
+            const x = -380 + ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS) * 760;
+            if (x < -385 || x > 385) continue;
             let closestPt: PPGDataPoint | null = null;
             let minDist = Infinity;
             for (let j = 0; j < pointsList.length; j++) {
@@ -775,9 +775,10 @@ const PPGSignalMeter = ({
             }
             if (closestPt && minDist < 200) {
               const normalizedY = (stats.max - closestPt.value) / stats.range;
-              const worldY = (normalizedY - 0.5) * 560 * ampBoost;
+              const worldY = (normalizedY - 0.5) * 1520 * ampBoost;
               const p = proj(x, worldY, -380);
-              peaks.push({ sx: p.sx, sy: p.sy, zc: p.zc, isArrhythmia: beat.isArrhythmia, time: beat.time });
+              const pp = proj(x, 0, -380);
+              peaks.push({ sx: p.sx, sy: p.sy, syPlane: pp.sy, zc: p.zc, isArrhythmia: beat.isArrhythmia, time: beat.time });
             }
           }
 
@@ -795,10 +796,10 @@ const PPGSignalMeter = ({
             }
             if (minPt) {
               const age2 = now - minPt.time;
-              const x = -330 + ((CONFIG.WINDOW_MS - age2) / CONFIG.WINDOW_MS) * 660;
-              if (x >= -335 && x <= 335) {
+              const x = -380 + ((CONFIG.WINDOW_MS - age2) / CONFIG.WINDOW_MS) * 760;
+              if (x >= -385 && x <= 385) {
                 const normalizedY = (stats.max - minPt.value) / stats.range;
-                const worldY = (normalizedY - 0.5) * 560 * ampBoost;
+                const worldY = (normalizedY - 0.5) * 1520 * ampBoost;
                 const p = proj(x, worldY, -380);
                 valleys.push({ sx: p.sx, sy: p.sy });
               }
@@ -830,6 +831,20 @@ const PPGSignalMeter = ({
           peaks.forEach(p => {
             const color = p.isArrhythmia ? COLORS.SIGNAL_ARRHYTHMIA : COLORS.SIGNAL_NORMAL;
             const r = (p.isArrhythmia ? 10 : 8) * (3000 / p.zc);
+
+            // Línea de energía: del pico al plano (altura 3D)
+            ctx.save();
+            ctx.strokeStyle = p.isArrhythmia
+              ? `rgba(255, 93, 93, 0.16)`
+              : `rgba(61, 246, 168, 0.16)`;
+            ctx.lineWidth = 1.2;
+            ctx.setLineDash([3, 4]);
+            ctx.beginPath();
+            ctx.moveTo(p.sx, p.sy);
+            ctx.lineTo(p.sx, p.syPlane);
+            ctx.stroke();
+            ctx.restore();
+
             const sg = ctx.createRadialGradient(p.sx - r * 0.35, p.sy - r * 0.35, r * 0.1, p.sx, p.sy, r);
             sg.addColorStop(0, p.isArrhythmia ? '#ffe1e1' : '#d8ffe9');
             sg.addColorStop(0.45, color);
