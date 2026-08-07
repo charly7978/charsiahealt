@@ -645,7 +645,7 @@ const Index = () => {
     if (!lastSignal || !isMonitoring) return;
     
     const signalValue = lastSignal.filteredValue;
-    const contactState = (lastSignal as any).contactState || (lastSignal.fingerDetected ? 'STABLE_CONTACT' : 'NO_CONTACT');
+    const contactState = lastSignal.contactState;
     const stableHumanSignal =
       contactState === 'STABLE_CONTACT' &&
       (lastSignal.quality || 0) >= 12 &&

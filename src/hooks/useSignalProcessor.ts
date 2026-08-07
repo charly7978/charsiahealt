@@ -1,4 +1,3 @@
-
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { PPGSignalProcessor } from '../modules/signal-processing/PPGSignalProcessor';
 import { ProcessedSignal, ProcessingError } from '../types/signal';
@@ -58,7 +57,7 @@ export const useSignalProcessor = () => {
     try {
       processorRef.current = new PPGSignalProcessor(onSignalReady, onError);
       // Aplicar configuración persistida del backpressure
-      try { processorRef.current.setBackpressureConfig(loadBackpressureConfig()); } catch {}
+      try { processorRef.current.setBackpressureConfig(loadBackpressureConfig()); } catch { /* ignore */ }
       initializationState.current = 'READY';
     } catch (err) {
       initializationState.current = 'ERROR';
@@ -176,7 +175,7 @@ export const useSignalProcessor = () => {
       try {
         const s = processorRef.current.getBackpressureState().pixelStride;
         setCurrentStride((prev) => (prev !== s ? s : prev));
-      } catch {}
+      } catch { /* ignore */ }
     };
     tick();
     const id = window.setInterval(tick, 1000);
