@@ -1,12 +1,14 @@
 /**
  * HEARTBEAT PROCESSOR - FUSIÓN TIEMPO + FRECUENCIA
  *
- * Mejoras:
- * 1. NO resetea buffers por fingerDetected — eso lo maneja el caller
- * 2. Fusión explícita: peak-domain dominante cuando morfología buena,
- *    spectral dominante cuando señal débil
- * 3. Scoring de candidatos de pico por prominencia + pendiente + consistencia RR
- * 4. Ventanas adaptativas: cortas para señal débil, largas para estable
+ * Detección de latidos (van Gent / Elgendi style):
+ * 1. Umbral adaptativo que sigue la altura de los picos aceptados recientes
+ *    (resiste ráfagas de ruido y cambios lentos de amplitud).
+ * 2. Máximo local estricto en ventana con contexto futuro + prominencia + morfología.
+ * 3. Período refractario adaptativo según RR esperado.
+ * 4. Search-back: reescanea el buffer para recuperar latidos perdidos en huecos
+ *    (elimina silencios/baches) en vez de registrar un intervalo doble.
+ * 5. Fusión tiempo+dominio frecuencial (Welch PSD) para el BPM mostrado.
  */
 export class HeartBeatProcessor {
   private readonly MIN_PEAK_INTERVAL_MS = 330;
@@ -18,8 +20,8 @@ export class HeartBeatProcessor {
   private readonly BUFFER_SIZE = 300;
 
   private lastPeakTime = 0;
-  private peakThreshold = 4.0;
   private lastPeakValue = 0;
+  private recentPeakHeights: number[] = [];
 
   private rrIntervals: number[] = [];
   private readonly MAX_RR_INTERVALS = 30;
@@ -31,7 +33,6 @@ export class HeartBeatProcessor {
   private audioUnlocked = false;
   private lastBeepTime = 0;
 
-  private frameCount = 0;
   private consecutivePeaks = 0;
   private signalQualityIndex = 0;
 
@@ -63,7 +64,6 @@ export class HeartBeatProcessor {
     arrhythmiaCount: number;
     sqi: number;
   } {
-    this.frameCount++;
     const now = timestamp ?? Date.now();
 
     this.signalBuffer.push(filteredValue);
@@ -106,46 +106,44 @@ export class HeartBeatProcessor {
       this.frequencyBPM = this.frequencyBPM * 0.94;
     }
 
-    this.updateThreshold(range, this.periodicityScore);
     this.signalQualityIndex = this.calculateSQI(range, this.periodicityScore);
 
-    const timeSinceLastPeak = this.lastPeakTime > 0 ? now - this.lastPeakTime : Number.MAX_SAFE_INTEGER;
+    const expectedRR = this.getExpectedRR();
+    const minInterval = Math.max(this.MIN_PEAK_INTERVAL_MS, expectedRR > 0 ? expectedRR * 0.5 : 0);
+    const maxInterval = this.MAX_PEAK_INTERVAL_MS;
+
+    // Detect on a sample with future context (5-frame delay) so morphology is reliable
+    const ctx = 5;
+    const tailLen = 11;
+    const tTail = this.timestampBuffer.slice(-tailLen);
+    const peakTime = tTail.length >= tailLen ? tTail[tailLen - 1 - ctx] : now;
+    const timeSinceLastPeak = this.lastPeakTime > 0 ? peakTime - this.lastPeakTime : Number.MAX_SAFE_INTEGER;
+
     let isPeak = false;
 
-    if (timeSinceLastPeak >= this.MIN_PEAK_INTERVAL_MS) {
-      isPeak = this.detectPeakWithScoring(timeSinceLastPeak);
-
-      if (isPeak) {
-        if (this.lastPeakTime > 0 && timeSinceLastPeak <= this.MAX_PEAK_INTERVAL_MS) {
-          this.rrIntervals.push(timeSinceLastPeak);
-          if (this.rrIntervals.length > this.MAX_RR_INTERVALS) {
-            this.rrIntervals.shift();
-          }
-
-          const instantBPM = 60000 / timeSinceLastPeak;
-
-          if (this.smoothBPM === 0) {
-            this.smoothBPM = instantBPM;
-          } else {
-            const relativeDiff = Math.abs(instantBPM - this.smoothBPM) / Math.max(1, this.smoothBPM);
-            let alpha = 0.25;
-            if (relativeDiff > 0.30) alpha = 0.08;
-            else if (relativeDiff > 0.18) alpha = 0.15;
-            if (this.consecutivePeaks < 5) alpha = Math.max(0.06, alpha - 0.08);
-
-            this.smoothBPM = this.smoothBPM * (1 - alpha) + instantBPM * alpha;
-          }
-
-          this.consecutivePeaks++;
-        }
-
-        this.lastPeakTime = now;
-        this.vibrate();
-        this.playBeep();
+    if (timeSinceLastPeak >= minInterval) {
+      const peakVal = this.detectPeak();
+      if (peakVal >= 0) {
+        this.acceptPeak(peakTime, timeSinceLastPeak, peakVal);
+        isPeak = true;
       }
     }
 
-    if (!isPeak && this.lastPeakTime > 0 && timeSinceLastPeak > this.MAX_PEAK_INTERVAL_MS) {
+    // === SEARCH-BACK: recover beats missed during gaps (fixes silence/hole artifacts) ===
+    if (
+      !isPeak &&
+      this.lastPeakTime > 0 &&
+      timeSinceLastPeak > expectedRR * 1.5 &&
+      timeSinceLastPeak < maxInterval
+    ) {
+      const missed = this.scanForMissedPeak(this.lastPeakTime, peakTime, minInterval);
+      if (missed && missed.time > this.lastPeakTime + minInterval) {
+        this.acceptPeak(missed.time, missed.time - this.lastPeakTime, missed.value);
+        isPeak = true;
+      }
+    }
+
+    if (!isPeak && this.lastPeakTime > 0 && timeSinceLastPeak > maxInterval) {
       this.consecutivePeaks = Math.max(0, this.consecutivePeaks - 1);
     }
 
@@ -203,10 +201,11 @@ export class HeartBeatProcessor {
     const refWindow = this.signalBuffer.slice(-windowLen);
     const { low, high, range } = this.getRobustBounds(refWindow);
     if (range < 0.15) return values.map(() => 0);
-    return values.map((v) => {
-      const c = Math.min(high, Math.max(low, v));
-      return ((c - low) / range - 0.5) * 120;
-    });
+    // NOTE: do NOT clamp to [low, high] here. Clamping flattens the systolic
+    // peak (which sits just above p90) into a plateau, destroying the local
+    // maximum that peak detection relies on. Mapping without clamping keeps
+    // true peaks distinguishable from their shoulders.
+    return values.map((v) => ((v - low) / range - 0.5) * 120);
   }
 
   private estimateSampleRate(): number {
@@ -352,12 +351,6 @@ export class HeartBeatProcessor {
     return this.clamp(rangeFactor + slopeFactor + rrFactor + peakFactor + periodicityFactor, 0, 100);
   }
 
-  private updateThreshold(range: number, periodicityScore: number): void {
-    const base = periodicityScore > 0.35 ? 3.0 : 4.0;
-    const target = this.clamp(base + range * 0.3, 2.5, 7.5);
-    this.peakThreshold = this.peakThreshold * 0.8 + target * 0.2;
-  }
-
   private getExpectedRR(): number {
     if (this.rrIntervals.length >= 3) {
       const recent = this.rrIntervals.slice(-6).sort((a, b) => a - b);
@@ -367,81 +360,123 @@ export class HeartBeatProcessor {
     return 0;
   }
 
-  // === PEAK DETECTION WITH CANDIDATE SCORING ===
-  private detectPeakWithScoring(timeSinceLastPeak: number): boolean {
-    const n = this.signalBuffer.length;
-    const dn = this.derivativeBuffer.length;
-    if (n < 11 || dn < 6) return false;
+  // === PEAK DETECTION (adaptive threshold + morphology, van Gent / Elgendi style) ===
+  // Returns the normalized peak height if a peak is found at the current sample, else -1.
+  private detectPeak(): number {
+    const tailLen = 11;
+    const tail = this.signalBuffer.slice(-tailLen);
+    if (tail.length < tailLen) return -1;
 
-    const deriv = this.derivativeBuffer.slice(-6);
-    const zeroCrossing = (deriv[2] > 0 && deriv[3] <= 0) || (deriv[3] > 0 && deriv[4] <= 0);
-
-    const windowLen = this.consecutivePeaks < 3 ? 90 : 150;
-    const recentNormalized = this.normalizeWindow(this.signalBuffer.slice(-11), windowLen);
+    const winLen = this.consecutivePeaks < 3 ? 90 : 150;
+    const norm = this.normalizeWindow(tail, winLen);
     const ci = 5;
-    const center = recentNormalized[ci];
-    const neighborhoodMin = Math.min(...recentNormalized);
-    const prominence = center - neighborhoodMin;
+    const center = norm[ci];
 
+    // Strict local maximum in a 5-sample neighborhood (both sides have context)
     const isLocalMax =
-      center >= recentNormalized[4] &&
-      center > recentNormalized[6] &&
-      center >= recentNormalized[3] &&
-      center >= recentNormalized[7];
+      center > norm[ci - 1] &&
+      center >= norm[ci - 2] &&
+      center > norm[ci - 3] &&
+      center >= norm[ci - 4] &&
+      center > norm[ci + 1] &&
+      center >= norm[ci + 2] &&
+      center > norm[ci + 3] &&
+      center >= norm[ci + 4];
+    if (!isLocalMax) return -1;
 
-    const risingSlope = center - recentNormalized[2];
-    const fallingSlope = center - recentNormalized[8];
-    const expectedRR = this.getExpectedRR();
-    const nearExpected = expectedRR > 0 &&
-      timeSinceLastPeak >= expectedRR * 0.55 &&
-      timeSinceLastPeak <= expectedRR * 1.45;
+    const localMin = Math.min(
+      norm[ci - 4], norm[ci - 3], norm[ci - 2], norm[ci - 1],
+      center,
+      norm[ci + 1], norm[ci + 2], norm[ci + 3], norm[ci + 4]
+    );
+    const prominence = center - localMin;
 
-    // === CANDIDATE SCORING ===
-    let score = 0;
+    const threshold = this.adaptiveThreshold();
+    if (center < threshold) return -1;
+    if (prominence < 2.0) return -1;
 
-    // Prominence gate: reject flat noise but accept real PPG
-    if (prominence < 2.2) return false;
+    const rising = center - norm[ci - 3];
+    if (rising < 1.0) return -1;
 
-    // Morphology gate: PPG has rising edge
-    if (risingSlope < 0.8) return false;
-
-    // Prominence (0-30 points)
-    score += Math.min(30, prominence * 2.5);
-
-    // Morphology: rising + falling slope (0-20 points)
-    score += Math.min(10, risingSlope * 2.0);
-    score += Math.min(10, fallingSlope * 1.8);
-
-    // Zero crossing derivative (0-15 points)
-    if (zeroCrossing) score += 15;
-
-    // First peak: need periodic support (chicken-and-egg)
-    if (this.consecutivePeaks === 0 && this.periodicityScore < 0.25 && !zeroCrossing) return false;
-
-    // Rhythm consistency (0-20 points)
-    if (nearExpected) score += 20;
-
-    // Periodicity boost (0-15 points)
-    score += this.periodicityScore * 15;
-
-    // Threshold: require minimum score scaled by consecutive peaks
-    const minScore = this.consecutivePeaks < 3 ? 36 : 42;
-    const thresholdCheck = center > this.peakThreshold * (nearExpected ? 0.65 : 0.9) || prominence > Math.max(2.0, this.peakThreshold * 0.55);
-
-    // Falling slope must also be positive for real PPG morphology
-    if (fallingSlope < 0.35) return false;
-
-    const amplitudeValid = this.lastPeakValue > 0
-      ? (Math.abs(center) / Math.max(1, Math.abs(this.lastPeakValue))) > 0.08 && (Math.abs(center) / Math.max(1, Math.abs(this.lastPeakValue))) < 8
-      : true;
-
-    const isPeak = isLocalMax && amplitudeValid && timeSinceLastPeak >= this.MIN_PEAK_INTERVAL_MS && score >= minScore && thresholdCheck;
-
-    if (isPeak) {
-      this.lastPeakValue = center;
+    // Amplitude consistency with previous accepted peak — rejects transient spikes
+    if (this.lastPeakValue > 0) {
+      const ratio = Math.abs(center) / Math.max(1, Math.abs(this.lastPeakValue));
+      if (ratio < 0.12 || ratio > 7) return -1;
     }
 
-    return isPeak;
+    // First beat: require a clearly defined peak to avoid false starts
+    if (this.consecutivePeaks === 0 && center < threshold * 1.3) return -1;
+
+    return center;
+  }
+
+  // Adaptive threshold tracks the height of recent accepted peaks so it resists single
+  // noise bursts and follows slow amplitude changes (van Gent-style moving baseline).
+  private adaptiveThreshold(): number {
+    if (this.recentPeakHeights.length < 2) return 3.0;
+    const mean = this.recentPeakHeights.reduce((a, b) => a + b, 0) / this.recentPeakHeights.length;
+    return Math.max(2.2, mean * 0.45);
+  }
+
+  private acceptPeak(peakTime: number, interval: number, peakValue: number): void {
+    if (
+      this.lastPeakTime > 0 &&
+      interval >= this.MIN_PEAK_INTERVAL_MS * 0.4 &&
+      interval <= this.MAX_PEAK_INTERVAL_MS
+    ) {
+      this.rrIntervals.push(interval);
+      if (this.rrIntervals.length > this.MAX_RR_INTERVALS) this.rrIntervals.shift();
+
+      const instantBPM = 60000 / interval;
+      if (this.smoothBPM === 0) {
+        this.smoothBPM = instantBPM;
+      } else {
+        const relativeDiff = Math.abs(instantBPM - this.smoothBPM) / Math.max(1, this.smoothBPM);
+        let alpha = 0.25;
+        if (relativeDiff > 0.30) alpha = 0.08;
+        else if (relativeDiff > 0.18) alpha = 0.15;
+        if (this.consecutivePeaks < 5) alpha = Math.max(0.06, alpha - 0.08);
+        this.smoothBPM = this.smoothBPM * (1 - alpha) + instantBPM * alpha;
+      }
+      this.consecutivePeaks++;
+    }
+    this.lastPeakTime = peakTime;
+    this.lastPeakValue = peakValue;
+    this.recentPeakHeights.push(Math.abs(peakValue));
+    if (this.recentPeakHeights.length > 12) this.recentPeakHeights.shift();
+    this.vibrate();
+    this.playBeep();
+  }
+
+  // Rescan the buffer between two beats for a missed local maximum (search-back).
+  private scanForMissedPeak(fromTime: number, toTime: number, minInterval: number): { time: number; value: number } | null {
+    let idxFrom = this.timestampBuffer.findIndex((t) => t > fromTime);
+    if (idxFrom < 0) idxFrom = 0;
+    const idxTo = this.timestampBuffer.length - 1;
+    if (idxTo - idxFrom < 9) return null;
+
+    const slice = this.signalBuffer.slice(idxFrom, idxTo + 1);
+    const ts = this.timestampBuffer.slice(idxFrom, idxTo + 1);
+    const norm = this.normalizeWindow(slice, 150);
+    const threshold = this.adaptiveThreshold();
+
+    let best: { time: number; value: number } | null = null;
+    for (let ci = 4; ci < norm.length - 4; ci++) {
+      const center = norm[ci];
+      const isLocalMax =
+        center > norm[ci - 1] && center >= norm[ci - 2] && center > norm[ci - 3] && center >= norm[ci - 4] &&
+        center > norm[ci + 1] && center >= norm[ci + 2] && center > norm[ci + 3] && center >= norm[ci + 4];
+      if (!isLocalMax) continue;
+
+      const localMin = Math.min(
+        norm[ci - 4], norm[ci - 3], norm[ci - 2], norm[ci - 1], center,
+        norm[ci + 1], norm[ci + 2], norm[ci + 3], norm[ci + 4]
+      );
+      const prominence = center - localMin;
+      if (center < threshold || prominence < 2.0) continue;
+      if (!best || center > best.value) best = { time: ts[ci], value: center };
+    }
+    return best;
   }
 
   private calculateConfidence(): number {
@@ -504,9 +539,8 @@ export class HeartBeatProcessor {
     this.frequencyBPM = 0;
     this.periodicityScore = 0;
     this.lastPeakTime = 0;
-    this.peakThreshold = 4.0;
     this.lastPeakValue = 0;
-    this.frameCount = 0;
+    this.recentPeakHeights = [];
     this.consecutivePeaks = 0;
     this.signalQualityIndex = 0;
   }
