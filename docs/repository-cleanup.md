@@ -20,12 +20,22 @@
 
 | Cambio | Motivo |
 |---|---|
-| `BandpassFilter` ahora es wrapper de `BandpassBiquad` (`src/lib/ppg/signal/filters.ts`) | Había dos implementaciones Butterworth biquad casi idénticas. |
-| `usePpgCapture` con guard de generación (runId) | `start()` asíncrono podía crear un worker zombi si `active` cambiaba durante el arranque. |
-| `usePpgCapture` con guard de generación (runId) | `start()` asíncrono podía crear un worker zombi si `active` cambiaba durante el arranque. |
+| **Pipeline Web Worker eliminado por completo** (`src/lib/ppg/**`) | Duplicaba ROI, detección de dedo, fusión de canales (PCA — inferior a POS según benchmark), SQI y buffers; solo alimentaba el panel de diagnóstico (desactivado). Se conserva `biquadFilter.ts` como única implementación de filtro. Eliminado también su UI en Index.tsx (panel "Advanced engine" + sliders SQI). |
+| `BandpassFilter` ahora es wrapper de `BandpassBiquad` (`src/modules/signal-processing/biquadFilter.ts`) | Había dos implementaciones Butterworth biquad casi idénticas. |
 | `HeartBeatProcessor`: FFT/Welch throttled a ~3 Hz + ventana Hann cacheada | El hotspot del main thread (allocs por frame) se redujo sin cambiar la salida (el BPM se suaviza por EMA). |
 | `PPGSignalMeter`: bucle RAF único con throttle + buffer 840×1680 | El doble bucle RAF dibujaba ~90 fps sobre un buffer 1400×2800; ahora 30 fps sobre 3.5× menos píxeles. |
-| Advanced engine (Web Worker) desactivado por defecto | Pipeline de diagnóstico que duplicaba la captura de frames; sigue disponible en Ajustes. |
+
+## Base literaria del pipeline único (validada en web)
+
+| Componente | Referencia | Implementación |
+|---|---|---|
+| Fusión POS (proyección ortogonal al tono de piel) | Wang et al., *Algorithmic Principles of Remote PPG*, IEEE TBME 2017 (benchmark: mejor rendimiento global; supera PCA/ICA/CHROM/PBV/2SR en robustez) | `PPGSignalProcessor.computePOS` |
+| Ventana POS adaptativa | Wang 2017: l ≈ fps × 1.6 s (≥1 ciclo cardíaco) | Ventana dinámica según FPS medido (antes fija 32) |
+| Canal verde + multi-canal | Verkruysse et al. 2008 (verde = mayor modulación PPG) | Fuentes R / G / RG / POS con ranking competitivo e histéresis |
+| Filtrado pasabanda Butterworth 0.3–5 Hz (18–300 bpm) | Elgendi et al. 2013; práctica estándar rPPG | `biquadFilter.ts` (2 biquads TDF-II) |
+| Detección de picos: umbral adaptativo + prominencia + período refractario + search-back | van Gent et al. 2019 (adaptación de Pan-Tompkins a PPG); Elgendi 2013 | `HeartBeatProcessor.detectPeak` |
+| BPM tiempo+frecuencia (Welch PSD) | Elgendi 2013; estándar de apps de móvil validadas | `estimatePeriodicity` + EMA con gate de picos confirmados |
+| SQI con gate de perfusión AC/DC | Verkruysse 2008 (AC/DC); práctica clínica de pulsioximetría | `calculateSignalQuality` + `calculatePerfusionIndex` |
 
 ## Mapa de dependencias actual (limpio)
 
@@ -35,7 +45,7 @@ CameraView (MediaStream + torch)
    ▼
 useSignalProcessor → PPGSignalProcessor
    │   • extractROI (5×5 tiles, exclusión de saturados)
-   │   • multi-source (R / G / RG)
+   │   • multi-source (R / G / RG / POS dinámico)
    │   • BandpassFilter (wrapper de BandpassBiquad, Butterworth 0.3–5 Hz IIR)
    │   • SQI unificado, perfusion index, contact state
    ▼
@@ -74,10 +84,9 @@ Pipeline avanzado opcional (Ajustes → "Advanced engine"): src/lib/ppg/**
 - **Páginas:** `Index.tsx`, `NotFound.tsx`
 - **Componentes:** `CameraView`, `PPGSignalMeter`, `VitalSign` + UI primitives (toast hook)
 - **Hooks:** `useSignalProcessor`, `useHeartBeatProcessor`, `useVitalSignsProcessor`, `useHealthAnalysis`, `useSaveMeasurement`, `usePerfTelemetry`, `use-toast`
-- **Módulos signal-processing:** `PPGSignalProcessor`, `BandpassFilter`
+- **Módulos signal-processing:** `PPGSignalProcessor`, `BandpassFilter`, `biquadFilter`
 - **Módulos vital-signs:** `VitalSignsProcessor`, `BloodPressureProcessor`, `PPGFeatureExtractor`, `arrhythmia-processor`
 - **Módulos:** `HeartBeatProcessor`
-- **Pipeline avanzado (diagnóstico):** `lib/ppg/**` (worker + filtros + SQI + ROI)
 - **Utils:** `arrhythmiaUtils`, `soundUtils`, `CircularBuffer`, `lib/utils`, `logger`
 - **Tipos:** `signal.d.ts`, `media-stream.d.ts`, `screen-orientation.d.ts`, `vite-env.d.ts`
 - **Integración:** `supabase/client.ts`, `supabase/types.ts`

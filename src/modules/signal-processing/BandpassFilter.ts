@@ -6,7 +6,7 @@
  * - Elimina DC (línea base, cambios lentos de iluminación)
  * - Elimina alta frecuencia (ruido eléctrico, vibraciones, movimiento)
  *
- * IMPLEMENTACIÓN: wrapper sobre BandpassBiquad (src/lib/ppg/signal/filters.ts),
+ * IMPLEMENTACIÓN: wrapper sobre BandpassBiquad (biquadFilter.ts),
  * única implementación biquad del repo. Mantiene la API legacy (filter/reset/
  * setSampleRate) para no tocar a PPGSignalProcessor ni a los tests.
  *
@@ -15,7 +15,7 @@
  * - webcam-pulse-detector de thearn (GitHub 3.2k stars)
  * - https://scipy-cookbook.readthedocs.io/items/ButterworthBandpass.html
  */
-import { BandpassBiquad } from '../../lib/ppg/signal/filters';
+import { BandpassBiquad } from './biquadFilter';
 
 export class BandpassFilter {
   private readonly bp: BandpassBiquad;

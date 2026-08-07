@@ -35,7 +35,9 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   private readonly ACDC_WINDOW = 180;
   private readonly TILE_COLUMNS = 5;
   private readonly TILE_ROWS = 5;
-  private readonly POS_WINDOW = 32;
+  /** Wang et al. (IEEE TBME 2017): la ventana POS debe cubrir ≥1 ciclo cardíaco,
+   *  l ≈ fps × 1.6 s (32 muestras a 20 fps). Se adapta al FPS real medido. */
+  private readonly POS_WINDOW_SECONDS = 1.6;
   private posWindow: { r: number; g: number; b: number }[] = [];
 
   // === BACKPRESSURE / ADAPTIVE STRIDE ===
@@ -527,12 +529,13 @@ export class PPGSignalProcessor implements SignalProcessorInterface {
   }
 
   private computePOS(rawRed: number, rawGreen: number, rawBlue: number): number {
+    const windowSize = Math.max(16, Math.round(this.estimatedSampleRate * this.POS_WINDOW_SECONDS));
     this.posWindow.push({ r: rawRed, g: rawGreen, b: rawBlue });
-    if (this.posWindow.length > this.POS_WINDOW) {
+    if (this.posWindow.length > windowSize) {
       this.posWindow.shift();
     }
 
-    if (this.posWindow.length < this.POS_WINDOW) return 0;
+    if (this.posWindow.length < windowSize) return 0;
 
     let meanR = 0, meanG = 0, meanB = 0;
     for (const p of this.posWindow) {

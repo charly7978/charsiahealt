@@ -36,14 +36,6 @@ import {
   getPersistedNegativeCount as getPersistedAuditNegativeCount,
   clearPersistedLog as clearPersistedAuditLog,
 } from "@/lib/sanity/sanityAuditLog";
-import {
-  getPpgRuntimeConfig,
-  setPpgRuntimeConfig,
-  resetPpgRuntimeConfig,
-  subscribePpgRuntimeConfig,
-  type PpgRuntimeConfig,
-} from "@/lib/ppg/config/ppgRuntimeConfig";
-import { usePpgCapture } from "@/lib/ppg/hooks/usePpgCapture";
 
 import { supabase } from "@/integrations/supabase/client";
 
@@ -191,34 +183,6 @@ const Index = () => {
     rebuildSanityChecker(sanityProfileId);
   }, [sanityProfileId, rebuildSanityChecker]);
 
-  // PPG runtime tuning (ROI grid + finger detection + SQI thresholds).
-  const [ppgCfg, setPpgCfg] = useState<PpgRuntimeConfig>(() => getPpgRuntimeConfig());
-  useEffect(() => subscribePpgRuntimeConfig(setPpgCfg), []);
-  const updateRoi = useCallback((patch: Partial<PpgRuntimeConfig["roi"]>) => {
-    setPpgRuntimeConfig({ roi: { ...getPpgRuntimeConfig().roi, ...patch } });
-  }, []);
-  const updateFinger = useCallback((patch: Partial<PpgRuntimeConfig["finger"]>) => {
-    setPpgRuntimeConfig({ finger: { ...getPpgRuntimeConfig().finger, ...patch } });
-  }, []);
-  const updateSqi = useCallback((patch: Partial<PpgRuntimeConfig["sqi"]>) => {
-    setPpgRuntimeConfig({ sqi: { ...getPpgRuntimeConfig().sqi, ...patch } });
-  }, []);
-  const handlePpgReset = useCallback(() => {
-    resetPpgRuntimeConfig();
-    toast({ title: "✓ PPG defaults restaurados" });
-  }, []);
-
-  // Advanced PPG engine (Web Worker pipeline). Es un panel de diagnóstico
-  // (sus resultados solo se muestran en Ajustes): se desactiva por defecto para
-  // no duplicar la captura de frames del pipeline principal.
-  const [advVideoEl, setAdvVideoEl] = useState<HTMLVideoElement | null>(null);
-  const [advancedEngineEnabled, setAdvancedEngineEnabled] = useState<boolean>(false);
-  const advanced = usePpgCapture({
-    video: advVideoEl,
-    active: advancedEngineEnabled && isMonitoring && !!cameraStream && !!advVideoEl,
-    useExternalVideo: true,
-  });
-  
   // HOOKS DE PROCESAMIENTO
   const { 
     startProcessing, 
@@ -523,8 +487,6 @@ const Index = () => {
   const handleStreamReady = useCallback((stream: MediaStream) => {
     console.log('📹 Stream recibido');
     setCameraStream(stream);
-    // Hand the same <video> element to the advanced engine.
-    setAdvVideoEl(cameraRef.current?.getVideoElement() ?? null);
     
     // Esperar a que el video esté listo y comenzar captura
     setTimeout(() => {
@@ -595,7 +557,7 @@ const Index = () => {
     
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
-      setCameraStream(null); setAdvVideoEl(null);
+      setCameraStream(null);
     }
     
     setIsMonitoring(false);
@@ -640,7 +602,7 @@ const Index = () => {
     
     if (cameraStream) {
       cameraStream.getTracks().forEach(track => track.stop());
-      setCameraStream(null); setAdvVideoEl(null);
+      setCameraStream(null);
     }
     
     setIsMonitoring(false);
@@ -1128,178 +1090,6 @@ const Index = () => {
                   <p className="mt-1 text-[10px] text-white/40">
                     Sobrevive a recargas. Retención máx: 2000 entradas.
                   </p>
-                </div>
-
-                {/* PPG runtime tuning: ROI grid + finger + SQI */}
-                <div className="mt-4 pt-3 border-t border-white/10">
-                  <div className="flex items-center justify-between">
-                    <div className="text-sm font-medium">PPG tuning (ROI + SQI)</div>
-                    <button
-                      type="button"
-                      onClick={handlePpgReset}
-                      className="text-[11px] px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 border border-white/10"
-                    >
-                      Defaults
-                    </button>
-                  </div>
-                  <p className="text-[10px] text-white/40 mt-1">
-                    Cambios en vivo, sin reiniciar la cámara. Persiste en este dispositivo.
-                  </p>
-
-                  {/* Advanced engine live readout */}
-                  <div className="mt-3 rounded border border-white/10 bg-black/30 p-2">
-                    <div className="flex items-center justify-between">
-                      <div className="text-[11px] font-medium text-white/80">
-                        Advanced engine (Web Worker)
-                      </div>
-                      <label className="flex items-center gap-1 text-[10px] text-white/60">
-                        <input
-                          type="checkbox"
-                          checked={advancedEngineEnabled}
-                          onChange={(e) => setAdvancedEngineEnabled(e.target.checked)}
-                        />
-                        on
-                      </label>
-                    </div>
-                    <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-white/70">
-                      <div>
-                        <div className="text-white/40">state</div>
-                        <div className="text-white">{advanced.state}</div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">finger</div>
-                        <div className={advanced.fingerDetected ? "text-emerald-400" : "text-rose-400"}>
-                          {advanced.fingerDetected ? "yes" : "no"}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">fps</div>
-                        <div className="text-white">{advanced.fpsInstant.toFixed(1)}</div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">SQI</div>
-                        <div className="text-white">{(advanced.snapshot?.sqi ?? 0).toFixed(2)}</div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">PI%</div>
-                        <div className="text-white">{((advanced.snapshot?.perfusionIndex ?? 0) * 100).toFixed(2)}</div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">skew</div>
-                        <div className="text-white">{(advanced.snapshot?.skewness ?? 0).toFixed(2)}</div>
-                      </div>
-                      <div>
-                        <div className="text-white/40">kurt</div>
-                        <div className="text-white">{(advanced.snapshot?.kurtosis ?? 0).toFixed(2)}</div>
-                      </div>
-                      <div className="col-span-2">
-                        <div className="text-white/40">err</div>
-                        <div className="text-amber-300 truncate">{advanced.error ?? "—"}</div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2 mt-3">
-                    <label className="text-[11px] text-white/70">
-                      ROI cols: <span className="text-white">{ppgCfg.roi.cols}</span>
-                      <input
-                        type="range" min={3} max={24} step={1}
-                        value={ppgCfg.roi.cols}
-                        onChange={(e) => updateRoi({ cols: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70">
-                      ROI rows: <span className="text-white">{ppgCfg.roi.rows}</span>
-                      <input
-                        type="range" min={3} max={24} step={1}
-                        value={ppgCfg.roi.rows}
-                        onChange={(e) => updateRoi({ rows: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70">
-                      Red dominance: <span className="text-white">{ppgCfg.finger.redDominance.toFixed(0)}</span>
-                      <input
-                        type="range" min={5} max={120} step={1}
-                        value={ppgCfg.finger.redDominance}
-                        onChange={(e) => updateFinger({ redDominance: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70">
-                      Coverage min: <span className="text-white">{ppgCfg.finger.coverage.toFixed(2)}</span>
-                      <input
-                        type="range" min={0.05} max={0.95} step={0.01}
-                        value={ppgCfg.finger.coverage}
-                        onChange={(e) => updateFinger({ coverage: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70">
-                      Sat. high: <span className="text-white">{ppgCfg.finger.saturationHigh}</span>
-                      <input
-                        type="range" min={200} max={255} step={1}
-                        value={ppgCfg.finger.saturationHigh}
-                        onChange={(e) => updateFinger({ saturationHigh: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70">
-                      Dark luma: <span className="text-white">{ppgCfg.finger.darkLuma}</span>
-                      <input
-                        type="range" min={0} max={80} step={1}
-                        value={ppgCfg.finger.darkLuma}
-                        onChange={(e) => updateFinger({ darkLuma: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70 col-span-2">
-                      Perfusion scale: <span className="text-white">{ppgCfg.sqi.perfusionScale.toFixed(0)}</span>
-                      <input
-                        type="range" min={1} max={200} step={1}
-                        value={ppgCfg.sqi.perfusionScale}
-                        onChange={(e) => updateSqi({ perfusionScale: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70">
-                      W. perfusion: <span className="text-white">{ppgCfg.sqi.weightPerfusion.toFixed(2)}</span>
-                      <input
-                        type="range" min={0} max={1} step={0.01}
-                        value={ppgCfg.sqi.weightPerfusion}
-                        onChange={(e) => updateSqi({ weightPerfusion: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70">
-                      W. skewness: <span className="text-white">{ppgCfg.sqi.weightSkewness.toFixed(2)}</span>
-                      <input
-                        type="range" min={0} max={1} step={0.01}
-                        value={ppgCfg.sqi.weightSkewness}
-                        onChange={(e) => updateSqi({ weightSkewness: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70">
-                      W. kurtosis: <span className="text-white">{ppgCfg.sqi.weightKurtosis.toFixed(2)}</span>
-                      <input
-                        type="range" min={0} max={1} step={0.01}
-                        value={ppgCfg.sqi.weightKurtosis}
-                        onChange={(e) => updateSqi({ weightKurtosis: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                    <label className="text-[11px] text-white/70">
-                      SQI aceptable: <span className="text-white">{ppgCfg.sqi.acceptableSqi.toFixed(2)}</span>
-                      <input
-                        type="range" min={0} max={1} step={0.01}
-                        value={ppgCfg.sqi.acceptableSqi}
-                        onChange={(e) => updateSqi({ acceptableSqi: Number(e.target.value) })}
-                        className="w-full"
-                      />
-                    </label>
-                  </div>
                 </div>
               </div>
             </div>
