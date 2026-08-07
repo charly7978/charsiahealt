@@ -1,5 +1,4 @@
-import React, { useEffect, useRef, useCallback, useState } from 'react';
-import { Heart, Activity } from 'lucide-react';
+import React, { useEffect, useRef, useCallback } from 'react';
 import { CircularBuffer, PPGDataPoint } from '../utils/CircularBuffer';
 
 interface PPGSignalMeterProps {
@@ -28,46 +27,30 @@ interface PPGSignalMeterProps {
 }
 
 const CONFIG = {
-  // Buffer interno 2x el viewport típico de móvil (420 CSS px de ancho).
-  // Suficiente nitidez; ~3.5x menos píxeles que 1400x2800 para el llenado por frame.
   CANVAS_WIDTH: 840,
   CANVAS_HEIGHT: 1680,
   WINDOW_MS: 2800,
   TARGET_FPS: 30,
   BUFFER_SIZE: 400,
-  PLOT_AREA: {
-    LEFT: 80,
-    RIGHT: 80,
-    TOP: 130,
-    BOTTOM: 60
-  },
+  FONT: '"SF Mono", Consolas, monospace',
   COLORS: {
-    BG: '#0a0f1a',
-    GRID_MAJOR: 'rgba(34, 197, 94, 0.25)',
-    GRID_MINOR: 'rgba(34, 197, 94, 0.1)',
-    BASELINE: 'rgba(77, 215, 254, 0.35)',
-    SIGNAL_NORMAL: '#34f5a1',
+    BG_DEEP: '#020409',
+    BG_TOP: '#081226',
+    SIGNAL_NORMAL: '#3df6a8',
     SIGNAL_CORE: '#eafff6',
-    SIGNAL_GLOW: 'rgba(52, 245, 161, 0.55)',
+    SIGNAL_GLOW: 'rgba(61, 246, 168, 0.55)',
     SIGNAL_ARRHYTHMIA: '#ff5d5d',
     ARRHYTHMIA_GLOW: 'rgba(255, 93, 93, 0.55)',
-    PEAK_NORMAL: '#3b82f6',
-    PEAK_ARRHYTHMIA: '#ef4444',
-    VALLEY_COLOR: '#94a3b8',
-    TEXT_PRIMARY: '#34f5a1',
-    TEXT_SECONDARY: '#9db4c8',
+    TEXT_PRIMARY: '#3df6a8',
+    TEXT_SECONDARY: '#8fa8bd',
     TEXT_WARNING: '#fbbf24',
     TEXT_DANGER: '#ff5d5d',
-    SCALE_TEXT: '#5c7488',
+    SCALE_TEXT: '#4a6276',
     ACCENT_CYAN: '#4dd7fe',
-    GHOST_1: 'rgba(8, 80, 52, 0.5)',
-    GHOST_2: 'rgba(4, 48, 34, 0.32)',
-    SIGNAL_FILL_NORMAL: 'rgba(34, 197, 94, 0.12)',
-    SIGNAL_FILL_ARR: 'rgba(255, 93, 93, 0.12)',
-    SYSTOLIC_MARKER: '#60a5fa',
-    DIASTOLIC_MARKER: '#818cf8',
-    DICHROTIC_NOTCH: '#a78bfa',
     IBI_TEXT: '#67e8f9',
+    CARD_BORDER: 'rgba(61, 246, 168, 0.35)',
+    PANEL_BG_TOP: 'rgba(9, 18, 32, 0.9)',
+    PANEL_BG_BOTTOM: 'rgba(3, 8, 16, 0.95)',
   }
 };
 
@@ -97,8 +80,6 @@ const PPGSignalMeter = ({
   const dataBufferRef = useRef<CircularBuffer | null>(null);
   
   const propsRef = useRef({ value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure });
-  const lastPeakTimeRef = useRef(0);
-  const [showPulse, setShowPulse] = useState(false);
   
   const beatArrhythmiaRef = useRef(false);
   const lastArrhythmiaCountRef = useRef(0);
@@ -109,173 +90,72 @@ const PPGSignalMeter = ({
   const hrvDisplayRef = useRef<{ sdnn: number; rmssd: number }>({ sdnn: 0, rmssd: 0 });
   const bpmStatsRef = useRef<{ min: number; max: number; sum: number; n: number }>({ min: 0, max: 0, sum: 0, n: 0 });
   const bpmTrendRef = useRef<{ t: number; bpm: number }[]>([]);
-  const lastBpmSampleRef = useRef<number>(0);
   const lastHrvUpdateRef = useRef<number>(0);
   const lastBpmStatsUpdateRef = useRef<number>(0);
 
-  const gridCacheRef = useRef<HTMLCanvasElement | null>(null);
-  const gridDirtyRef = useRef(true);
+  const bgCacheRef = useRef<HTMLCanvasElement | null>(null);
   const scanlineCacheRef = useRef<HTMLCanvasElement | null>(null);
 
-  const getPlotArea = useCallback(() => {
-    const { CANVAS_WIDTH: W, CANVAS_HEIGHT: H, PLOT_AREA } = CONFIG;
+  // ---------- CÁMARA 3D (proyección en perspectiva manual, sin librerías) ----------
+  const computeCamera = useCallback((now: number) => {
+    const pitch = (24 + 2.4 * Math.sin(now / 9000)) * Math.PI / 180;
+    const yaw = 2.6 * Math.sin(now / 13000 + 1.7) * Math.PI / 180;
     return {
-      x: PLOT_AREA.LEFT,
-      y: PLOT_AREA.TOP,
-      width: W - PLOT_AREA.LEFT - PLOT_AREA.RIGHT,
-      height: H - PLOT_AREA.TOP - PLOT_AREA.BOTTOM,
-      centerY: PLOT_AREA.TOP + (H - PLOT_AREA.TOP - PLOT_AREA.BOTTOM) / 2
+      cth: Math.cos(pitch), sth: Math.sin(pitch),
+      cph: Math.cos(yaw), sph: Math.sin(yaw),
+      H: 650, D: 2600, F: 2350,
+      cx: 420, cy: 700
     };
   }, []);
 
-  const drawGridToContext = useCallback((ctx: CanvasRenderingContext2D) => {
+  const project = useCallback((x: number, y: number, z: number, cam: ReturnType<typeof computeCamera>) => {
+    const zr = -x * cam.sph + z * cam.cph;
+    const xr = x * cam.cph + z * cam.sph;
+    const yw = y - cam.H;
+    const y1 = yw * cam.cth - zr * cam.sth;
+    const z2 = yw * cam.sth + zr * cam.cth;
+    const zc = cam.D - z2;
+    const inv = cam.F / zc;
+    return { sx: cam.cx + xr * inv, sy: cam.cy - y1 * inv, zc };
+  }, []);
+
+  const beatFlashRef = useRef({ time: 0, age: Infinity });
+
+  // ---------- Fondo estático cacheado ----------
+  const drawBackground = useCallback((ctx: CanvasRenderingContext2D) => {
     const { CANVAS_WIDTH: W, CANVAS_HEIGHT: H, COLORS } = CONFIG;
-    const plot = getPlotArea();
-    
-    // Fondo espacial profundo con bruma central
-    const bgGrad = ctx.createRadialGradient(W / 2, H * 0.42, 0, W / 2, H * 0.42, Math.max(W, H) / 1.15);
-    bgGrad.addColorStop(0, '#0d1830');
-    bgGrad.addColorStop(0.45, '#091020');
-    bgGrad.addColorStop(1, '#03060c');
+    const bgGrad = ctx.createRadialGradient(W / 2, H * 0.36, 0, W / 2, H * 0.36, Math.max(W, H) / 1.05);
+    bgGrad.addColorStop(0, '#0b1730');
+    bgGrad.addColorStop(0.5, '#060d1c');
+    bgGrad.addColorStop(1, COLORS.BG_DEEP);
     ctx.fillStyle = bgGrad;
     ctx.fillRect(0, 0, W, H);
 
-    // Halo cian sutil superior (luz ambiental de cabecera)
-    const topGlow = ctx.createRadialGradient(W * 0.5, -80, 0, W * 0.5, -80, W * 0.6);
-    topGlow.addColorStop(0, 'rgba(40, 130, 200, 0.10)');
+    const topGlow = ctx.createRadialGradient(W * 0.5, -120, 0, W * 0.5, -120, W * 0.55);
+    topGlow.addColorStop(0, 'rgba(45, 140, 220, 0.10)');
     topGlow.addColorStop(1, 'rgba(0, 0, 0, 0)');
     ctx.fillStyle = topGlow;
-    ctx.fillRect(0, 0, W, 400);
+    ctx.fillRect(0, 0, W, 500);
 
-    // Área de trazado: gradiente vertical frío
-    const innerGrad = ctx.createLinearGradient(0, plot.y, 0, plot.y + plot.height);
-    innerGrad.addColorStop(0, 'rgba(0, 34, 22, 0.55)');
-    innerGrad.addColorStop(0.5, 'rgba(2, 20, 14, 0.4)');
-    innerGrad.addColorStop(1, 'rgba(0, 34, 22, 0.55)');
-    ctx.fillStyle = innerGrad;
-    ctx.fillRect(plot.x, plot.y, plot.width, plot.height);
+    // Luz ambiental del escenario 3D (centro)
+    const stageGlow = ctx.createRadialGradient(W / 2, 780, 0, W / 2, 780, 480);
+    stageGlow.addColorStop(0, 'rgba(20, 80, 60, 0.10)');
+    stageGlow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = stageGlow;
+    ctx.fillRect(0, 264, W, 980);
+  }, []);
 
-    // Suelo en perspectiva (pseudo-3D): línea de horizonte interior baja del plot
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(plot.x, plot.y, plot.width, plot.height);
-    ctx.clip();
-    const vpX = plot.x + plot.width / 2;
-    const vpY = plot.y + plot.height + 150;
-    ctx.strokeStyle = 'rgba(77, 215, 254, 0.055)';
-    ctx.lineWidth = 1;
-    // Horizontales recediendo (cada vez más juntas hacia abajo)
-    for (let i = 1; i <= 7; i++) {
-      const t = i / 8;
-      const y = plot.centerY + 40 + Math.pow(t, 1.6) * (plot.y + plot.height - plot.centerY - 60);
-      ctx.beginPath();
-      ctx.moveTo(plot.x, y);
-      ctx.lineTo(plot.x + plot.width, y);
-      ctx.stroke();
-    }
-    // Verticales convergentes al punto de fuga
-    for (let i = 0; i <= 10; i++) {
-      const xBottom = plot.x + (i / 10) * plot.width;
-      const xTop = vpX + (xBottom - vpX) * 0.45;
-      ctx.beginPath();
-      ctx.moveTo(xTop, plot.y);
-      ctx.lineTo(xBottom, plot.y + plot.height);
-      ctx.stroke();
-    }
-    ctx.restore();
-
-    // Rejilla estilo ECG: menor rojo (0.2s), mayor (1s), gruesa (5s) verde
-    ctx.strokeStyle = 'rgba(200, 70, 70, 0.07)';
-    ctx.lineWidth = 0.5;
-    ctx.beginPath();
-    for (let x = plot.x; x <= plot.x + plot.width; x += 20) {
-      ctx.moveTo(x, plot.y); ctx.lineTo(x, plot.y + plot.height);
-    }
-    for (let y = plot.y; y <= plot.y + plot.height; y += 20) {
-      ctx.moveTo(plot.x, y); ctx.lineTo(plot.x + plot.width, y);
-    }
-    ctx.stroke();
-
-    ctx.strokeStyle = 'rgba(200, 70, 70, 0.17)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    for (let x = plot.x; x <= plot.x + plot.width; x += 100) {
-      ctx.moveTo(x, plot.y); ctx.lineTo(x, plot.y + plot.height);
-    }
-    for (let y = plot.y; y <= plot.y + plot.height; y += 100) {
-      ctx.moveTo(plot.x, y); ctx.lineTo(plot.x + plot.width, y);
-    }
-    ctx.stroke();
-
-    ctx.strokeStyle = 'rgba(34, 197, 94, 0.22)';
-    ctx.lineWidth = 1.2;
-    ctx.beginPath();
-    for (let x = plot.x; x <= plot.x + plot.width; x += 500) {
-      ctx.moveTo(x, plot.y); ctx.lineTo(x, plot.y + plot.height);
-    }
-    ctx.stroke();
-
-    // Marcas de tiempo (segundos)
-    ctx.fillStyle = 'rgba(148, 163, 184, 0.5)';
-    ctx.font = '9px "SF Mono", Consolas, monospace';
-    ctx.textAlign = 'center';
-    const secs = CONFIG.WINDOW_MS / 1000;
-    for (let s = 0; s <= secs; s++) {
-      const x = plot.x + plot.width - (s / secs) * plot.width;
-      ctx.fillRect(x - 0.5, plot.y - 6, 1, 6);
-      if (s % 1 === 0) {
-        ctx.fillText(`${s}s`, x, plot.y - 9);
-      }
-    }
-
-    // Línea base cian
-    ctx.strokeStyle = COLORS.BASELINE;
-    ctx.lineWidth = 1.2;
-    ctx.setLineDash([10, 6]);
-    ctx.beginPath();
-    ctx.moveTo(plot.x, plot.centerY);
-    ctx.lineTo(plot.x + plot.width, plot.centerY);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Marco del plot con resplandor exterior y esquinas
-    ctx.shadowColor = 'rgba(34, 197, 94, 0.35)';
-    ctx.shadowBlur = 14;
-    ctx.strokeStyle = 'rgba(34, 197, 94, 0.5)';
-    ctx.lineWidth = 1.2;
-    ctx.strokeRect(plot.x, plot.y, plot.width, plot.height);
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = 'rgba(34, 197, 94, 0.85)';
-    ctx.lineWidth = 2;
-    const ct = 22;
-    ctx.beginPath();
-    ctx.moveTo(plot.x, plot.y + ct); ctx.lineTo(plot.x, plot.y); ctx.lineTo(plot.x + ct, plot.y);
-    ctx.moveTo(plot.x + plot.width - ct, plot.y); ctx.lineTo(plot.x + plot.width, plot.y); ctx.lineTo(plot.x + plot.width, plot.y + ct);
-    ctx.moveTo(plot.x, plot.y + plot.height - ct); ctx.lineTo(plot.x, plot.y + plot.height); ctx.lineTo(plot.x + ct, plot.y + plot.height);
-    ctx.moveTo(plot.x + plot.width, plot.y + plot.height - ct); ctx.lineTo(plot.x + plot.width, plot.y + plot.height); ctx.lineTo(plot.x + plot.width - ct, plot.y + plot.height);
-    ctx.stroke();
-
-    // Reflejo especular superior del panel de cristal
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(plot.x + 2, plot.y + 0.5);
-    ctx.lineTo(plot.x + plot.width - 2, plot.y + 0.5);
-    ctx.stroke();
-  }, [getPlotArea]);
-
-  const ensureGridCache = useCallback((ctx: CanvasRenderingContext2D) => {
-    if (!gridCacheRef.current || gridDirtyRef.current) {
+  const ensureBgCache = useCallback((ctx: CanvasRenderingContext2D) => {
+    if (!bgCacheRef.current) {
       const offscreen = document.createElement('canvas');
       offscreen.width = CONFIG.CANVAS_WIDTH;
       offscreen.height = CONFIG.CANVAS_HEIGHT;
       const offCtx = offscreen.getContext('2d', { alpha: false })!;
-      drawGridToContext(offCtx);
-      gridCacheRef.current = offscreen;
-      gridDirtyRef.current = false;
+      drawBackground(offCtx);
+      bgCacheRef.current = offscreen;
     }
-    ctx.drawImage(gridCacheRef.current, 0, 0);
-  }, [drawGridToContext]);
+    ctx.drawImage(bgCacheRef.current, 0, 0);
+  }, [drawBackground]);
 
   const ensureScanlineCache = useCallback(() => {
     if (!scanlineCacheRef.current) {
@@ -283,8 +163,7 @@ const PPGSignalMeter = ({
       offscreen.width = CONFIG.CANVAS_WIDTH;
       offscreen.height = CONFIG.CANVAS_HEIGHT;
       const offCtx = offscreen.getContext('2d', { alpha: true })!;
-      // Scanlines CRT muy sutiles
-      offCtx.strokeStyle = 'rgba(0, 0, 0, 0.12)';
+      offCtx.strokeStyle = 'rgba(0, 0, 0, 0.10)';
       offCtx.lineWidth = 1;
       offCtx.beginPath();
       for (let y = 1; y < CONFIG.CANVAS_HEIGHT; y += 4) {
@@ -292,368 +171,299 @@ const PPGSignalMeter = ({
         offCtx.lineTo(CONFIG.CANVAS_WIDTH, y);
       }
       offCtx.stroke();
-      // Viñeta
       const vg = offCtx.createRadialGradient(
-        CONFIG.CANVAS_WIDTH / 2, CONFIG.CANVAS_HEIGHT / 2, CONFIG.CANVAS_HEIGHT * 0.32,
-        CONFIG.CANVAS_WIDTH / 2, CONFIG.CANVAS_HEIGHT / 2, CONFIG.CANVAS_HEIGHT * 0.75
+        CONFIG.CANVAS_WIDTH / 2, CONFIG.CANVAS_HEIGHT / 2, CONFIG.CANVAS_HEIGHT * 0.3,
+        CONFIG.CANVAS_WIDTH / 2, CONFIG.CANVAS_HEIGHT / 2, CONFIG.CANVAS_HEIGHT * 0.78
       );
       vg.addColorStop(0, 'rgba(0, 0, 0, 0)');
-      vg.addColorStop(1, 'rgba(0, 0, 0, 0.3)');
+      vg.addColorStop(1, 'rgba(0, 0, 0, 0.32)');
       offCtx.fillStyle = vg;
       offCtx.fillRect(0, 0, CONFIG.CANVAS_WIDTH, CONFIG.CANVAS_HEIGHT);
       scanlineCacheRef.current = offscreen;
     }
   }, []);
 
-  const drawAmplitudeScale = useCallback((ctx: CanvasRenderingContext2D) => {
-    const { COLORS } = CONFIG;
-    const plot = getPlotArea();
-    const stats = amplitudeStatsRef.current;
-    
-    ctx.font = '11px "SF Mono", Consolas, monospace';
-    ctx.fillStyle = COLORS.SCALE_TEXT;
-    ctx.textAlign = 'right';
-    
-    const steps = 5;
-    for (let i = 0; i <= steps; i++) {
-      const y = plot.y + (i / steps) * plot.height;
-      const val = stats.max - (i / steps) * stats.range;
-      ctx.fillText(val.toFixed(0), plot.x - 8, y + 4);
-      ctx.strokeStyle = COLORS.SCALE_TEXT;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(plot.x - 5, y);
-      ctx.lineTo(plot.x, y);
-      ctx.stroke();
-    }
-    
-    ctx.save();
-    ctx.translate(15, plot.centerY);
-    ctx.rotate(-Math.PI / 2);
-    ctx.textAlign = 'center';
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.font = '10px "SF Mono", Consolas, monospace';
-    ctx.fillText('AMPLITUD (μV)', 0, 0);
-    ctx.restore();
-  }, [getPlotArea]);
-
-  const drawTimeScale = useCallback((ctx: CanvasRenderingContext2D) => {
-    const { COLORS, WINDOW_MS } = CONFIG;
-    const plot = getPlotArea();
-    
-    ctx.font = '10px "SF Mono", Consolas, monospace';
-    ctx.fillStyle = COLORS.SCALE_TEXT;
-    ctx.textAlign = 'center';
-    
-    const seconds = WINDOW_MS / 1000;
-    for (let s = 0; s <= seconds; s++) {
-      const x = plot.x + plot.width - (s / seconds) * plot.width;
-      ctx.fillText(`${s}s`, x, plot.y + plot.height + 20);
-      ctx.strokeStyle = COLORS.SCALE_TEXT;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(x, plot.y + plot.height);
-      ctx.lineTo(x, plot.y + plot.height + 5);
-      ctx.stroke();
-    }
-    
-    ctx.textAlign = 'right';
-    ctx.fillStyle = COLORS.TEXT_PRIMARY;
-    ctx.fillText('25mm/s', plot.x + plot.width, plot.y + plot.height + 40);
-  }, [getPlotArea]);
-
+  // ---------- Paneles de cristal ----------
   const drawGlassPanel = (
     ctx: CanvasRenderingContext2D,
     x: number, y: number, w: number, h: number,
     borderColor: string,
-    headerColor: string
+    accent: string
   ) => {
     const grad = ctx.createLinearGradient(0, y, 0, y + h);
-    grad.addColorStop(0, 'rgba(10, 20, 34, 0.86)');
-    grad.addColorStop(1, 'rgba(4, 10, 20, 0.92)');
+    grad.addColorStop(0, CONFIG.COLORS.PANEL_BG_TOP);
+    grad.addColorStop(1, CONFIG.COLORS.PANEL_BG_BOTTOM);
     ctx.fillStyle = grad;
     ctx.fillRect(x, y, w, h);
+    ctx.save();
+    ctx.shadowColor = borderColor;
+    ctx.shadowBlur = 8;
     ctx.strokeStyle = borderColor;
     ctx.lineWidth = 1.2;
     ctx.strokeRect(x, y, w, h);
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(x + 2, y + 1);
-    ctx.lineTo(x + w - 2, y + 1);
-    ctx.stroke();
-    ctx.fillStyle = headerColor;
-    ctx.fillRect(x, y, w, 4);
-  };
-
-  const drawVitalInfo = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
-    const { CANVAS_WIDTH: W, COLORS } = CONFIG;
-    const { bpm, spo2, arrhythmiaStatus, quality, rrIntervals, rawArrhythmiaData } = propsRef.current;
-    
-    const panelH = 122;
-    const panelW = 165;
-    const panelY = 2;
-    const fontSize = {
-      label: 'bold 13px "SF Mono", Consolas, monospace',
-      value: 'bold 46px "SF Mono", Consolas, monospace',
-      unit: '15px "SF Mono", Consolas, monospace',
-      class: '11px "SF Mono", Consolas, monospace',
-      small: '10px "SF Mono", Consolas, monospace',
-    };
-
-    const hrBorder = bpm > 0 && (bpm < 60 || bpm > 100) ? COLORS.TEXT_WARNING : COLORS.TEXT_PRIMARY;
-    drawGlassPanel(ctx, 3, panelY, panelW, panelH, hrBorder, 'rgba(34, 197, 94, 0.25)');
-    
-    ctx.font = fontSize.label;
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.textAlign = 'left';
-    ctx.fillText('♥ FRECUENCIA', 10, panelY + 18);
-    
-    ctx.save();
-    ctx.font = fontSize.value;
-    ctx.fillStyle = bpm > 0 ? COLORS.TEXT_PRIMARY : COLORS.TEXT_SECONDARY;
-    if (bpm > 0) {
-      ctx.shadowColor = 'rgba(52, 245, 161, 0.45)';
-      ctx.shadowBlur = 16;
-    }
-    ctx.fillText(bpm > 0 ? bpm.toString() : '--', 10, panelY + 66);
     ctx.restore();
-    
-    ctx.font = fontSize.unit;
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText('BPM', panelW - 36, panelY + 66);
-    
-    if (bpm > 0) {
-      ctx.font = fontSize.class;
-      let hrLabel = '';
-      let hrColor = COLORS.TEXT_PRIMARY;
-      if (bpm < 60) { hrLabel = 'BRADICARDIA'; hrColor = COLORS.TEXT_WARNING; }
-      else if (bpm <= 100) { hrLabel = 'NORMAL'; hrColor = COLORS.TEXT_PRIMARY; }
-      else { hrLabel = 'TAQUICARDIA'; hrColor = COLORS.TEXT_WARNING; }
-      ctx.fillStyle = hrColor;
-      ctx.fillText(hrLabel, 10, panelY + 86);
-    }
-
-    // Tachograma RR en vivo (datos reales de intervalos)
-    const rr = rrIntervals || [];
-    if (rr.length >= 2) {
-      const rrRecent = rr.slice(-48);
-      let rrMin = Infinity;
-      let rrMax = -Infinity;
-      for (const v of rrRecent) {
-        if (v < rrMin) rrMin = v;
-        if (v > rrMax) rrMax = v;
-      }
-      const rrRange = Math.max(80, rrMax - rrMin);
-      ctx.font = '8px "SF Mono", Consolas, monospace';
-      ctx.fillStyle = COLORS.TEXT_SECONDARY;
-      ctx.textAlign = 'left';
-      ctx.fillText('TACO RR', 10, panelY + 106);
-      const tx = 52;
-      const ty = panelY + 100;
-      const tw = panelW - 62;
-      const th = 15;
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.06)';
-      ctx.fillRect(tx, ty, tw, th);
-      ctx.strokeStyle = 'rgba(77, 215, 254, 0.25)';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(tx, ty, tw, th);
-      ctx.beginPath();
-      ctx.strokeStyle = COLORS.ACCENT_CYAN;
-      ctx.lineWidth = 1.4;
-      for (let i = 0; i < rrRecent.length; i++) {
-        const px = tx + 2 + (i / (rrRecent.length - 1)) * (tw - 4);
-        const py = ty + th - 3 - ((rrRecent[i] - rrMin) / rrRange) * (th - 6);
-        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-      }
-      ctx.stroke();
-      ctx.fillStyle = COLORS.ACCENT_CYAN;
-      ctx.fillRect(tx + tw - 4, ty + th - 5, 2, 5);
-      ctx.font = '8px "SF Mono", Consolas, monospace';
-      ctx.textAlign = 'right';
-      ctx.fillStyle = COLORS.TEXT_SECONDARY;
-      ctx.fillText(`${Math.round(rrMin)}–${Math.round(rrMax)}ms`, panelW - 4, panelY + 96);
-    }
-    
-    const spo2Border = spo2 >= 95 ? COLORS.TEXT_PRIMARY : spo2 >= 90 ? COLORS.TEXT_WARNING : spo2 > 0 ? COLORS.TEXT_DANGER : COLORS.TEXT_SECONDARY;
-    drawGlassPanel(ctx, W - panelW - 3, panelY, panelW, panelH, spo2Border, 'rgba(59, 130, 246, 0.25)');
-    
-    ctx.font = fontSize.label;
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.textAlign = 'left';
-    ctx.fillText('O₂ SATURACIÓN', W - panelW + 7, panelY + 18);
-    
-    ctx.font = fontSize.value;
-    const spo2Color = spo2 >= 95 ? COLORS.TEXT_PRIMARY : spo2 >= 90 ? COLORS.TEXT_WARNING : spo2 > 0 ? COLORS.TEXT_DANGER : COLORS.TEXT_SECONDARY;
-    ctx.fillStyle = spo2Color;
-    ctx.fillText(spo2 > 0 ? spo2.toFixed(0) : '--', W - panelW + 7, panelY + 66);
-    
-    ctx.font = fontSize.unit;
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText('%', W - 22, panelY + 66);
-    
-    if (spo2 > 0) {
-      ctx.font = fontSize.class;
-      let spLabel = '';
-      let spColor = COLORS.TEXT_PRIMARY;
-      if (spo2 >= 95) { spLabel = 'NORMAL'; spColor = COLORS.TEXT_PRIMARY; }
-      else if (spo2 >= 90) { spLabel = 'HIPOXEMIA LEVE'; spColor = COLORS.TEXT_WARNING; }
-      else { spLabel = 'HIPOXEMIA'; spColor = COLORS.TEXT_DANGER; }
-      ctx.fillStyle = spColor;
-      ctx.fillText(spLabel, W - panelW + 7, panelY + 86);
-    }
-
-    const centerX = W / 2;
-    const centerW = 250;
-    const qBorder = quality > 60 ? COLORS.TEXT_PRIMARY : quality > 30 ? COLORS.TEXT_WARNING : COLORS.TEXT_DANGER;
-    drawGlassPanel(ctx, centerX - centerW / 2, panelY, centerW, panelH, qBorder, 'rgba(77, 215, 254, 0.3)');
-    
-    ctx.font = '12px "SF Mono", Consolas, monospace';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText('CALIDAD SEÑAL', centerX, panelY + 18);
-    
-    const barWidth = 210;
-    const barHeight = 10;
-    const barX = centerX - barWidth / 2;
-    const barY = panelY + 24;
-    ctx.fillStyle = 'rgba(255,255,255,0.1)';
-    ctx.fillRect(barX, barY, barWidth, barHeight);
-    
-    const qGrad = ctx.createLinearGradient(barX, 0, barX + (quality / 100) * barWidth, 0);
-    if (quality > 60) { qGrad.addColorStop(0, '#166534'); qGrad.addColorStop(1, '#34f5a1'); }
-    else if (quality > 30) { qGrad.addColorStop(0, '#854d0e'); qGrad.addColorStop(1, '#fbbf24'); }
-    else { qGrad.addColorStop(0, '#7f1d1d'); qGrad.addColorStop(1, '#ff5d5d'); }
-    ctx.save();
-    ctx.shadowColor = quality > 60 ? 'rgba(52, 245, 161, 0.5)' : quality > 30 ? 'rgba(251, 191, 36, 0.5)' : 'rgba(255, 93, 93, 0.5)';
-    ctx.shadowBlur = 8;
-    ctx.fillStyle = qGrad;
-    ctx.fillRect(barX, barY, (quality / 100) * barWidth, barHeight);
-    ctx.restore();
-    
-    ctx.font = 'bold 13px "SF Mono", Consolas, monospace';
-    ctx.fillStyle = quality > 60 ? COLORS.TEXT_PRIMARY : quality > 30 ? COLORS.TEXT_WARNING : COLORS.TEXT_DANGER;
-    ctx.fillText(`${quality.toFixed(0)}%`, centerX, panelY + 52);
-    
-    const ibi = ibiDisplayRef.current;
-    const hrv = hrvDisplayRef.current;
-    ctx.font = fontSize.small;
-    ctx.textAlign = 'left';
-    
-    ctx.fillStyle = COLORS.IBI_TEXT;
-    ctx.fillText(`IBI: ${ibi > 0 ? ibi + 'ms' : '--'}`, centerX - centerW / 2 + 8, panelY + 68);
-    
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText(`SDNN: ${hrv.sdnn > 0 ? hrv.sdnn + 'ms' : '--'}`, centerX - centerW / 2 + 8, panelY + 84);
-    
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText(`RMSSD: ${hrv.rmssd > 0 ? hrv.rmssd + 'ms' : '--'}`, centerX + 20, panelY + 84);
-    
-    if (rrIntervals && rrIntervals.length > 0) {
-      const lastRR = rrIntervals[rrIntervals.length - 1];
-      ctx.fillStyle = COLORS.IBI_TEXT;
-      ctx.textAlign = 'right';
-      ctx.fillText(`RR: ${lastRR.toFixed(0)}ms`, centerX + centerW / 2 - 8, panelY + 68);
-    }
-    
-    if (arrhythmiaStatus?.includes('ARRITMIA')) {
-      const parts = arrhythmiaStatus.split('|');
-      const count = parts.length > 1 ? parseInt(parts[1]) : 0;
-      
-      const pulse = (Math.sin(now / 100) + 1) / 2;
-      ctx.fillStyle = `rgba(239, 68, 68, ${0.25 + pulse * 0.4})`;
-      ctx.fillRect(W - panelW - 3, panelY + panelH + 4, panelW, 30);
-      ctx.strokeStyle = COLORS.TEXT_DANGER;
-      ctx.lineWidth = 2;
-      ctx.strokeRect(W - panelW - 3, panelY + panelH + 4, panelW, 30);
-      
-      ctx.font = 'bold 14px "SF Mono", Consolas, monospace';
-      ctx.fillStyle = COLORS.TEXT_DANGER;
-      ctx.textAlign = 'center';
-      ctx.fillText(`⚠ ARRITMIA x${count}`, W - panelW / 2 - 3, panelY + panelH + 22);
-      
-      if (rawArrhythmiaData && rawArrhythmiaData.rmssd > 0) {
-        ctx.font = '10px "SF Mono", Consolas, monospace';
-        ctx.fillStyle = 'rgba(255, 93, 93, 0.85)';
-        ctx.fillText(`RMSSD: ${rawArrhythmiaData.rmssd.toFixed(0)}ms`, W - panelW / 2 - 3, panelY + panelH + 42);
-      }
-    }
-  }, []);
-
-  const drawClinicalPanel = useCallback((ctx: CanvasRenderingContext2D) => {
-    const { CANVAS_WIDTH: W, CANVAS_HEIGHT: H, COLORS } = CONFIG;
-    const { bpm, spo2, rrIntervals, perfusionIndex, pressure, elapsedTime } = propsRef.current;
-
-    const panelH = 110;
-    const panelY = H - panelH - 50;
-    const panelX = 80;
-    const panelW = W - 160;
-
-    const grad = ctx.createLinearGradient(0, panelY, 0, panelY + panelH);
-    grad.addColorStop(0, 'rgba(9, 18, 30, 0.94)');
-    grad.addColorStop(1, 'rgba(3, 8, 16, 0.96)');
-    ctx.fillStyle = grad;
-    ctx.fillRect(panelX, panelY, panelW, panelH);
-    ctx.shadowColor = 'rgba(34, 197, 94, 0.25)';
-    ctx.shadowBlur = 10;
-    ctx.strokeStyle = 'rgba(34, 197, 94, 0.4)';
-    ctx.lineWidth = 1.2;
-    ctx.strokeRect(panelX, panelY, panelW, panelH);
-    ctx.shadowBlur = 0;
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(panelX + 2, panelY + 1);
-    ctx.lineTo(panelX + panelW - 2, panelY + 1);
+    ctx.moveTo(x + 3, y + 1.5);
+    ctx.lineTo(x + w - 3, y + 1.5);
     ctx.stroke();
+    ctx.fillStyle = accent;
+    ctx.fillRect(x, y, w, 3);
+  };
 
-    ctx.fillStyle = 'rgba(34, 197, 94, 0.12)';
-    ctx.fillRect(panelX, panelY, panelW, 22);
-    ctx.font = 'bold 11px "SF Mono", Consolas, monospace';
-    ctx.fillStyle = COLORS.TEXT_PRIMARY;
+  const cardLabel = (ctx: CanvasRenderingContext2D, text: string, x: number, y: number, color: string) => {
+    ctx.font = `bold 10px ${CONFIG.FONT}`;
+    ctx.fillStyle = color;
     ctx.textAlign = 'left';
-    ctx.fillText('● MONITOR · PARÁMETROS HEMODINÁMICOS', panelX + 10, panelY + 15);
+    ctx.fillText(text, x, y);
+  };
 
+  // ---------- Cabecera ----------
+  const drawHeader = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
+    const { CANVAS_WIDTH: W, COLORS } = CONFIG;
+    const { quality, elapsedTime } = propsRef.current;
+
+    ctx.font = `bold 12px ${CONFIG.FONT}`;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = COLORS.TEXT_PRIMARY;
+    ctx.fillText('● PPG MONITOR v5', 14, 24);
+    ctx.font = `9px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText('CARDIAC RHYTHM STATION', 14, 40);
+
+    const recentBeat = now - beatFlashRef.current.time < 400;
+    const hx = 220;
+    ctx.font = `16px ${CONFIG.FONT}`;
+    ctx.fillStyle = recentBeat ? '#ff6b6b' : COLORS.TEXT_DANGER;
+    ctx.textAlign = 'center';
+    if (recentBeat && propsRef.current.isFingerDetected) {
+      const p = 1 - (now - beatFlashRef.current.time) / 400;
+      ctx.save();
+      ctx.shadowColor = 'rgba(255, 80, 80, 0.9)';
+      ctx.shadowBlur = 10 + 24 * p;
+      ctx.scale(1 + 0.18 * p, 1 + 0.18 * p);
+      ctx.fillText('♥', hx / (1 + 0.18 * p), 32);
+      ctx.restore();
+    } else {
+      ctx.save();
+      ctx.shadowColor = 'rgba(255, 80, 80, 0.6)';
+      ctx.shadowBlur = 8;
+      ctx.fillText('♥', hx, 32);
+      ctx.restore();
+    }
+    ctx.font = `9px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.textAlign = 'left';
+    ctx.fillText('LIVE', hx + 18, 32);
+
+    // Barra de calidad centrada
+    const cxc = W / 2;
+    const bw = 150;
+    ctx.textAlign = 'center';
+    cardLabel(ctx, 'CALIDAD SEÑAL', cxc, 16, COLORS.TEXT_SECONDARY);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+    ctx.fillRect(cxc - bw / 2, 22, bw, 8);
+    const qGrad = ctx.createLinearGradient(cxc - bw / 2, 0, cxc - bw / 2 + bw, 0);
+    if (quality > 60) { qGrad.addColorStop(0, '#166534'); qGrad.addColorStop(1, '#3df6a8'); }
+    else if (quality > 30) { qGrad.addColorStop(0, '#854d0e'); qGrad.addColorStop(1, '#fbbf24'); }
+    else { qGrad.addColorStop(0, '#7f1d1d'); qGrad.addColorStop(1, '#ff5d5d'); }
+    ctx.fillStyle = qGrad;
+    ctx.fillRect(cxc - bw / 2, 22, bw * Math.min(1, quality / 100), 8);
+    ctx.font = `bold 10px ${CONFIG.FONT}`;
+    ctx.fillStyle = quality > 60 ? COLORS.TEXT_PRIMARY : quality > 30 ? COLORS.TEXT_WARNING : COLORS.TEXT_DANGER;
+    ctx.fillText(`${quality.toFixed(0)}%`, cxc + bw / 2 + 24, 30);
+
+    // Reloj y cronómetro
     const d = new Date();
     const hh = String(d.getHours()).padStart(2, '0');
     const mm = String(d.getMinutes()).padStart(2, '0');
     const ss = String(d.getSeconds()).padStart(2, '0');
-    const elapsedStr = (() => {
-      const t = Math.max(0, Math.floor(elapsedTime || 0));
-      const m = String(Math.floor(t / 60)).padStart(2, '0');
-      const s = String(t % 60).padStart(2, '0');
-      return `${m}:${s}`;
-    })();
+    const t = Math.max(0, Math.floor(elapsedTime || 0));
+    const em = String(Math.floor(t / 60)).padStart(2, '0');
+    const es = String(t % 60).padStart(2, '0');
     ctx.textAlign = 'right';
+    ctx.font = `bold 13px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_PRIMARY;
+    ctx.fillText(`⏱ ${em}:${es}`, W - 14, 24);
+    ctx.font = `9px ${CONFIG.FONT}`;
     ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText(`⏱ ${elapsedStr} · ${hh}:${mm}:${ss}`, panelX + panelW - 10, panelY + 15);
+    ctx.fillText(`${hh}:${mm}:${ss}`, W - 14, 40);
+  }, []);
 
-    const colW = panelW / 4;
-    const rowY1 = panelY + 38;
-    const rowY2 = panelY + 60;
-    const rowY3 = panelY + 82;
-    const rowY4 = panelY + 100;
+  // ---------- Fila de métricas ----------
+  const drawMetricsRow = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
+    const { COLORS } = CONFIG;
+    const { bpm, spo2, perfusionIndex, pressure, rrIntervals } = propsRef.current;
 
-    const drawCell = (cx: number, label: string, value: string, color: string, sub?: string) => {
-      ctx.font = '9px "SF Mono", Consolas, monospace';
-      ctx.fillStyle = COLORS.TEXT_SECONDARY;
-      ctx.textAlign = 'left';
-      ctx.fillText(label, cx + 10, rowY1);
-      ctx.font = 'bold 22px "SF Mono", Consolas, monospace';
+    const y = 62;
+    const h = 196;
+    const gap = 12;
+    const cardW = (840 - gap * 5) / 4;
+    const xs = [gap, gap * 2 + cardW, gap * 3 + cardW * 2, gap * 4 + cardW * 3];
+
+    // ---- HR ----
+    const hrCard = xs[0];
+    const hrAlarm = bpm > 0 && (bpm < 60 || bpm > 100);
+    drawGlassPanel(ctx, hrCard, y, cardW, h, hrAlarm ? COLORS.TEXT_WARNING : COLORS.TEXT_PRIMARY, 'rgba(61, 246, 168, 0.35)');
+    cardLabel(ctx, 'FRECUENCIA', hrCard + 12, y + 20, COLORS.TEXT_SECONDARY);
+    const beatAge = now - beatFlashRef.current.time;
+    const beatPulse = propsRef.current.isFingerDetected && beatAge < 450 ? (1 - beatAge / 450) : 0;
+    const valSize = 58 + 9 * beatPulse;
+    ctx.font = `bold ${valSize}px ${CONFIG.FONT}`;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = bpm > 0 ? COLORS.TEXT_PRIMARY : COLORS.TEXT_SECONDARY;
+    ctx.save();
+    if (bpm > 0) {
+      ctx.shadowColor = `rgba(61, 246, 168, ${0.35 + 0.5 * beatPulse})`;
+      ctx.shadowBlur = 14 + 26 * beatPulse;
+    }
+    ctx.fillText(bpm > 0 ? bpm.toString() : '--', hrCard + 12, y + 92);
+    ctx.restore();
+    ctx.font = `bold 13px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.textAlign = 'right';
+    ctx.fillText('BPM', hrCard + cardW - 12, y + 82);
+    if (bpm > 0) {
+      let label = '';
+      let color = COLORS.TEXT_PRIMARY;
+      if (bpm < 60) { label = 'BRADICARDIA'; color = COLORS.TEXT_WARNING; }
+      else if (bpm <= 100) { label = 'RITMO NORMAL'; color = COLORS.TEXT_PRIMARY; }
+      else { label = 'TAQUICARDIA'; color = COLORS.TEXT_WARNING; }
+      ctx.font = `bold 10px ${CONFIG.FONT}`;
       ctx.fillStyle = color;
-      ctx.fillText(value, cx + 10, rowY2);
-      if (sub) {
-        ctx.font = '9px "SF Mono", Consolas, monospace';
-        ctx.fillStyle = COLORS.TEXT_SECONDARY;
-        ctx.fillText(sub, cx + 10, rowY3);
+      ctx.fillText(label, hrCard + 12, y + 116);
+    }
+    // Ticker de latidos reales (últimos 8)
+    cardLabel(ctx, 'LATIDOS', hrCard + 12, y + 146, COLORS.TEXT_SECONDARY);
+    const beats = beatHistoryRef.current.slice(-8);
+    const dotX0 = hrCard + 12;
+    const dotY = y + 172;
+    const tickW = cardW - 24;
+    for (let i = 0; i < 8; i++) {
+      const dx = dotX0 + (i / 7) * tickW;
+      if (i < beats.length) {
+        const b = beats[i];
+        const age = now - b.time;
+        const fade = Math.max(0.35, 1 - age / 12000);
+        ctx.globalAlpha = fade;
+        if (b.isArrhythmia) {
+          ctx.fillStyle = COLORS.SIGNAL_ARRHYTHMIA;
+          ctx.beginPath();
+          ctx.arc(dx, dotY, 5.5, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.fillStyle = COLORS.SIGNAL_NORMAL;
+          ctx.beginPath();
+          ctx.arc(dx, dotY, 4.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      } else {
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
+        ctx.beginPath();
+        ctx.arc(dx, dotY, 3, 0, Math.PI * 2);
+        ctx.fill();
       }
-    };
+    }
+    if (beats.length > 0) {
+      const newest = beats[beats.length - 1];
+      const age = now - newest.time;
+      if (age < 800) {
+        const p = age / 800;
+        const lx = dotX0 + ((beats.length - 1) / 7) * tickW;
+        ctx.beginPath();
+        ctx.arc(lx, dotY, 5 + 14 * p, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(61, 246, 168, ${0.5 * (1 - p)})`;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    }
 
-    const stats = bpmStatsRef.current;
-    const meanBpm = stats.n > 0 ? Math.round(stats.sum / stats.n) : 0;
-    const meanRR = rrIntervals && rrIntervals.length > 0
-      ? Math.round(rrIntervals.reduce((a, b) => a + b, 0) / rrIntervals.length)
-      : 0;
+    // ---- SpO2 ----
+    const spCard = xs[1];
+    const spBorder = spo2 >= 95 ? COLORS.TEXT_PRIMARY : spo2 >= 90 ? COLORS.TEXT_WARNING : spo2 > 0 ? COLORS.TEXT_DANGER : COLORS.TEXT_SECONDARY;
+    drawGlassPanel(ctx, spCard, y, cardW, h, spBorder, 'rgba(77, 215, 254, 0.35)');
+    cardLabel(ctx, 'SATURACIÓN O₂', spCard + 12, y + 20, COLORS.TEXT_SECONDARY);
+    ctx.font = `bold 58px ${CONFIG.FONT}`;
+    ctx.fillStyle = spBorder;
+    ctx.textAlign = 'left';
+    ctx.save();
+    if (spo2 > 0) {
+      ctx.shadowColor = `rgba(77, 215, 254, 0.4)`;
+      ctx.shadowBlur = 12;
+    }
+    ctx.fillText(spo2 > 0 ? spo2.toFixed(0) : '--', spCard + 12, y + 92);
+    ctx.restore();
+    ctx.font = `bold 13px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.textAlign = 'right';
+    ctx.fillText('%', spCard + cardW - 12, y + 82);
+    if (spo2 > 0) {
+      let label = '';
+      let color = COLORS.TEXT_PRIMARY;
+      if (spo2 >= 95) { label = 'NORMAL'; color = COLORS.TEXT_PRIMARY; }
+      else if (spo2 >= 90) { label = 'HIPOXEMIA LEVE'; color = COLORS.TEXT_WARNING; }
+      else { label = 'HIPOXEMIA'; color = COLORS.TEXT_DANGER; }
+      ctx.font = `bold 10px ${CONFIG.FONT}`;
+      ctx.fillStyle = color;
+      ctx.fillText(label, spCard + 12, y + 116);
+    }
+    cardLabel(ctx, 'OBJETIVO ≥ 95%', spCard + 12, y + 146, COLORS.TEXT_SECONDARY);
+    ctx.font = `9px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText('PLETH POR PPG', spCard + 12, y + 170);
+
+    // ---- MAP ----
+    const mpCard = xs[2];
+    const sys = pressure?.systolic || 0;
+    const dia = pressure?.diastolic || 0;
+    const map = sys > 0 && dia > 0 ? Math.round(dia + (sys - dia) / 3) : 0;
+    const pp = sys > 0 && dia > 0 ? sys - dia : 0;
+    const mpBorder = map === 0 ? COLORS.TEXT_SECONDARY : (map < 65 || map > 110) ? COLORS.TEXT_WARNING : COLORS.TEXT_PRIMARY;
+    drawGlassPanel(ctx, mpCard, y, cardW, h, mpBorder, 'rgba(129, 140, 248, 0.35)');
+    cardLabel(ctx, 'PRESIÓN · MAP', mpCard + 12, y + 20, COLORS.TEXT_SECONDARY);
+    ctx.font = `bold 58px ${CONFIG.FONT}`;
+    ctx.fillStyle = mpBorder;
+    ctx.textAlign = 'left';
+    ctx.save();
+    if (map > 0) {
+      ctx.shadowColor = `rgba(129, 140, 248, 0.4)`;
+      ctx.shadowBlur = 12;
+    }
+    ctx.fillText(map > 0 ? `${map}` : '--', mpCard + 12, y + 92);
+    ctx.restore();
+    ctx.font = `bold 13px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.textAlign = 'right';
+    ctx.fillText('mmHg', mpCard + cardW - 12, y + 82);
+    ctx.font = `bold 11px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText(sys > 0 ? `${sys}/${dia}` : '--/--', mpCard + 12, y + 116);
+    cardLabel(ctx, `PP ${pp > 0 ? pp + ' mmHg' : '--'}`, mpCard + 12, y + 146, COLORS.TEXT_SECONDARY);
+    ctx.font = `9px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText('OBJETIVO 70–105', mpCard + 12, y + 170);
+
+    // ---- PI + RESP ----
+    const piCard = xs[3];
+    const piVal = perfusionIndex || 0;
+    const piBorder = piVal >= 0.02 ? COLORS.TEXT_PRIMARY : piVal >= 0.005 ? COLORS.TEXT_WARNING : COLORS.TEXT_DANGER;
+    drawGlassPanel(ctx, piCard, y, cardW, h, piBorder, 'rgba(251, 191, 36, 0.3)');
+    cardLabel(ctx, 'PERFUSIÓN · PI', piCard + 12, y + 20, COLORS.TEXT_SECONDARY);
+    ctx.font = `bold 58px ${CONFIG.FONT}`;
+    ctx.fillStyle = piBorder;
+    ctx.textAlign = 'left';
+    ctx.fillText(piVal > 0 ? (piVal * 100).toFixed(1) : '--', piCard + 12, y + 92);
+    ctx.font = `bold 13px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.textAlign = 'right';
+    ctx.fillText('%', piCard + cardW - 12, y + 82);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+    ctx.fillRect(piCard + 12, y + 104, cardW - 24, 6);
+    const piPct = Math.min(1, piVal / 0.05);
+    ctx.fillStyle = piBorder;
+    ctx.fillRect(piCard + 12, y + 104, (cardW - 24) * piPct, 6);
 
     let respRate = 0;
     if (rrIntervals && rrIntervals.length >= 4) {
@@ -667,66 +477,433 @@ const PPGSignalMeter = ({
       if (totalSec > 0) respRate = Math.round((cycles / totalSec) * 60);
       if (respRate < 6 || respRate > 40) respRate = 0;
     }
-
-    const prColor = bpm <= 0 ? COLORS.TEXT_SECONDARY : (bpm < 60 || bpm > 100) ? COLORS.TEXT_WARNING : COLORS.TEXT_PRIMARY;
-    drawCell(panelX + colW * 0, 'PR · PULSE RATE', bpm > 0 ? `${Math.round(bpm)}` : '--', prColor, 'lím 50–120 bpm');
-    ctx.font = '9px "SF Mono", Consolas, monospace';
+    const respColor = respRate === 0 ? COLORS.TEXT_SECONDARY : (respRate < 12 || respRate > 20) ? COLORS.TEXT_WARNING : COLORS.TEXT_PRIMARY;
+    ctx.font = `bold 10px ${CONFIG.FONT}`;
     ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText(`min ${stats.min || '--'}  max ${stats.max || '--'}  x̄ ${meanBpm || '--'}`, panelX + colW * 0 + 10, rowY4);
-
-    const piVal = perfusionIndex || 0;
-    const piColor = piVal >= 0.02 ? COLORS.TEXT_PRIMARY : piVal >= 0.005 ? COLORS.TEXT_WARNING : COLORS.TEXT_DANGER;
-    drawCell(panelX + colW * 1, 'PI · PERFUSIÓN', piVal > 0 ? (piVal * 100).toFixed(2) : '--', piColor, '% AC/DC');
-    const piBarX = panelX + colW * 1 + 10;
-    const piBarY = rowY4 - 3;
-    ctx.fillStyle = 'rgba(255,255,255,0.08)';
-    ctx.fillRect(piBarX, piBarY, 110, 5);
-    const piPct = Math.min(1, piVal / 0.05);
-    ctx.fillStyle = piColor;
-    ctx.fillRect(piBarX, piBarY, 110 * piPct, 5);
-
-    const sys = pressure?.systolic || 0;
-    const dia = pressure?.diastolic || 0;
-    const map = sys > 0 && dia > 0 ? Math.round(dia + (sys - dia) / 3) : 0;
-    const pp = sys > 0 && dia > 0 ? sys - dia : 0;
-    const mapColor = map === 0 ? COLORS.TEXT_SECONDARY : (map < 65 || map > 110) ? COLORS.TEXT_WARNING : COLORS.TEXT_PRIMARY;
-    drawCell(panelX + colW * 2, 'MAP · TAM', map > 0 ? `${map}` : '--', mapColor, 'mmHg · objetivo 70–105');
-    ctx.font = '9px "SF Mono", Consolas, monospace';
+    ctx.fillText('RESP (EST.)', piCard + 12, y + 146);
+    ctx.font = `bold 22px ${CONFIG.FONT}`;
+    ctx.fillStyle = respColor;
+    ctx.fillText(respRate > 0 ? `${respRate}` : '--', piCard + 12, y + 172);
+    ctx.font = `bold 10px ${CONFIG.FONT}`;
     ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText(`PP ${pp > 0 ? pp + ' mmHg' : '--'}  ·  ${sys || '--'}/${dia || '--'}`, panelX + colW * 2 + 10, rowY4);
+    ctx.fillText('rpm', piCard + 46, y + 172);
+  }, []);
 
-    const rrColor = respRate === 0 ? COLORS.TEXT_SECONDARY : (respRate < 12 || respRate > 20) ? COLORS.TEXT_WARNING : COLORS.TEXT_PRIMARY;
-    drawCell(panelX + colW * 3, 'RESP (EST.)', respRate > 0 ? `${respRate}` : '--', rrColor, 'rpm · derivado RR');
-    ctx.font = '9px "SF Mono", Consolas, monospace';
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText(`IBI x̄ ${meanRR > 0 ? meanRR + 'ms' : '--'}  ·  SpO₂ ${spo2 > 0 ? spo2.toFixed(0) + '%' : '--'}`, panelX + colW * 3 + 10, rowY4);
+  // ---------- Escenario 3D ----------
+  const draw3DStage = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
+    const { COLORS } = CONFIG;
+    const { preserveResults, isFingerDetected: detected } = propsRef.current;
+    const stage = { x0: 60, x1: 780, y0: 272, y1: 1252 };
+    const cam = computeCamera(now);
+    const proj = (x: number, y: number, z: number) => project(x, y, z, cam);
 
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(stage.x0, stage.y0, stage.x1 - stage.x0, stage.y1 - stage.y0);
+    ctx.clip();
+
+    // Plano 3D: polígono (línea trasera y delantera del plano en pantalla)
+    const plBackL = proj(-340, 0, -900);
+    const plBackR = proj(340, 0, -900);
+    const plFrontL = proj(-340, 0, 0);
+    const plFrontR = proj(340, 0, 0);
+    const planeGrad = ctx.createLinearGradient(0, plBackL.sy, 0, plFrontL.sy);
+    planeGrad.addColorStop(0, 'rgba(6, 22, 34, 0.35)');
+    planeGrad.addColorStop(1, 'rgba(10, 40, 30, 0.55)');
+    ctx.fillStyle = planeGrad;
+    ctx.beginPath();
+    ctx.moveTo(plBackL.sx, plBackL.sy);
+    ctx.lineTo(plBackR.sx, plBackR.sy);
+    ctx.lineTo(plFrontR.sx, plFrontR.sy);
+    ctx.lineTo(plFrontL.sx, plFrontL.sy);
+    ctx.closePath();
+    ctx.fill();
+
+    // Rejilla del plano en perspectiva
+    ctx.strokeStyle = 'rgba(61, 246, 168, 0.10)';
     ctx.lineWidth = 1;
-    for (let i = 1; i < 4; i++) {
+    for (let i = 0; i <= 10; i++) {
+      const x = -340 + (i / 10) * 680;
+      const a = proj(x, 0, -900);
+      const b = proj(x, 0, 0);
       ctx.beginPath();
-      ctx.moveTo(panelX + colW * i, panelY + 26);
-      ctx.lineTo(panelX + colW * i, panelY + panelH - 6);
+      ctx.moveTo(a.sx, a.sy);
+      ctx.lineTo(b.sx, b.sy);
       ctx.stroke();
     }
+    for (let i = 0; i <= 8; i++) {
+      const z = -900 + (i / 8) * 900;
+      const a = proj(-340, 0, z);
+      const b = proj(340, 0, z);
+      ctx.beginPath();
+      ctx.moveTo(a.sx, a.sy);
+      ctx.lineTo(b.sx, b.sy);
+      ctx.stroke();
+    }
+    // Bordes del plano
+    ctx.strokeStyle = 'rgba(61, 246, 168, 0.28)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(plFrontL.sx, plFrontL.sy);
+    ctx.lineTo(plFrontR.sx, plFrontR.sy);
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(61, 246, 168, 0.14)';
+    ctx.beginPath();
+    ctx.moveTo(plBackL.sx, plBackL.sy);
+    ctx.lineTo(plBackR.sx, plBackR.sy);
+    ctx.stroke();
 
+    // Ticks de tiempo a lo largo de la línea de la onda (z = -380)
+    for (let s = 0; s <= 2.8; s += 0.5) {
+      const x = -330 + (s / 2.8) * 660;
+      const a = proj(x, 0, -380);
+      const b = proj(x, 12, -380);
+      ctx.strokeStyle = 'rgba(77, 215, 254, 0.30)';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(a.sx, a.sy);
+      ctx.lineTo(b.sx, b.sy);
+      ctx.stroke();
+      if (s === Math.round(s)) {
+        ctx.font = `9px ${CONFIG.FONT}`;
+        ctx.fillStyle = COLORS.SCALE_TEXT;
+        ctx.textAlign = 'center';
+        ctx.fillText(`${s}s`, a.sx, a.sy - 8);
+      }
+    }
+
+    const hasWave = !(preserveResults && !detected);
+
+    if (hasWave) {
+      const { value: signalValue, isPeak: peak, arrhythmiaStatus: arrStatus } = propsRef.current;
+      const scaledValue = signalValue * 2;
+
+      if (peak) {
+        beatFlashRef.current = { time: now, age: 0 };
+        const currentCount = arrStatus ? parseInt(arrStatus.split('|')[1] || '0') : 0;
+        if (currentCount > lastArrhythmiaCountRef.current) {
+          beatArrhythmiaRef.current = true;
+          lastArrhythmiaCountRef.current = currentCount;
+          const { rrIntervals: rr } = propsRef.current;
+          const lastRR = rr && rr.length > 0 ? rr[rr.length - 1] : 800;
+          const retroDuration = Math.min(Math.max(lastRR, 400), 1500);
+          dataBufferRef.current?.markArrhythmiaBack(retroDuration);
+        } else {
+          beatArrhythmiaRef.current = false;
+        }
+        beatHistoryRef.current.push({ isArrhythmia: beatArrhythmiaRef.current, time: now });
+        if (beatHistoryRef.current.length > 20) {
+          beatHistoryRef.current = beatHistoryRef.current.slice(-20);
+        }
+      }
+      const currentIsArrhythmia = beatArrhythmiaRef.current;
+
+      dataBufferRef.current?.push({ time: now, value: scaledValue, isArrhythmia: currentIsArrhythmia });
+
+      const buffer = dataBufferRef.current;
+      if (buffer) {
+        const points = buffer.getPoints();
+        if (points.length > 30) {
+          let min = Infinity;
+          let max = -Infinity;
+          const recentPoints = points.length > 150 ? points.slice(-150) : points;
+          for (let i = 0; i < recentPoints.length; i++) {
+            const v = recentPoints[i].value;
+            if (v < min) min = v;
+            if (v > max) max = v;
+          }
+          const range = Math.max(40, max - min);
+          const stats = amplitudeStatsRef.current;
+          stats.min = stats.min * 0.95 + (min - range * 0.1) * 0.05;
+          stats.max = stats.max * 0.95 + (max + range * 0.1) * 0.05;
+          stats.range = stats.max - stats.min;
+        }
+
+        const stats = amplitudeStatsRef.current;
+
+        // Respuesta al latido: rebote de amplitud + flash de brillo
+        const beatAge = now - beatFlashRef.current.time;
+        const beatPulse = Math.exp(-Math.max(0, beatAge) / 320);
+        const ampBoost = 1 + 0.06 * beatPulse;
+        const waveBright = 0.72 + 0.28 * beatPulse;
+
+        const proj3: { sx: number; sy: number; syPlane: number; isArr: boolean; x: number; y: number; zc: number }[] = [];
+        const pointsList = points.length > 400 ? points.slice(-400) : points;
+        for (let i = 0; i < pointsList.length; i++) {
+          const pt = pointsList[i];
+          const age = now - pt.time;
+          if (age > CONFIG.WINDOW_MS) continue;
+          const x = -330 + ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS) * 660;
+          const z = -380 + (age / CONFIG.WINDOW_MS) * 130;
+          const normalizedY = (stats.max - pt.value) / stats.range;
+          const worldY = (normalizedY - 0.5) * 560 * ampBoost;
+          const p = proj(x, worldY, z);
+          const pp = proj(x, 0, z);
+          proj3.push({ sx: p.sx, sy: p.sy, syPlane: pp.sy, isArr: pt.isArrhythmia, x, y: worldY, zc: p.zc });
+        }
+
+        if (proj3.length > 2) {
+          ctx.lineJoin = 'round';
+          ctx.lineCap = 'round';
+
+          // Espejo difuso en el plano (reflejo atenuado)
+          ctx.save();
+          ctx.globalAlpha = 0.12;
+          ctx.strokeStyle = COLORS.SIGNAL_NORMAL;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          let mstarted = false;
+          for (const c of proj3) {
+            const m = proj(c.x, -c.y * 0.5, -380);
+            if (!mstarted) { ctx.moveTo(m.sx, m.sy); mstarted = true; }
+            else ctx.lineTo(m.sx, m.sy);
+          }
+          ctx.stroke();
+          ctx.restore();
+
+          // Relleno de la cinta 3D (de la onda hasta el plano)
+          ctx.beginPath();
+          ctx.moveTo(proj3[0].sx, proj3[0].sy);
+          for (const c of proj3) ctx.lineTo(c.sx, c.sy);
+          for (let i = proj3.length - 1; i >= 0; i--) ctx.lineTo(proj3[i].sx, proj3[i].syPlane);
+          ctx.closePath();
+          const ribbonGrad = ctx.createLinearGradient(0, Math.min(...proj3.map(c => c.sy)) - 20, 0, Math.max(...proj3.map(c => c.syPlane)) + 20);
+          ribbonGrad.addColorStop(0, 'rgba(61, 246, 168, 0.16)');
+          ribbonGrad.addColorStop(0.5, 'rgba(61, 246, 168, 0.06)');
+          ribbonGrad.addColorStop(1, 'rgba(61, 246, 168, 0.0)');
+          ctx.fillStyle = ribbonGrad;
+          ctx.fill();
+
+          // Segmentación normal / arritmia (con el punto del plano para el relleno 3D)
+          const runs: { pts: { sx: number; sy: number; syPlane: number }[]; arr: boolean }[] = [];
+          let currentRun: { sx: number; sy: number; syPlane: number }[] = [];
+          let currentArr = proj3[0].isArr;
+          for (const c of proj3) {
+            if (c.isArr === currentArr) {
+              currentRun.push({ sx: c.sx, sy: c.sy, syPlane: c.syPlane });
+            } else {
+              if (currentRun.length > 1) runs.push({ pts: currentRun, arr: currentArr });
+              currentRun = [{ sx: c.sx, sy: c.sy, syPlane: c.syPlane }];
+              currentArr = c.isArr;
+            }
+          }
+          if (currentRun.length > 1) runs.push({ pts: currentRun, arr: currentArr });
+
+          // Vallas de profundidad (cada 4 muestras) — refuerza el 3D
+          ctx.strokeStyle = 'rgba(61, 246, 168, 0.10)';
+          ctx.lineWidth = 1;
+          for (let i = 0; i < proj3.length; i += 4) {
+            const c = proj3[i];
+            ctx.beginPath();
+            ctx.moveTo(c.sx, c.sy);
+            ctx.lineTo(c.sx, c.syPlane);
+            ctx.stroke();
+          }
+
+          // Relleno rojo de segmentos arrítmicos
+          for (const run of runs) {
+            if (!run.arr) continue;
+            ctx.beginPath();
+            ctx.moveTo(run.pts[0].sx, run.pts[0].sy);
+            for (const c of run.pts) ctx.lineTo(c.sx, c.sy);
+            for (let i = run.pts.length - 1; i >= 0; i--) ctx.lineTo(run.pts[i].sx, run.pts[i].syPlane);
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(255, 93, 93, 0.12)';
+            ctx.fill();
+          }
+
+          const strokePass = (arr: boolean, width: number, alpha: number, blur: number, useCore = false) => {
+            ctx.save();
+            ctx.globalAlpha = alpha * waveBright;
+            for (const run of runs) {
+              if (run.arr !== arr) continue;
+              ctx.beginPath();
+              ctx.moveTo(run.pts[0].sx, run.pts[0].sy);
+              for (let i = 1; i < run.pts.length; i++) ctx.lineTo(run.pts[i].sx, run.pts[i].sy);
+              if (blur > 0) {
+                ctx.shadowColor = arr ? COLORS.ARRHYTHMIA_GLOW : COLORS.SIGNAL_GLOW;
+                ctx.shadowBlur = blur;
+              }
+              ctx.strokeStyle = arr ? (useCore ? '#ffd9d9' : COLORS.SIGNAL_ARRHYTHMIA) : (useCore ? COLORS.SIGNAL_CORE : COLORS.SIGNAL_NORMAL);
+              ctx.lineWidth = width;
+              ctx.stroke();
+            }
+            ctx.restore();
+          };
+
+          // Halo difuso + trazo + núcleo (brillo reactivo al latido)
+          strokePass(false, 9, 0.20, 24);
+          strokePass(true, 9, 0.20, 24);
+          strokePass(false, 3, 1, 14);
+          strokePass(true, 3, 1, 14);
+          strokePass(false, 1.2, 0.9, 0, true);
+          strokePass(true, 1.2, 0.9, 0, true);
+
+          // Barrido luminoso en el borde actual
+          const last = proj3[proj3.length - 1];
+          const beamTop = proj(last.x, Math.max(0, last.y) + 190, -380);
+          const beamBottom = proj(last.x, -60, -380);
+          const beamGrad = ctx.createLinearGradient(beamTop.sx - 70, 0, beamTop.sx + 6, 0);
+          const beamPulse = 0.14 + 0.08 * Math.sin(now / 240) + 0.10 * beatPulse;
+          beamGrad.addColorStop(0, 'rgba(61, 246, 168, 0)');
+          beamGrad.addColorStop(1, `rgba(61, 246, 168, ${beamPulse})`);
+          ctx.fillStyle = beamGrad;
+          ctx.fillRect(beamTop.sx - 70, Math.min(beamTop.sy, beamBottom.sy), 76, Math.abs(beamBottom.sy - beamTop.sy));
+          ctx.save();
+          ctx.shadowColor = 'rgba(61, 246, 168, 0.9)';
+          ctx.shadowBlur = 12;
+          ctx.fillStyle = `rgba(61, 246, 168, ${0.35 + 0.2 * beatPulse})`;
+          ctx.fillRect(beamTop.sx - 1.5, Math.min(beamTop.sy, beamBottom.sy), 1.5, Math.abs(beamBottom.sy - beamTop.sy));
+          ctx.restore();
+
+          // Picos, valles e IBI (en espacio 3D proyectado)
+          const history = beatHistoryRef.current;
+          const peaks: { sx: number; sy: number; zc: number; isArrhythmia: boolean; time: number }[] = [];
+          const valleys: { sx: number; sy: number }[] = [];
+
+          for (const beat of history) {
+            const age = now - beat.time;
+            if (age > CONFIG.WINDOW_MS || age < 0) continue;
+            const x = -330 + ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS) * 660;
+            if (x < -335 || x > 335) continue;
+            let closestPt: PPGDataPoint | null = null;
+            let minDist = Infinity;
+            for (let j = 0; j < pointsList.length; j++) {
+              const pt = pointsList[j];
+              const dist = Math.abs(pt.time - beat.time);
+              if (dist < minDist) { minDist = dist; closestPt = pt; }
+            }
+            if (closestPt && minDist < 200) {
+              const normalizedY = (stats.max - closestPt.value) / stats.range;
+              const worldY = (normalizedY - 0.5) * 560 * ampBoost;
+              const p = proj(x, worldY, -380);
+              peaks.push({ sx: p.sx, sy: p.sy, zc: p.zc, isArrhythmia: beat.isArrhythmia, time: beat.time });
+            }
+          }
+
+          for (let b = 0; b < peaks.length - 1; b++) {
+            const t0 = peaks[b].time;
+            const t1 = peaks[b + 1].time;
+            let minVal = Infinity;
+            let minPt: PPGDataPoint | null = null;
+            for (let j = 0; j < pointsList.length; j++) {
+              const pt = pointsList[j];
+              if (pt.time > t0 && pt.time < t1 && pt.value < minVal) {
+                minVal = pt.value;
+                minPt = pt;
+              }
+            }
+            if (minPt) {
+              const age2 = now - minPt.time;
+              const x = -330 + ((CONFIG.WINDOW_MS - age2) / CONFIG.WINDOW_MS) * 660;
+              if (x >= -335 && x <= 335) {
+                const normalizedY = (stats.max - minPt.value) / stats.range;
+                const worldY = (normalizedY - 0.5) * 560 * ampBoost;
+                const p = proj(x, worldY, -380);
+                valleys.push({ sx: p.sx, sy: p.sy });
+              }
+            }
+          }
+
+          for (let i = 0; i < peaks.length - 1; i++) {
+            const p1 = peaks[i];
+            const p2 = peaks[i + 1];
+            const ibiMs = Math.abs(p1.time - p2.time);
+            if (ibiMs > 0 && ibiMs < 3000) {
+              const midX = (p1.sx + p2.sx) / 2;
+              const topY = Math.min(p1.sy, p2.sy) - 26;
+              ctx.strokeStyle = 'rgba(103, 232, 249, 0.5)';
+              ctx.lineWidth = 1.2;
+              ctx.beginPath();
+              ctx.moveTo(p1.sx, topY + 8);
+              ctx.lineTo(p1.sx, topY);
+              ctx.lineTo(p2.sx, topY);
+              ctx.lineTo(p2.sx, topY + 8);
+              ctx.stroke();
+              ctx.font = `9px ${CONFIG.FONT}`;
+              ctx.fillStyle = COLORS.IBI_TEXT;
+              ctx.textAlign = 'center';
+              ctx.fillText(`${ibiMs}ms`, midX, topY - 4);
+            }
+          }
+
+          peaks.forEach(p => {
+            const color = p.isArrhythmia ? COLORS.SIGNAL_ARRHYTHMIA : COLORS.SIGNAL_NORMAL;
+            const r = (p.isArrhythmia ? 10 : 8) * (3000 / p.zc);
+            const sg = ctx.createRadialGradient(p.sx - r * 0.35, p.sy - r * 0.35, r * 0.1, p.sx, p.sy, r);
+            sg.addColorStop(0, p.isArrhythmia ? '#ffe1e1' : '#d8ffe9');
+            sg.addColorStop(0.45, color);
+            sg.addColorStop(1, p.isArrhythmia ? '#7f1d1d' : '#0f5132');
+            ctx.save();
+            ctx.shadowColor = p.isArrhythmia ? 'rgba(255, 93, 93, 0.8)' : 'rgba(61, 246, 168, 0.8)';
+            ctx.shadowBlur = 16;
+            ctx.beginPath();
+            ctx.arc(p.sx, p.sy, r, 0, Math.PI * 2);
+            ctx.fillStyle = sg;
+            ctx.fill();
+            ctx.restore();
+            ctx.beginPath();
+            ctx.arc(p.sx, p.sy, Math.max(1.5, r * 0.25), 0, Math.PI * 2);
+            ctx.fillStyle = '#fff';
+            ctx.fill();
+            ctx.font = `bold 11px ${CONFIG.FONT}`;
+            ctx.fillStyle = p.isArrhythmia ? COLORS.TEXT_DANGER : COLORS.SIGNAL_NORMAL;
+            ctx.textAlign = 'center';
+            ctx.fillText(p.isArrhythmia ? 'A' : 'N', p.sx, p.sy - r - 10);
+
+            // Anillo de pulso expansivo por latido
+            const pAge = now - p.time;
+            if (pAge < 900) {
+              const pr = pAge / 900;
+              ctx.beginPath();
+              ctx.arc(p.sx, p.sy, r + 12 + 30 * pr, 0, Math.PI * 2);
+              ctx.strokeStyle = p.isArrhythmia
+                ? `rgba(255, 93, 93, ${0.6 * (1 - pr)})`
+                : `rgba(61, 246, 168, ${0.6 * (1 - pr)})`;
+              ctx.lineWidth = 2.5 * (1 - pr) + 0.5;
+              ctx.stroke();
+            }
+            if (p.isArrhythmia) {
+              const alpha = (Math.sin(now / 80) + 1) / 2;
+              ctx.beginPath();
+              ctx.arc(p.sx, p.sy, r + 10, 0, Math.PI * 2);
+              ctx.strokeStyle = `rgba(255, 93, 93, ${0.3 + alpha * 0.5})`;
+              ctx.lineWidth = 2;
+              ctx.stroke();
+            }
+          });
+
+          valleys.forEach(v => {
+            ctx.beginPath();
+            ctx.moveTo(v.sx, v.sy + 3);
+            ctx.lineTo(v.sx - 4, v.sy + 10);
+            ctx.lineTo(v.sx + 4, v.sy + 10);
+            ctx.closePath();
+            ctx.fillStyle = COLORS.TEXT_SECONDARY;
+            ctx.fill();
+          });
+        }
+      }
+    }
+    ctx.restore();
+  }, [computeCamera, project]);
+
+  // ---------- Banda analítica ----------
+  const drawAnalyticsBand = useCallback((ctx: CanvasRenderingContext2D) => {
+    const { COLORS } = CONFIG;
+    const { rrIntervals } = propsRef.current;
+
+    const y = 1264;
+    const h = 320;
+    const gap = 12;
+    const w = (840 - gap * 3) / 2;
+
+    // ---- Izquierda: tendencia PR + HRV ----
+    const tx = gap;
+    drawGlassPanel(ctx, tx, y, w, h, 'rgba(61, 246, 168, 0.25)', 'rgba(61, 246, 168, 0.2)');
+    cardLabel(ctx, 'TENDENCIA PR', tx + 14, y + 22, COLORS.TEXT_SECONDARY);
     const trend = bpmTrendRef.current;
     if (trend.length >= 2) {
-      const tx = panelX;
-      const ty = panelY + panelH + 6;
-      const tw = panelW;
-      const th = 26;
-      ctx.fillStyle = 'rgba(8, 16, 28, 0.85)';
-      ctx.fillRect(tx, ty, tw, th);
-      ctx.strokeStyle = 'rgba(34, 197, 94, 0.25)';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(tx, ty, tw, th);
-
-      ctx.font = '9px "SF Mono", Consolas, monospace';
-      ctx.fillStyle = COLORS.TEXT_SECONDARY;
-      ctx.textAlign = 'left';
-      ctx.fillText('TENDENCIA PR', tx + 6, ty + 11);
-
       let minB = trend[0].bpm;
       let maxB = trend[0].bpm;
       for (let i = 1; i < trend.length; i++) {
@@ -736,47 +913,251 @@ const PPGSignalMeter = ({
       const range = Math.max(10, maxB - minB);
       ctx.beginPath();
       ctx.strokeStyle = COLORS.TEXT_PRIMARY;
-      ctx.lineWidth = 1.5;
-      ctx.shadowColor = 'rgba(52, 245, 161, 0.4)';
-      ctx.shadowBlur = 6;
+      ctx.lineWidth = 1.8;
+      ctx.save();
+      ctx.shadowColor = 'rgba(61, 246, 168, 0.45)';
+      ctx.shadowBlur = 8;
+      const plotW = w - 28;
       for (let i = 0; i < trend.length; i++) {
         const p = trend[i];
-        const px = tx + 90 + (i / (trend.length - 1)) * (tw - 100);
-        const py = ty + th - 4 - ((p.bpm - minB) / range) * (th - 8);
+        const px = tx + 14 + (i / (trend.length - 1)) * plotW;
+        const py = y + 118 - ((p.bpm - minB) / range) * 90;
         if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
       }
       ctx.stroke();
-      ctx.shadowBlur = 0;
-
-      ctx.textAlign = 'right';
+      ctx.restore();
+      ctx.font = `9px ${CONFIG.FONT}`;
       ctx.fillStyle = COLORS.TEXT_SECONDARY;
-      ctx.fillText(`${Math.round(minB)}–${Math.round(maxB)} bpm`, tx + tw - 6, ty + 11);
+      ctx.textAlign = 'left';
+      ctx.fillText(`min ${Math.round(minB)}`, tx + 14, y + 46);
+      ctx.textAlign = 'right';
+      ctx.fillText(`max ${Math.round(maxB)}`, tx + w - 14, y + 46);
+    } else {
+      ctx.font = `10px ${CONFIG.FONT}`;
+      ctx.fillStyle = 'rgba(143, 168, 189, 0.5)';
+      ctx.textAlign = 'center';
+      ctx.fillText('ACUMULANDO DATOS…', tx + w / 2, y + 90);
+    }
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(tx + 10, y + 132);
+    ctx.lineTo(tx + w - 10, y + 132);
+    ctx.stroke();
+    cardLabel(ctx, 'VARIABILIDAD HRV', tx + 14, y + 154, COLORS.TEXT_SECONDARY);
+    const hrv = hrvDisplayRef.current;
+    const ibi = ibiDisplayRef.current;
+    const meanRR = rrIntervals && rrIntervals.length > 0
+      ? Math.round(rrIntervals.reduce((a, b) => a + b, 0) / rrIntervals.length)
+      : 0;
+    ctx.font = `bold 30px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.IBI_TEXT;
+    ctx.textAlign = 'left';
+    ctx.fillText(ibi > 0 ? `${ibi}` : '--', tx + 14, y + 196);
+    ctx.font = `10px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText('ms IBI', tx + (ibi > 0 ? 84 : 54), y + 196);
+    ctx.font = `12px ${CONFIG.FONT}`;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText(`SDNN ${hrv.sdnn > 0 ? hrv.sdnn + 'ms' : '--'}`, tx + 14, y + 230);
+    ctx.fillText(`RMSSD ${hrv.rmssd > 0 ? hrv.rmssd + 'ms' : '--'}`, tx + 14, y + 252);
+    ctx.fillStyle = COLORS.IBI_TEXT;
+    ctx.fillText(`x̄ RR ${meanRR > 0 ? meanRR + 'ms' : '--'}`, tx + 14, y + 274);
+    const stats = bpmStatsRef.current;
+    const meanBpm = stats.n > 0 ? Math.round(stats.sum / stats.n) : 0;
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText(`PR x̄ ${meanBpm || '--'} bpm`, tx + 14, y + 296);
+
+    // ---- Derecha: tacograma RR + historial de latidos ----
+    const rx = gap * 2 + w;
+    drawGlassPanel(ctx, rx, y, w, h, 'rgba(77, 215, 254, 0.25)', 'rgba(77, 215, 254, 0.25)');
+    cardLabel(ctx, 'TACOGRAMA RR', rx + 14, y + 22, COLORS.TEXT_SECONDARY);
+    if (rrIntervals && rrIntervals.length >= 2) {
+      const rrRecent = rrIntervals.slice(-60);
+      let rrMin = Infinity;
+      let rrMax = -Infinity;
+      for (const v of rrRecent) {
+        if (v < rrMin) rrMin = v;
+        if (v > rrMax) rrMax = v;
+      }
+      const rrRange = Math.max(80, rrMax - rrMin);
+      const px0 = rx + 14;
+      const py0 = y + 34;
+      const pw = w - 28;
+      const ph = 84;
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+      ctx.fillRect(px0, py0, pw, ph);
+      ctx.beginPath();
+      ctx.strokeStyle = COLORS.ACCENT_CYAN;
+      ctx.lineWidth = 1.6;
+      ctx.save();
+      ctx.shadowColor = 'rgba(77, 215, 254, 0.4)';
+      ctx.shadowBlur = 6;
+      for (let i = 0; i < rrRecent.length; i++) {
+        const px = px0 + 2 + (i / (rrRecent.length - 1)) * (pw - 4);
+        const py = py0 + ph - 4 - ((rrRecent[i] - rrMin) / rrRange) * (ph - 8);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.restore();
+      ctx.font = `9px ${CONFIG.FONT}`;
+      ctx.fillStyle = COLORS.TEXT_SECONDARY;
+      ctx.textAlign = 'left';
+      ctx.fillText(`${Math.round(rrMin)}ms`, px0 + 2, py0 + ph - 8);
+      ctx.textAlign = 'right';
+      ctx.fillText(`${Math.round(rrMax)}ms`, px0 + pw - 2, py0 + 12);
     }
 
-    ctx.font = '9px "SF Mono", Consolas, monospace';
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(rx + 10, y + 132);
+    ctx.lineTo(rx + w - 10, y + 132);
+    ctx.stroke();
+    cardLabel(ctx, 'HISTORIAL DE LATIDOS', rx + 14, y + 154, COLORS.TEXT_SECONDARY);
+    const beatHistory = beatHistoryRef.current;
+    const arrCount = beatHistory.filter(b => b.isArrhythmia).length;
+    const normalCount = beatHistory.length - arrCount;
+    ctx.font = `9px ${CONFIG.FONT}`;
+    ctx.textAlign = 'right';
+    ctx.fillStyle = COLORS.SIGNAL_NORMAL;
+    ctx.fillText(`N:${normalCount}`, rx + w - 14, y + 154);
+    ctx.fillStyle = arrCount > 0 ? COLORS.SIGNAL_ARRHYTHMIA : COLORS.TEXT_SECONDARY;
+    ctx.fillText(` A:${arrCount}`, rx + w - 60, y + 154);
+
+    const dotSpacing = 26;
+    const totalWidth = beatHistory.length * dotSpacing;
+    const startX = rx + w / 2 - totalWidth / 2;
+    const cy = y + 210;
+    for (let i = 0; i < beatHistory.length; i++) {
+      const beat = beatHistory[i];
+      const cx = startX + i * dotSpacing + dotSpacing / 2;
+      if (beat.isArrhythmia) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 93, 93, 0.2)';
+        ctx.fill();
+      }
+      const dg = ctx.createRadialGradient(cx - 2, cy - 2, 1, cx, cy, 7);
+      dg.addColorStop(0, '#ffffff');
+      dg.addColorStop(0.4, beat.isArrhythmia ? COLORS.SIGNAL_ARRHYTHMIA : COLORS.SIGNAL_NORMAL);
+      dg.addColorStop(1, beat.isArrhythmia ? '#7f1d1d' : '#0f5132');
+      ctx.beginPath();
+      ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+      ctx.fillStyle = dg;
+      ctx.fill();
+      ctx.font = `bold 7px ${CONFIG.FONT}`;
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${i + 1}`, cx, cy + 3);
+    }
+    if (beatHistory.length === 0) {
+      ctx.font = `10px ${CONFIG.FONT}`;
+      ctx.fillStyle = 'rgba(143, 168, 189, 0.5)';
+      ctx.textAlign = 'center';
+      ctx.fillText('—', rx + w / 2, cy + 4);
+    }
+
+    // Tachograma compacto de barras (últimas RR) bajo el historial
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(rx + 10, y + 240);
+    ctx.lineTo(rx + w - 10, y + 240);
+    ctx.stroke();
+    cardLabel(ctx, 'ÚLTIMOS IBI', rx + 14, y + 262, COLORS.TEXT_SECONDARY);
+    if (rrIntervals && rrIntervals.length > 0) {
+      const rrLast = rrIntervals.slice(-14);
+      let mx = 0;
+      for (const v of rrLast) if (v > mx) mx = v;
+      const bx0 = rx + 14;
+      const by0 = y + 286;
+      const bW = (w - 28) / rrLast.length;
+      for (let i = 0; i < rrLast.length; i++) {
+        const bh = 14 + (rrLast[i] / Math.max(mx, 1)) * 16;
+        const g = ctx.createLinearGradient(0, by0 - bh, 0, by0);
+        g.addColorStop(0, 'rgba(77, 215, 254, 0.5)');
+        g.addColorStop(1, 'rgba(77, 215, 254, 0.1)');
+        ctx.fillStyle = g;
+        ctx.fillRect(bx0 + i * bW + 2, by0 - bh, Math.max(2, bW - 4), bh);
+      }
+    }
+  }, []);
+
+  // ---------- Pie ----------
+  const drawFooter = useCallback((ctx: CanvasRenderingContext2D) => {
+    const { COLORS } = CONFIG;
+    const { bpm, spo2 } = propsRef.current;
+
+    ctx.font = `9px ${CONFIG.FONT}`;
     ctx.textAlign = 'left';
-    const fy = H - 8;
-    ctx.fillText('SWEEP 25mm/s   GAIN ×1.0   FILTRO 0.5–4 Hz   FUENTE PPG/RG', panelX + 10, fy);
+    const lx = 14;
+    const ly = 1666;
+
+    ctx.fillStyle = COLORS.SIGNAL_NORMAL;
+    ctx.fillRect(lx, ly - 6, 15, 3);
+    ctx.beginPath();
+    ctx.arc(lx + 22, ly - 4, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText('Normal (N)', lx + 30, ly);
+
+    ctx.fillStyle = COLORS.SIGNAL_ARRHYTHMIA;
+    ctx.fillRect(lx + 108, ly - 6, 15, 3);
+    ctx.beginPath();
+    ctx.arc(lx + 130, ly - 4, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText('Arritmia (A)', lx + 138, ly);
+
+    ctx.beginPath();
+    ctx.arc(lx + 226, ly - 4, 4, 0, Math.PI * 2);
+    ctx.fillStyle = COLORS.SIGNAL_NORMAL;
+    ctx.fill();
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText('Pico', lx + 236, ly);
+
+    ctx.beginPath();
+    ctx.moveTo(lx + 268, ly - 6);
+    ctx.lineTo(lx + 264, ly);
+    ctx.lineTo(lx + 272, ly);
+    ctx.closePath();
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fill();
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText('Valle', lx + 278, ly);
+
+    ctx.fillStyle = COLORS.IBI_TEXT;
+    ctx.fillRect(lx + 310, ly - 5, 12, 2);
+    ctx.fillStyle = COLORS.TEXT_SECONDARY;
+    ctx.fillText('IBI', lx + 328, ly);
+
+    ctx.fillStyle = COLORS.SCALE_TEXT;
+    ctx.fillText('SWEEP 25mm/s · FILTRO 0.5–4 Hz · FUENTE PPG/RG', 420, ly);
+
     ctx.textAlign = 'right';
     const alarms: string[] = [];
-    if (bpm > 0 && (bpm < 50 || bpm > 120)) alarms.push(`HR!`);
-    if (spo2 > 0 && spo2 < 92) alarms.push(`SpO₂!`);
-    if (map > 0 && (map < 65 || map > 110)) alarms.push(`MAP!`);
+    if (bpm > 0 && (bpm < 50 || bpm > 120)) alarms.push('HR!');
+    if (spo2 > 0 && spo2 < 92) alarms.push('SpO₂!');
+    const sys = propsRef.current.pressure?.systolic || 0;
+    const dia = propsRef.current.pressure?.diastolic || 0;
+    const map = sys > 0 && dia > 0 ? Math.round(dia + (sys - dia) / 3) : 0;
+    if (map > 0 && (map < 65 || map > 110)) alarms.push('MAP!');
     if (alarms.length > 0) {
       const pulse = (Math.sin(Date.now() / 180) + 1) / 2;
       ctx.save();
       ctx.shadowColor = `rgba(255, 93, 93, ${0.3 + pulse * 0.6})`;
       ctx.shadowBlur = 12;
       ctx.fillStyle = COLORS.TEXT_DANGER;
-      ctx.fillText(`⚠ ALARMAS: ${alarms.join(' ')}`, panelX + panelW - 10, fy);
+      ctx.fillText(`⚠ ALARMAS: ${alarms.join(' ')}`, 826, ly);
       ctx.restore();
     } else {
       ctx.fillStyle = COLORS.TEXT_PRIMARY;
-      ctx.fillText('● SIN ALARMAS', panelX + panelW - 10, fy);
+      ctx.fillText('● SIN ALARMAS', 826, ly);
     }
   }, []);
 
+  // ---------- Sincronización de props ----------
   useEffect(() => {
     propsRef.current = { value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure };
     
@@ -814,17 +1195,6 @@ const PPGSignalMeter = ({
   }, [value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure]);
 
   useEffect(() => {
-    if (isPeak && isFingerDetected) {
-      const now = Date.now();
-      if (now - lastPeakTimeRef.current > 250) {
-        lastPeakTimeRef.current = now;
-        setShowPulse(true);
-        setTimeout(() => setShowPulse(false), 120);
-      }
-    }
-  }, [isPeak, isFingerDetected]);
-
-  useEffect(() => {
     if (!dataBufferRef.current) {
       dataBufferRef.current = new CircularBuffer(CONFIG.BUFFER_SIZE);
     }
@@ -840,506 +1210,30 @@ const PPGSignalMeter = ({
     }
   }, [preserveResults, isFingerDetected]);
 
+  // ---------- Bucle de render ----------
   const render = useCallback(() => {
     const canvas = canvasRef.current;
-    const buffer = dataBufferRef.current;
-    if (!canvas || !buffer) {
-      return;
-    }
-    
+    if (!canvas) return;
     const ctx = canvas.getContext('2d', { alpha: false });
-    if (!ctx) {
-      return;
-    }
-    
+    if (!ctx) return;
+
     const now = Date.now();
 
-    const { value: signalValue, isFingerDetected: detected, arrhythmiaStatus: arrStatus, preserveResults: preserve, isPeak: peak } = propsRef.current;
-    const plot = getPlotArea();
-    const { WINDOW_MS, COLORS } = CONFIG;
-    
-    ensureGridCache(ctx);
-    
-    // Los paneles deben redibujarse en CADA frame: ensureGridCache repinta el
-    // fondo opaco, que borraría lo dibujado en el frame anterior.
-    drawAmplitudeScale(ctx);
-    drawTimeScale(ctx);
-    drawVitalInfo(ctx, now);
-    drawClinicalPanel(ctx);
-    
-    if (preserve && !detected) {
-      ensureScanlineCache();
-      if (scanlineCacheRef.current) ctx.drawImage(scanlineCacheRef.current, 0, 0);
-      return;
-    }
-    
-    const scaledValue = signalValue * 2;
-    
-    if (peak) {
-      const currentCount = arrStatus ? parseInt(arrStatus.split('|')[1] || '0') : 0;
-      if (currentCount > lastArrhythmiaCountRef.current) {
-        beatArrhythmiaRef.current = true;
-        lastArrhythmiaCountRef.current = currentCount;
-        
-        const { rrIntervals: rr } = propsRef.current;
-        const lastRR = rr && rr.length > 0 ? rr[rr.length - 1] : 800;
-        const retroDuration = Math.min(Math.max(lastRR, 400), 1500);
-        buffer.markArrhythmiaBack(retroDuration);
-      } else {
-        beatArrhythmiaRef.current = false;
-      }
-      beatHistoryRef.current.push({ isArrhythmia: beatArrhythmiaRef.current, time: now });
-      if (beatHistoryRef.current.length > 20) {
-        beatHistoryRef.current = beatHistoryRef.current.slice(-20);
-      }
-    }
-    const currentIsArrhythmia = beatArrhythmiaRef.current;
-    
-    buffer.push({
-      time: now,
-      value: scaledValue,
-      isArrhythmia: currentIsArrhythmia
-    });
-    
-    const points = buffer.getPoints();
-    if (points.length > 30) {
-      let min = Infinity;
-      let max = -Infinity;
-      const recentPoints = points.length > 150 ? points.slice(-150) : points;
-      for (let i = 0; i < recentPoints.length; i++) {
-        const v = recentPoints[i].value;
-        if (v < min) min = v;
-        if (v > max) max = v;
-      }
-      const range = Math.max(40, max - min);
-      const stats = amplitudeStatsRef.current;
-      stats.min = stats.min * 0.95 + (min - range * 0.1) * 0.05;
-      stats.max = stats.max * 0.95 + (max + range * 0.1) * 0.05;
-      stats.range = stats.max - stats.min;
-    }
-    
-    const stats = amplitudeStatsRef.current;
-    
-    if (points.length > 2) {
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-      
-      const pathCoords: { x: number; y: number; isArr: boolean }[] = [];
-      
-      for (let i = 0; i < points.length; i++) {
-        const pt = points[i];
-        const age = now - pt.time;
-        if (age > WINDOW_MS) continue;
-        
-        const x = plot.x + plot.width - (age * plot.width / WINDOW_MS);
-        const normalizedY = (stats.max - pt.value) / stats.range;
-        const y = plot.y + normalizedY * plot.height;
-        
-        if (x < plot.x || x > plot.x + plot.width) continue;
-        pathCoords.push({ x, y, isArr: pt.isArrhythmia });
-      }
-      
-      if (pathCoords.length > 2) {
-        // --- REFLEJO 3D: espejo de la onda bajo la línea base con desvanecido ---
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(plot.x, plot.y, plot.width, plot.height);
-        ctx.clip();
-        const reflGrad = ctx.createLinearGradient(0, plot.centerY, 0, plot.y + plot.height);
-        reflGrad.addColorStop(0, 'rgba(52, 245, 161, 0.16)');
-        reflGrad.addColorStop(0.35, 'rgba(52, 245, 161, 0.06)');
-        reflGrad.addColorStop(1, 'rgba(52, 245, 161, 0)');
-        ctx.strokeStyle = reflGrad;
-        ctx.lineWidth = 1.6;
-        ctx.beginPath();
-        let started = false;
-        for (const c of pathCoords) {
-          const my = 2 * plot.centerY - c.y;
-          if (my < plot.y + plot.height) {
-            if (!started) { ctx.moveTo(c.x, my); started = true; }
-            else ctx.lineTo(c.x, my);
-          } else {
-            started = false;
-          }
-        }
-        ctx.stroke();
-        ctx.restore();
-        
-        // --- RELLENO de área bajo la onda ---
-        ctx.save();
-        ctx.beginPath();
-        ctx.moveTo(pathCoords[0].x, plot.centerY);
-        for (const c of pathCoords) {
-          ctx.lineTo(c.x, c.y);
-        }
-        ctx.lineTo(pathCoords[pathCoords.length - 1].x, plot.centerY);
-        ctx.closePath();
-        
-        const fillGrad = ctx.createLinearGradient(0, plot.y, 0, plot.y + plot.height);
-        fillGrad.addColorStop(0, 'rgba(34, 197, 94, 0.12)');
-        fillGrad.addColorStop(0.5, 'rgba(34, 197, 94, 0.04)');
-        fillGrad.addColorStop(1, 'rgba(34, 197, 94, 0.0)');
-        ctx.fillStyle = fillGrad;
-        ctx.fill();
-        ctx.restore();
-        
-        // Segmentación de corridas normales / arritmia
-        const runs: { pts: { x: number; y: number }[]; arr: boolean }[] = [];
-        let currentRun: { x: number; y: number }[] = [];
-        let currentArr = pathCoords[0].isArr;
-        for (const c of pathCoords) {
-          if (c.isArr === currentArr) {
-            currentRun.push(c);
-          } else {
-            if (currentRun.length > 1) runs.push({ pts: currentRun, arr: currentArr });
-            currentRun = [c];
-            currentArr = c.isArr;
-          }
-        }
-        if (currentRun.length > 1) runs.push({ pts: currentRun, arr: currentArr });
-        
-        const arrRuns = runs.filter(r => r.arr);
-        for (const seg of arrRuns) {
-          ctx.save();
-          ctx.beginPath();
-          ctx.moveTo(seg.pts[0].x, plot.centerY);
-          for (const c of seg.pts) ctx.lineTo(c.x, c.y);
-          ctx.lineTo(seg.pts[seg.pts.length - 1].x, plot.centerY);
-          ctx.closePath();
-          const arrFill = ctx.createLinearGradient(0, plot.y, 0, plot.y + plot.height);
-          arrFill.addColorStop(0, 'rgba(255, 93, 93, 0.15)');
-          arrFill.addColorStop(0.5, 'rgba(255, 93, 93, 0.05)');
-          arrFill.addColorStop(1, 'rgba(255, 93, 93, 0.0)');
-          ctx.fillStyle = arrFill;
-          ctx.fill();
-          ctx.restore();
-        }
-        
-        // --- EXTRUSIÓN 3D: copias recediendo en profundidad ---
-        const ghostPasses = [
-          { dy: 26, style: COLORS.GHOST_2, width: 2 },
-          { dy: 13, style: COLORS.GHOST_1, width: 2.4 }
-        ];
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(plot.x, plot.y, plot.width, plot.height);
-        ctx.clip();
-        for (const gp of ghostPasses) {
-          ctx.strokeStyle = gp.style;
-          ctx.lineWidth = gp.width;
-          ctx.beginPath();
-          let gstarted = false;
-          for (const c of pathCoords) {
-            const gy = Math.min(plot.y + plot.height - 2, c.y + gp.dy);
-            if (!gstarted) { ctx.moveTo(c.x, gy); gstarted = true; }
-            else ctx.lineTo(c.x, gy);
-          }
-          ctx.stroke();
-        }
-        ctx.restore();
-        
-        const strokePass = (arr: boolean, width: number, alpha: number, blur: number, useCore = false) => {
-          for (const run of runs) {
-            if (run.arr !== arr) continue;
-            ctx.save();
-            ctx.beginPath();
-            ctx.moveTo(run.pts[0].x, run.pts[0].y);
-            for (let i = 1; i < run.pts.length; i++) ctx.lineTo(run.pts[i].x, run.pts[i].y);
-            ctx.globalAlpha = alpha;
-            if (blur > 0) {
-              ctx.shadowColor = arr ? COLORS.ARRHYTHMIA_GLOW : COLORS.SIGNAL_GLOW;
-              ctx.shadowBlur = blur;
-            }
-            ctx.strokeStyle = arr ? (useCore ? '#ffd9d9' : COLORS.SIGNAL_ARRHYTHMIA) : (useCore ? COLORS.SIGNAL_CORE : COLORS.SIGNAL_NORMAL);
-            ctx.lineWidth = width;
-            ctx.stroke();
-            ctx.restore();
-          }
-        };
-        
-        // Halo exterior difuso
-        strokePass(false, 8, 0.22, 22);
-        strokePass(true, 8, 0.22, 22);
-        // Trazo principal fosforescente
-        strokePass(false, 2.6, 1, 12);
-        strokePass(true, 2.6, 1, 12);
-        // Núcleo blanco-caliente
-        strokePass(false, 1.1, 0.85, 0, true);
-        strokePass(true, 1.1, 0.85, 0, true);
-        
-        // --- BARRA DE BARRIDO en el borde actual (sweep) ---
-        const edgeX = plot.x + plot.width;
-        const beamW = 90;
-        const beamGrad = ctx.createLinearGradient(edgeX - beamW, 0, edgeX, 0);
-        const beamPulse = 0.16 + 0.06 * Math.sin(now / 260);
-        beamGrad.addColorStop(0, `rgba(52, 245, 161, 0)`);
-        beamGrad.addColorStop(1, `rgba(52, 245, 161, ${beamPulse})`);
-        ctx.fillStyle = beamGrad;
-        ctx.fillRect(edgeX - beamW, plot.y, beamW, plot.height);
-        ctx.save();
-        ctx.shadowColor = 'rgba(52, 245, 161, 0.8)';
-        ctx.shadowBlur = 10;
-        ctx.fillStyle = `rgba(52, 245, 161, ${0.35 + 0.15 * Math.sin(now / 260)})`;
-        ctx.fillRect(edgeX - 1.5, plot.y, 1.5, plot.height);
-        ctx.restore();
-        
-        const peaks: { x: number; y: number; isArrhythmia: boolean; time: number }[] = [];
-        const valleys: { x: number; y: number }[] = [];
-        const history = beatHistoryRef.current;
-        const visibleBeats: { time: number; x: number; y: number; isArrhythmia: boolean }[] = [];
-        
-        for (const beat of history) {
-          const age = now - beat.time;
-          if (age > WINDOW_MS || age < 0) continue;
-          
-          const x = plot.x + plot.width - (age * plot.width / WINDOW_MS);
-          if (x < plot.x || x > plot.x + plot.width) continue;
-          
-          let closestPt: PPGDataPoint | null = null;
-          let minDist = Infinity;
-          for (let j = 0; j < points.length; j++) {
-            const pt = points[j];
-            const dist = Math.abs(pt.time - beat.time);
-            if (dist < minDist) { minDist = dist; closestPt = pt; }
-          }
-          
-          if (closestPt && minDist < 200) {
-            const normalizedY = (stats.max - closestPt.value) / stats.range;
-            const y = plot.y + normalizedY * plot.height;
-            peaks.push({ x, y, isArrhythmia: beat.isArrhythmia, time: beat.time });
-            visibleBeats.push({ time: beat.time, x, y, isArrhythmia: beat.isArrhythmia });
-          }
-        }
-        
-        for (let b = 0; b < visibleBeats.length - 1; b++) {
-          const t0 = visibleBeats[b].time;
-          const t1 = visibleBeats[b + 1].time;
-          let minVal = Infinity;
-          let minPt: PPGDataPoint | null = null;
-          for (let j = 0; j < points.length; j++) {
-            const pt = points[j];
-            if (pt.time > t0 && pt.time < t1 && pt.value < minVal) {
-              minVal = pt.value;
-              minPt = pt;
-            }
-          }
-          if (minPt) {
-            const age2 = now - minPt.time;
-            const vx = plot.x + plot.width - (age2 * plot.width / WINDOW_MS);
-            const vy = plot.y + ((stats.max - minPt.value) / stats.range) * plot.height;
-            if (vx >= plot.x && vx <= plot.x + plot.width) {
-              valleys.push({ x: vx, y: vy });
-            }
-          }
-        }
-        
-        for (let i = 0; i < peaks.length - 1; i++) {
-          const p1 = peaks[i];
-          const p2 = peaks[i + 1];
-          const ibiMs = Math.abs(p1.time - p2.time);
-          if (ibiMs > 0 && ibiMs < 3000) {
-            const midX = (p1.x + p2.x) / 2;
-            const topY = Math.min(p1.y, p2.y) - 28;
-            
-            ctx.strokeStyle = 'rgba(103, 232, 249, 0.45)';
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            ctx.moveTo(p1.x, topY + 8);
-            ctx.lineTo(p1.x, topY);
-            ctx.lineTo(p2.x, topY);
-            ctx.lineTo(p2.x, topY + 8);
-            ctx.stroke();
-            
-            ctx.font = '9px "SF Mono", Consolas, monospace';
-            ctx.fillStyle = COLORS.IBI_TEXT;
-            ctx.textAlign = 'center';
-            ctx.fillText(`${ibiMs}ms`, midX, topY - 3);
-          }
-        }
-        
-        peaks.forEach(p => {
-          const color = p.isArrhythmia ? COLORS.PEAK_ARRHYTHMIA : COLORS.SIGNAL_NORMAL;
-          
-          ctx.save();
-          ctx.strokeStyle = p.isArrhythmia ? 'rgba(255, 93, 93, 0.35)' : 'rgba(34, 197, 94, 0.25)';
-          ctx.lineWidth = 1;
-          ctx.setLineDash([4, 4]);
-          ctx.beginPath();
-          ctx.moveTo(p.x, plot.y);
-          ctx.lineTo(p.x, plot.y + plot.height);
-          ctx.stroke();
-          ctx.restore();
-          
-          // Esfera 3D del pico: gradiente radial + brillo especular
-          const r = p.isArrhythmia ? 9 : 7;
-          const sg = ctx.createRadialGradient(p.x - r * 0.35, p.y - r * 0.35, r * 0.1, p.x, p.y, r);
-          sg.addColorStop(0, p.isArrhythmia ? '#ffe1e1' : '#d8ffe9');
-          sg.addColorStop(0.45, color);
-          sg.addColorStop(1, p.isArrhythmia ? '#7f1d1d' : '#0f5132');
-          ctx.save();
-          ctx.shadowColor = p.isArrhythmia ? 'rgba(255, 93, 93, 0.8)' : 'rgba(52, 245, 161, 0.8)';
-          ctx.shadowBlur = 14;
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-          ctx.fillStyle = sg;
-          ctx.fill();
-          ctx.restore();
-          
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, 1.8, 0, Math.PI * 2);
-          ctx.fillStyle = '#fff';
-          ctx.fill();
-          
-          ctx.font = 'bold 11px "SF Mono", Consolas, monospace';
-          ctx.fillStyle = p.isArrhythmia ? COLORS.TEXT_DANGER : COLORS.SIGNAL_NORMAL;
-          ctx.textAlign = 'center';
-          ctx.fillText(p.isArrhythmia ? 'A' : 'N', p.x, p.y - 16);
-          
-          if (p.isArrhythmia) {
-            const alpha = (Math.sin(now / 80) + 1) / 2;
-            ctx.beginPath();
-            ctx.arc(p.x, p.y, 18, 0, Math.PI * 2);
-            ctx.strokeStyle = `rgba(255, 93, 93, ${0.3 + alpha * 0.5})`;
-            ctx.lineWidth = 2.5;
-            ctx.stroke();
-            
-            ctx.beginPath();
-            ctx.arc(p.x, p.y, 24, 0, Math.PI * 2);
-            ctx.strokeStyle = `rgba(255, 93, 93, ${0.1 + alpha * 0.2})`;
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-          }
-        });
-        
-        valleys.forEach(v => {
-          ctx.beginPath();
-          ctx.moveTo(v.x, v.y + 3);
-          ctx.lineTo(v.x - 4, v.y + 10);
-          ctx.lineTo(v.x + 4, v.y + 10);
-          ctx.closePath();
-          ctx.fillStyle = COLORS.VALLEY_COLOR;
-          ctx.fill();
-          
-          ctx.font = '8px "SF Mono", Consolas, monospace';
-          ctx.fillStyle = COLORS.VALLEY_COLOR;
-          ctx.textAlign = 'center';
-          ctx.fillText('V', v.x, v.y + 22);
-        });
-      }
-      
-      const beatHistory = beatHistoryRef.current;
-      if (beatHistory.length > 0) {
-        const histX = plot.x;
-        const histY = plot.y + plot.height + 30;
-        const dotRadius = 7;
-        const dotSpacing = 18;
-        const totalWidth = beatHistory.length * dotSpacing;
-        const startX = histX + (plot.width - totalWidth) / 2;
-        
-        ctx.fillStyle = 'rgba(6, 12, 24, 0.88)';
-        const panelPad = 8;
-        ctx.fillRect(startX - panelPad, histY - dotRadius - panelPad, totalWidth + panelPad * 2, dotRadius * 2 + panelPad * 2 + 12);
-        ctx.strokeStyle = 'rgba(100, 116, 139, 0.3)';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(startX - panelPad, histY - dotRadius - panelPad, totalWidth + panelPad * 2, dotRadius * 2 + panelPad * 2 + 12);
-        
-        ctx.font = '8px "SF Mono", Consolas, monospace';
-        ctx.fillStyle = COLORS.TEXT_SECONDARY;
-        ctx.textAlign = 'center';
-        ctx.fillText('HISTORIAL DE LATIDOS', startX + totalWidth / 2, histY - dotRadius - 1);
-        
-        const arrCount = beatHistory.filter(b => b.isArrhythmia).length;
-        const normalCount = beatHistory.length - arrCount;
-        ctx.textAlign = 'right';
-        ctx.fillStyle = COLORS.SIGNAL_NORMAL;
-        ctx.fillText(`N:${normalCount}`, startX + totalWidth + panelPad - 2, histY - dotRadius - 1);
-        ctx.fillStyle = arrCount > 0 ? COLORS.SIGNAL_ARRHYTHMIA : COLORS.TEXT_SECONDARY;
-        ctx.fillText(`A:${arrCount}`, startX - 2, histY - dotRadius - 1);
-        ctx.textAlign = 'center';
-        
-        for (let i = 0; i < beatHistory.length; i++) {
-          const beat = beatHistory[i];
-          const cx = startX + i * dotSpacing + dotSpacing / 2;
-          const cy = histY + 6;
-          
-          if (beat.isArrhythmia) {
-            ctx.beginPath();
-            ctx.arc(cx, cy, dotRadius + 3, 0, Math.PI * 2);
-            ctx.fillStyle = 'rgba(255, 93, 93, 0.25)';
-            ctx.fill();
-          }
-          
-          const dg = ctx.createRadialGradient(cx - 2, cy - 2, 1, cx, cy, dotRadius);
-          dg.addColorStop(0, '#ffffff');
-          dg.addColorStop(0.4, beat.isArrhythmia ? COLORS.SIGNAL_ARRHYTHMIA : COLORS.SIGNAL_NORMAL);
-          dg.addColorStop(1, beat.isArrhythmia ? '#7f1d1d' : '#0f5132');
-          ctx.beginPath();
-          ctx.arc(cx, cy, dotRadius, 0, Math.PI * 2);
-          ctx.fillStyle = dg;
-          ctx.fill();
-          
-          ctx.font = 'bold 7px "SF Mono", Consolas, monospace';
-          ctx.fillStyle = '#fff';
-          ctx.textAlign = 'center';
-          ctx.fillText(`${i + 1}`, cx, cy + 3);
-        }
-      }
-    }
-    
-    // Overlay CRT: scanlines + viñeta por encima de todo el canvas
+    ensureBgCache(ctx);
+    drawHeader(ctx, now);
+    drawMetricsRow(ctx, now);
+    draw3DStage(ctx, now);
+    drawAnalyticsBand(ctx);
+    drawFooter(ctx);
+
     ensureScanlineCache();
     if (scanlineCacheRef.current) ctx.drawImage(scanlineCacheRef.current, 0, 0);
-    
-    const legendY = CONFIG.CANVAS_HEIGHT - 15;
-    ctx.font = '9px "SF Mono", Consolas, monospace';
-    ctx.textAlign = 'left';
-    const lx = CONFIG.PLOT_AREA.LEFT;
-    
-    ctx.fillStyle = COLORS.SIGNAL_NORMAL;
-    ctx.fillRect(lx, legendY - 6, 15, 3);
-    ctx.beginPath();
-    ctx.arc(lx + 22, legendY - 4, 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText('Normal (N)', lx + 30, legendY);
-    
-    ctx.fillStyle = COLORS.SIGNAL_ARRHYTHMIA;
-    ctx.fillRect(lx + 110, legendY - 6, 15, 3);
-    ctx.beginPath();
-    ctx.arc(lx + 132, legendY - 4, 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText('Arritmia (A)', lx + 140, legendY);
-    
-    ctx.beginPath();
-    ctx.arc(lx + 230, legendY - 4, 4, 0, Math.PI * 2);
-    ctx.fillStyle = COLORS.PEAK_NORMAL;
-    ctx.fill();
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText('Pico', lx + 240, legendY);
-    
-    ctx.beginPath();
-    ctx.moveTo(lx + 275, legendY - 6);
-    ctx.lineTo(lx + 271, legendY);
-    ctx.lineTo(lx + 279, legendY);
-    ctx.closePath();
-    ctx.fillStyle = COLORS.VALLEY_COLOR;
-    ctx.fill();
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText('Valle', lx + 285, legendY);
-    
-    ctx.fillStyle = COLORS.IBI_TEXT;
-    ctx.fillRect(lx + 320, legendY - 5, 12, 2);
-    ctx.fillStyle = COLORS.TEXT_SECONDARY;
-    ctx.fillText('IBI', lx + 338, legendY);
-  }, [ensureGridCache, ensureScanlineCache, drawAmplitudeScale, drawTimeScale, drawVitalInfo, drawClinicalPanel, getPlotArea]);
+  }, [ensureBgCache, ensureScanlineCache, drawHeader, drawMetricsRow, draw3DStage, drawAnalyticsBand, drawFooter]);
 
   useEffect(() => {
     if (isRunningRef.current) return;
     isRunningRef.current = true;
     
-    // Bucle único con throttle: la señal se pinta a TARGET_FPS y los paneles
-    // estáticos se refrescan a media frecuencia dentro de render().
     const frameTime = 1000 / CONFIG.TARGET_FPS;
     let lastRenderTime = 0;
     
@@ -1374,7 +1268,6 @@ const PPGSignalMeter = ({
     hrvDisplayRef.current = { sdnn: 0, rmssd: 0 };
     bpmStatsRef.current = { min: 0, max: 0, sum: 0, n: 0 };
     bpmTrendRef.current = [];
-    gridDirtyRef.current = true;
     onReset();
   }, [onReset]);
 
@@ -1386,27 +1279,6 @@ const PPGSignalMeter = ({
         height={CONFIG.CANVAS_HEIGHT}
         className="w-full h-full absolute inset-0"
       />
-
-      <div className="absolute top-0 left-0 p-2 z-10 flex items-center gap-2" style={{ top: '6px', left: '138px' }}>
-        <div className={`p-1.5 rounded-full transition-all duration-100 ${
-          showPulse ? 'bg-red-500/30 scale-110' : 'bg-emerald-500/20'
-        }`}>
-          <Heart 
-            className={`w-4 h-4 transition-all duration-100 ${
-              showPulse ? 'text-red-400 scale-110' : 'text-emerald-400'
-            }`}
-            fill={showPulse ? 'currentColor' : 'none'}
-          />
-        </div>
-        <Activity className="w-3.5 h-3.5 text-emerald-400" />
-        <span className="text-[10px] font-mono text-emerald-400/80">PPG MONITOR v4</span>
-        {isMonitoring && (
-          <span className="flex items-center gap-1 text-[9px] font-mono text-red-400">
-            <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-            LIVE
-          </span>
-        )}
-      </div>
 
       <div className="fixed bottom-0 left-0 right-0 h-12 grid grid-cols-2 z-10">
         <button 
