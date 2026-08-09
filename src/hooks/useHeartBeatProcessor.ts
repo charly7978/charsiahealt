@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { HeartBeatProcessor } from '../modules/HeartBeatProcessor';
+import { AdvancedBeatDetector } from '../modules/AdvancedBeatDetector';
 import type { ContactState } from '../types/signal';
 
 interface HeartBeatResult {
@@ -23,7 +23,7 @@ interface HeartBeatResult {
  * - En UNSTABLE_CONTACT sigue procesando sin resetear historial
  */
 export const useHeartBeatProcessor = () => {
-  const processorRef = useRef<HeartBeatProcessor | null>(null);
+  const processorRef = useRef<AdvancedBeatDetector | null>(null);
   const [currentBPM, setCurrentBPM] = useState<number>(0);
   const [confidence, setConfidence] = useState<number>(0);
   const [signalQuality, setSignalQuality] = useState<number>(0);
@@ -45,7 +45,7 @@ export const useHeartBeatProcessor = () => {
     const t = Date.now().toString(36);
     const p = (performance.now() | 0).toString(36);
     sessionIdRef.current = `hb_${t}_${p}`;
-    processorRef.current = new HeartBeatProcessor();
+    processorRef.current = new AdvancedBeatDetector();
     processingStateRef.current = 'ACTIVE';
 
     return () => {

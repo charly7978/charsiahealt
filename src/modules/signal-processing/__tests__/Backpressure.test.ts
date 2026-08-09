@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { PPGSignalProcessor } from '../PPGSignalProcessor';
-import { HeartBeatProcessor } from '../../HeartBeatProcessor';
+import { AdvancedBeatDetector } from '../../AdvancedBeatDetector';
 import type { ProcessedSignal } from '../../../types/signal';
 
 type GlobalWithImageData = typeof globalThis & { ImageData?: typeof ImageData };
@@ -39,7 +39,7 @@ function runSession(stride: 3 | 4): { bpms: number[]; confidences: number[]; sig
   proc.setBackpressureConfig({ enabled: false, forceStride: stride });
   proc.start();
 
-  const hb = new HeartBeatProcessor();
+  const hb = new AdvancedBeatDetector();
   const bpms: number[] = [];
   const confidences: number[] = [];
   const fs = 30;

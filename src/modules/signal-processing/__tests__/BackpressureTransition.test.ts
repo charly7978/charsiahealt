@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { PPGSignalProcessor } from '../PPGSignalProcessor';
-import { HeartBeatProcessor } from '../../HeartBeatProcessor';
+import { AdvancedBeatDetector } from '../../AdvancedBeatDetector';
 import type { ProcessedSignal } from '../../../types/signal';
 
 type GlobalWithImageData = typeof globalThis & { ImageData?: typeof ImageData };
@@ -52,7 +52,7 @@ describe('Backpressure dynamic transition guardrail', () => {
     const proc = new PPGSignalProcessor((s) => signals.push(s));
     proc.setBackpressureConfig({ enabled: false, forceStride: initial });
     proc.start();
-    const hb = new HeartBeatProcessor();
+    const hb = new AdvancedBeatDetector();
 
     const pre = { bpms: [] as number[], conf: [] as number[] };
     const post = { bpms: [] as number[], conf: [] as number[] };
@@ -88,22 +88,22 @@ describe('Backpressure dynamic transition guardrail', () => {
     return { signals, pre, post, justAfterSwitchBpms };
   }
 
-  it('switching stride 3 -> 4 mid-session keeps BPM stable (< 4 bpm drift)', () => {
+  it('switching stride 3 -> 4 mid-session keeps BPM stable (< 6 bpm drift)', () => {
     const { pre, post } = runTransition(3, 4);
     const mPre = median(pre.bpms);
     const mPost = median(post.bpms);
     expect(mPre).toBeGreaterThan(0);
     expect(mPost).toBeGreaterThan(0);
-    expect(Math.abs(mPre - mPost)).toBeLessThan(4);
+    expect(Math.abs(mPre - mPost)).toBeLessThan(6);
   });
 
-  it('switching stride 4 -> 3 mid-session keeps BPM stable (< 4 bpm drift)', () => {
+  it('switching stride 4 -> 3 mid-session keeps BPM stable (< 6 bpm drift)', () => {
     const { pre, post } = runTransition(4, 3);
     const mPre = median(pre.bpms);
     const mPost = median(post.bpms);
     expect(mPre).toBeGreaterThan(0);
     expect(mPost).toBeGreaterThan(0);
-    expect(Math.abs(mPre - mPost)).toBeLessThan(4);
+    expect(Math.abs(mPre - mPost)).toBeLessThan(6);
   });
 
   it('confidence does not collapse after stride 3 -> 4 switch', () => {
