@@ -1,5 +1,5 @@
 
-import type { Config } from "tailwindcss";
+import type { Config, PluginAPI } from "tailwindcss";
 import animate from "tailwindcss-animate";
 
 export default {
@@ -139,14 +139,30 @@ export default {
   					height: '0.5rem'
   				}
   			},
-  			'value-glow': {
-  				'0%, 100%': {
-  					textShadow: '0 0 1px rgba(255,255,255,0.2)'
-  				},
-  				'50%': {
-  					textShadow: '0 0 20px rgba(255,255,255,0.9), 0 0 10px rgba(255,255,255,0.6)'
-  				}
-  			}
+      'value-glow': {
+        '0%, 100%': {
+          textShadow: '0 0 1px rgba(255,255,255,0.2)'
+        },
+        '50%': {
+          textShadow: '0 0 20px rgba(255,255,255,0.9), 0 0 10px rgba(255,255,255,0.6)'
+        }
+      },
+      'alarm-blink': {
+        '0%, 100%': {
+          opacity: '1'
+        },
+        '50%': {
+          opacity: '0.25'
+        }
+      },
+      'monitor-scan': {
+        '0%': {
+          transform: 'translateX(-100%)'
+        },
+        '100%': {
+          transform: 'translateX(100%)'
+        }
+      }
   		},
   		animation: {
   			'heart-beat': 'heart-beat 1s ease-in-out infinite',
@@ -189,13 +205,14 @@ export default {
   },
   plugins: [
     animate,
-    function({ addUtilities }) {
+    function(api: PluginAPI) {
+      const { addUtilities } = api;
       const newUtilities = {
         '.text-gradient-soft': {
           background: 'linear-gradient(to bottom, #FFFFFF, #F2FCE2)',
           '-webkit-background-clip': 'text',
           'background-clip': 'text',
-          'color': 'transparent',
+          color: 'transparent',
           'text-shadow': '0 0 5px rgba(255,255,255,0.3)'
         },
       }

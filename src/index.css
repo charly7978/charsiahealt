@@ -5,6 +5,17 @@
 @tailwind components;
 @tailwind utilities;
 
+@layer utilities {
+  .text-glow {
+    text-shadow: 0 0 8px currentColor, 0 0 18px currentColor;
+  }
+
+  .text-glow-strong {
+    text-shadow: 0 0 6px rgba(255, 255, 255, 0.9), 0 0 16px currentColor,
+      0 0 32px currentColor;
+  }
+}
+
 @layer base {
   :root {
     --background: 0 0% 100%;
