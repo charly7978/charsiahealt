@@ -1,274 +1,212 @@
 import * as THREE from 'three';
-import type { EcgSceneOptions, EcgChannelConfig } from './types';
+import type { EcgSceneOptions, EcgChannelConfig, MonitorLayout, SweepBeamState } from './types';
 import { EcgRibbonMesh } from './EcgRibbonMesh';
 
-/** Referencia perezosa a EcgParticles para evitar dependencia circular. */
-type ParticlesRef = { update(deltaMs: number, flowSpeed: number): void; dispose(): void };
-
-/** Config por defecto de la escena. */
-const DEFAULT_OPTIONS: EcgSceneOptions = {
-  backgroundColor: 0x000a05,
-  fogNear: 700,
-  fogFar: 1700,
-  pixelRatioCap: 2,
-  antialias: true,
-  powerPreference: 'high-performance',
-};
-
-/**
- * Gestor de la escena WebGL three.js del monitor.
- *
- * Crea renderer, cámara perspectiva, luces (direccional pulsante por latido
- * + ambiente), niebla lineal, plano de rejilla en XZ y el haz de barrido
- * (plano traslúcido con ShaderMaterial). Gestiona el loop rAF, resize con
- * cap de pixel ratio y dispose estricto (sin fugas de contexto WebGL).
- */
 export class EcgSceneManager {
-  readonly renderer: THREE.WebGLRenderer;
-  readonly scene: THREE.Scene;
-  readonly camera: THREE.PerspectiveCamera;
-
   private readonly container: HTMLDivElement;
   private readonly options: EcgSceneOptions;
+  private readonly layout: MonitorLayout;
 
-  private readonly channels: EcgRibbonMesh[] = [];
-  private readonly particleSystems: ParticlesRef[] = [];
-
-  private readonly dirLight: THREE.DirectionalLight;
-
-  private beam: THREE.Mesh | null = null;
-  private beamUniforms: { uProgress: { value: number }; uIntensity: { value: number } } | null = null;
-
-  private rafId = 0;
-  private running = false;
-  private lastFrameTime = 0;
+  private renderer: THREE.WebGLRenderer | null = null;
+  private scene: THREE.Scene | null = null;
+  private camera: THREE.PerspectiveCamera | null = null;
+  private animationId: number | null = null;
   private disposed = false;
 
-  /** Pulso de luz por latido (0..1), animado con damp en el loop. */
+  private ecgMesh: EcgRibbonMesh | null = null;
+  private ppgMesh: EcgRibbonMesh | null = null;
+  private particles: THREE.Points | null = null;
+
+  private readonly sweepBeam: SweepBeamState = {
+    positionZ: 0,
+    intensity: 0,
+    lastPeakTime: 0,
+  };
+
+  private readonly clock = new THREE.Clock();
   private beatPulse = 0;
-  /** Posición del haz de barrido (0..1). */
-  private beamProgress = 0;
 
-  constructor(container: HTMLDivElement, options?: Partial<EcgSceneOptions>) {
+  constructor(container: HTMLDivElement, options: EcgSceneOptions, layout: MonitorLayout) {
     this.container = container;
-    this.options = { ...DEFAULT_OPTIONS, ...options };
-
-    // --- Renderer ---
-    if (this.options.renderer) {
-      this.renderer = this.options.renderer;
-    } else {
-      this.renderer = new THREE.WebGLRenderer({
-        antialias: this.options.antialias,
-        alpha: false,
-        powerPreference: this.options.powerPreference,
-      });
-    }
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.options.pixelRatioCap));
-    this.renderer.setClearColor(this.options.backgroundColor, 1);
-    this.renderer.domElement.style.display = 'block';
-    this.renderer.domElement.style.width = '100%';
-    this.renderer.domElement.style.height = '100%';
-    this.container.appendChild(this.renderer.domElement);
-
-    // --- Escena + niebla ---
-    this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(this.options.backgroundColor);
-    this.scene.fog = new THREE.Fog(this.options.backgroundColor, this.options.fogNear, this.options.fogFar);
-
-    // --- Cámara ---
-    this.camera = new THREE.PerspectiveCamera(45, 1, 1, 4000);
-    this.camera.position.set(0, 240, 1050);
-    this.camera.lookAt(0, 0, -300);
-
-    // --- Luces ---
-    this.dirLight = new THREE.DirectionalLight(0xffffff, 0.85);
-    this.dirLight.position.set(300, 900, 700);
-    this.scene.add(this.dirLight);
-
-    const ambient = new THREE.AmbientLight(0x223322, 0.45);
-    this.scene.add(ambient);
-
-    this.buildGrid();
-    this.buildBeam();
-
-    // Resize inicial.
-    const rect = container.getBoundingClientRect();
-    this.resize(
-      rect.width || container.clientWidth || 1,
-      rect.height || container.clientHeight || 1
-    );
+    this.options = options;
+    this.layout = layout;
+    this.init();
   }
 
-  /** Crea un canal (cinta) y la registra en la escena. */
-  createChannel(channel: EcgChannelConfig): EcgRibbonMesh {
-    const mesh = new EcgRibbonMesh(this.scene, channel);
-    this.channels.push(mesh);
+  private init(): void {
+    const width = this.container.clientWidth || window.innerWidth;
+    const height = this.container.clientHeight || window.innerHeight;
+
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: this.options.antialias,
+      powerPreference: this.options.powerPreference,
+      alpha: false,
+    });
+    this.renderer.setSize(width, height);
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.options.pixelRatioCap));
+    this.renderer.setClearColor(this.options.backgroundColor);
+    this.container.appendChild(this.renderer.domElement);
+
+    this.scene = new THREE.Scene();
+    this.scene.fog = new THREE.Fog(this.options.backgroundColor, this.options.fogNear, this.options.fogFar);
+
+    this.camera = new THREE.PerspectiveCamera(45, width / Math.max(height, 1), 10, 5000);
+    this.camera.position.set(0, -180, 1400);
+    this.camera.lookAt(0, 0, 0);
+
+    const ambient = new THREE.AmbientLight('#445566', 0.6);
+    this.scene.add(ambient);
+
+    const directional = new THREE.DirectionalLight('#ffffff', 0.9);
+    directional.position.set(200, -300, 900);
+    this.scene.add(directional);
+
+    const point = new THREE.PointLight('#00ff88', 0.7, 1600);
+    point.position.set(0, -120, 700);
+    this.scene.add(point);
+
+    this.addGrid();
+    this.addSweepBeam();
+
+    window.addEventListener('resize', this.onResize);
+  }
+
+  private addGrid(): void {
+    if (!this.scene) return;
+    const grid = new THREE.GridHelper(1800, 36, '#1a3a2a', '#0d1f16');
+    grid.position.y = 400;
+    grid.position.z = -300;
+    this.scene.add(grid);
+  }
+
+  private addSweepBeam(): void {
+    if (!this.scene) return;
+    const geometry = new THREE.PlaneGeometry(80, 1600);
+    const material = new THREE.MeshBasicMaterial({
+      color: '#00ff88',
+      transparent: true,
+      opacity: 0.12,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const beam = new THREE.Mesh(geometry, material);
+    beam.position.set(0, 0, 0);
+    this.scene.add(beam);
+  }
+
+  createChannel(config: EcgChannelConfig): EcgRibbonMesh {
+    if (!this.scene) throw new Error('Scene not initialized');
+    const mesh = new EcgRibbonMesh(this.scene, config);
+    if (config.color === 0x00ff88) {
+      this.ecgMesh = mesh;
+    } else {
+      this.ppgMesh = mesh;
+    }
     return mesh;
   }
 
-  /** Añade un sistema de partículas a la escena. */
-  addParticles(system: ParticlesRef): void {
-    this.particleSystems.push(system);
+  addParticles(particles: THREE.Points): void {
+    if (!this.scene) return;
+    this.particles = particles;
+    this.scene.add(particles);
   }
 
-  /** Avanza el haz de barrido y su intensidad por latido. */
   setSweep(positionZ: number, intensity: number): void {
-    this.beamProgress = Math.max(0, Math.min(1, positionZ));
-    this.beatPulse = Math.max(this.beatPulse, Math.max(0, Math.min(1, intensity)));
+    this.sweepBeam.positionZ = positionZ;
+    this.sweepBeam.intensity = intensity;
+    this.sweepBeam.lastPeakTime = Date.now();
   }
 
-  /** Actualiza el tamaño del renderer y la relación de aspecto de la cámara. */
-  resize(width: number, height: number): void {
-    const w = Math.max(1, width);
-    const h = Math.max(1, height);
-    this.renderer.setSize(w, h, false);
-    this.camera.aspect = w / h;
+  triggerBeatPulse(intensity = 1): void {
+    this.beatPulse = clamp(intensity, 0, 1);
+  }
+
+  private onResize = (): void => {
+    if (!this.renderer || !this.camera || !this.container) return;
+    const width = this.container.clientWidth || window.innerWidth;
+    const height = this.container.clientHeight || window.innerHeight;
+    this.renderer.setSize(width, height);
+    this.camera.aspect = width / Math.max(height, 1);
     this.camera.updateProjectionMatrix();
-  }
+  };
 
-  /** Inicia el loop rAF. */
   start(): void {
-    if (this.running || this.disposed) return;
-    this.running = true;
-    this.lastFrameTime = performance.now();
-    this.rafId = requestAnimationFrame(this.loop);
+    if (this.disposed || !this.renderer || !this.scene || !this.camera) return;
+    const animate = () => {
+      if (this.disposed) return;
+      this.animationId = requestAnimationFrame(animate);
+
+      const delta = this.clock.getDelta();
+      const now = Date.now();
+
+      if (this.ecgMesh) this.ecgMesh.update(delta);
+      if (this.ppgMesh) this.ppgMesh.update(delta);
+
+      if (this.particles) {
+        this.particles.rotation.y += delta * 0.05;
+      }
+
+      if (this.beatPulse > 0.01) {
+        if (this.ecgMesh) this.ecgMesh.setBeatPulse(this.beatPulse);
+        if (this.ppgMesh) this.ppgMesh.setBeatPulse(this.beatPulse);
+        this.beatPulse *= 0.92;
+      } else {
+        this.beatPulse = 0;
+        if (this.ecgMesh) this.ecgMesh.setBeatPulse(0);
+        if (this.ppgMesh) this.ppgMesh.setBeatPulse(0);
+      }
+
+      this.renderer.render(this.scene, this.camera);
+    };
+    animate();
   }
 
-  /** Detiene el loop rAF. */
   stop(): void {
-    this.running = false;
-    if (this.rafId) {
-      cancelAnimationFrame(this.rafId);
-      this.rafId = 0;
+    if (this.animationId !== null) {
+      cancelAnimationFrame(this.animationId);
+      this.animationId = null;
     }
   }
 
-  /** Libera renderer, geometrías, materiales y detecta un eventual doble dispose. */
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.stop();
 
-    for (const channel of this.channels) channel.dispose();
-    for (const particles of this.particleSystems) particles.dispose();
+    window.removeEventListener('resize', this.onResize);
 
-    if (this.beam) {
-      this.scene.remove(this.beam);
-      this.beam.geometry.dispose();
-      const mat = this.beam.material as THREE.ShaderMaterial;
-      if (mat) mat.dispose();
-      this.beam = null;
+    if (this.ecgMesh) {
+      this.ecgMesh.dispose();
+      this.ecgMesh = null;
     }
-
-    // Dispose de cualquier material/geometría restante en la escena.
-    const disposedGeometries = new Set<THREE.BufferGeometry>();
-    const disposedMaterials = new Set<THREE.Material>();
-    this.scene.traverse((obj) => {
-      const mesh = obj as THREE.Mesh;
-      if (mesh.isMesh && mesh.geometry && !disposedGeometries.has(mesh.geometry)) {
-        mesh.geometry.dispose();
-        disposedGeometries.add(mesh.geometry);
+    if (this.ppgMesh) {
+      this.ppgMesh.dispose();
+      this.ppgMesh = null;
+    }
+    if (this.particles) {
+      this.particles.geometry.dispose();
+      if (Array.isArray(this.particles.material)) {
+        this.particles.material.forEach((m) => m.dispose());
+      } else {
+        this.particles.material.dispose();
       }
-      const mat = (mesh as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
-      if (mat) {
-        const mats = Array.isArray(mat) ? mat : [mat];
-        for (const m of mats) {
-          if (m && !disposedMaterials.has(m)) {
-            m.dispose();
-            disposedMaterials.add(m);
-          }
-        }
+      this.particles = null;
+    }
+    if (this.scene) {
+      this.scene.clear();
+      this.scene = null;
+    }
+    if (this.renderer) {
+      this.renderer.dispose();
+      if (this.renderer.domElement.parentNode) {
+        this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
       }
-    });
-
-    if (this.renderer.domElement.parentElement === this.container) {
-      this.container.removeChild(this.renderer.domElement);
+      this.renderer = null;
     }
-    this.renderer.dispose();
+    this.camera = null;
   }
+}
 
-  /** Loop principal. */
-  private readonly loop = (now: number) => {
-    if (!this.running || this.disposed) return;
-    const dt = Math.max(0, now - this.lastFrameTime);
-    this.lastFrameTime = now;
-
-    // ~60fps; por debajo de 30fps el dt se acota para no "saltar" la cinta.
-    const dtClamped = Math.min(dt, 64);
-
-    for (const channel of this.channels) {
-      channel.advance(now);
-      channel.update(dtClamped);
-    }
-    for (const system of this.particleSystems) {
-      system.update(dtClamped, 1);
-    }
-
-    // Pulso de luz suave (damp) por latido.
-    this.beatPulse = THREE.MathUtils.damp(this.beatPulse, 0, 6, dtClamped / 1000);
-    this.dirLight.intensity = 0.85 + this.beatPulse * 0.9;
-
-    // Haz de barrido: avanza y pulsea.
-    if (this.beamUniforms && this.beam) {
-      this.beamUniforms.uProgress.value = this.beamProgress;
-      this.beamUniforms.uIntensity.value = 0.25 + this.beatPulse * 0.6;
-
-      this.beamProgress += dtClamped / 2800; // ~2.8s por barrido
-      if (this.beamProgress > 1) this.beamProgress = 0;
-    }
-
-    this.renderer.render(this.scene, this.camera);
-    this.rafId = requestAnimationFrame(this.loop);
-  };
-
-  /** Construye la rejilla en el plano XZ (fondo del monitor). */
-  private buildGrid(): void {
-    const grid = new THREE.GridHelper(1900, 24, 0x00ff88, 0x00aa55);
-    const mat = grid.material as THREE.Material;
-    mat.transparent = true;
-    mat.opacity = 0.07;
-    mat.depthWrite = false;
-    grid.position.set(0, -560, -760);
-    this.scene.add(grid);
-  }
-
-  /** Construye el haz de barrido (plano traslúcido con ShaderMaterial). */
-  private buildBeam(): void {
-    const geo = new THREE.PlaneGeometry(2000, 1600);
-    const uniforms = {
-      uProgress: { value: 0 },
-      uIntensity: { value: 0.3 },
-      uColor: { value: new THREE.Color(0x00ff88) },
-    };
-    const mat = new THREE.ShaderMaterial({
-      uniforms,
-      transparent: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      vertexShader: `
-        varying vec2 vUv;
-        void main() {
-          vUv = uv;
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        uniform float uProgress;
-        uniform float uIntensity;
-        uniform vec3 uColor;
-        varying vec2 vUv;
-        void main() {
-          float dist = abs(vUv.x - uProgress);
-          float glow = exp(-dist * 26.0) * uIntensity;
-          float edge = smoothstep(0.02, 0.0, dist) * uIntensity * 0.35;
-          gl_FragColor = vec4(uColor * (glow + edge), glow + edge);
-        }
-      `,
-    });
-    this.beam = new THREE.Mesh(geo, mat);
-    this.beam.position.set(0, 0, 0);
-    this.beam.rotation.y = -Math.PI / 2; // plano perpendicular a X (barrido vertical)
-    this.beamUniforms = uniforms;
-    this.scene.add(this.beam);
-  }
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }

@@ -1,5 +1,11 @@
 import React, { useEffect, useRef, useCallback } from 'react';
-import { CircularBuffer, PPGDataPoint } from '../utils/CircularBuffer';
+import * as THREE from 'three';
+import { ECGWaveformSynthesizer } from '../modules/ecg/ECGWaveformSynthesizer';
+import { rhythmFromStatus } from '../modules/ecg/ECGComplexModel';
+import { EcgSceneManager } from '../render/ecg/EcgSceneManager';
+import { EcgRibbonMesh } from '../render/ecg/EcgRibbonMesh';
+import { EcgParticles } from '../render/ecg/EcgParticles';
+import type { EcgChannelConfig, MonitorLayout } from '../render/ecg/types';
 
 interface PPGSignalMeterProps {
   value: number;
@@ -41,81 +47,38 @@ const CONFIG = {
   GRID_MAJOR: 'rgba(0, 255, 136, 0.08)',
   GRID_MINOR: 'rgba(0, 255, 136, 0.03)',
   BASELINE_COLOR: 'rgba(0, 255, 136, 0.22)',
-  PEAK_POSITIVE_COLOR: '#00ff88',
-  PEAK_NEGATIVE_COLOR: '#4df0ff',
-  ANATOMY_LINE_WIDTH: 2.4,
 };
 
-const DEG = Math.PI / 180;
-
-const pitchYaw = (now: number) => {
-  const pitch = (34 + 2.2 * Math.sin(now / 9400)) * DEG;
-  const yaw = 2.4 * Math.sin(now / 12600 + 1.7) * DEG;
-  const cth = Math.cos(pitch);
-  const sth = Math.sin(pitch);
-  const cph = Math.cos(yaw);
-  const sph = Math.sin(yaw);
-  return { cth, sth, cph, sph, H: 700, D: 2600, F: 2350, cx: 420, cy: 700 };
+const ECG_CHANNEL: EcgChannelConfig = {
+  baseY: 120,
+  amplitude: 1520,
+  width: 840,
+  depth: 900,
+  timeWindowMs: 3200,
+  depthSpanMs: 130,
+  color: 0x00ff88,
+  emissive: 0x00ff88,
+  ribbonSegments: 260,
+  ribbonSubSegments: 6,
 };
 
-const project = (x: number, y: number, z: number, cam: ReturnType<typeof pitchYaw>) => {
-  const zr = -x * cam.sph + z * cam.cph;
-  const xr = x * cam.cph + z * cam.sph;
-  const yw = y - cam.H;
-  const y1 = yw * cam.cth - zr * cam.sth;
-  const z2 = yw * cam.sth + zr * cam.cth;
-  const zc = cam.D - z2;
-  const inv = cam.F / zc;
-  return { sx: cam.cx + xr * inv, sy: cam.cy - y1 * inv, zc };
+const PPG_CHANNEL: EcgChannelConfig = {
+  baseY: -120,
+  amplitude: 1100,
+  width: 840,
+  depth: 900,
+  timeWindowMs: 3200,
+  depthSpanMs: 130,
+  color: 0xff7050,
+  emissive: 0xff4500,
+  ribbonSegments: 260,
+  ribbonSubSegments: 6,
 };
 
-const cardiacModel = (t: number) => {
-  const cycle = t % 1;
-  let y = 0;
-  let tag: 'p' | 'q' | 'r' | 's' | 't' | 'baseline' = 'baseline';
-
-  if (cycle < 0.08) {
-    y = 0.18 * Math.sin((cycle / 0.08) * Math.PI);
-    tag = 'p';
-  } else if (cycle < 0.12) {
-    const k = (cycle - 0.08) / 0.04;
-    y = 0.18 * (1 - k) - 0.22 * k;
-    tag = 'q';
-  } else if (cycle < 0.18) {
-    const k = (cycle - 0.12) / 0.06;
-    y = -0.22 + 1.18 * Math.sin(k * Math.PI);
-    tag = 'r';
-  } else if (cycle < 0.24) {
-    const k = (cycle - 0.18) / 0.06;
-    y = 0.96 - 0.34 * Math.sin(k * Math.PI);
-    tag = 's';
-  } else if (cycle < 0.38) {
-    const k = (cycle - 0.24) / 0.14;
-    y = 0.28 * Math.sin(k * Math.PI);
-    tag = 't';
-  } else {
-    y = 0;
-    tag = 'baseline';
-  }
-  return { y, tag };
-};
-
-const beatAnnotations = (rrMs: number | undefined, bpm: number, arrStatus?: string) => {
-  const arrhythmia = !!arrStatus && arrStatus.includes('AF');
-  const pvc = !!arrStatus && arrStatus.includes('PVC');
-  const pac = !!arrStatus && arrStatus.includes('PAC');
-  const rvr = bpm > 140;
-  const brady = bpm > 0 && bpm < 60;
-  const tachy = bpm > 100;
-  const rrLabel = rrMs && rrMs > 0 ? `${Math.round(rrMs)} ms` : '-- ms';
-  let label = 'NSR';
-  if (arrhythmia) label = 'AF';
-  else if (pvc) label = 'PVC';
-  else if (pac) label = 'PAC';
-  else if (rvr) label = 'RVR';
-  else if (brady) label = 'BRADY';
-  else if (tachy) label = 'TACHY';
-  return { label, rrLabel };
+const LAYOUT: MonitorLayout = {
+  stage: { x0: 58, x1: 782, y0: 268, y1: 1260 },
+  ecgViewport: { y0: 280, y1: 760 },
+  ppgViewport: { y0: 780, y1: 1260 },
 };
 
 const PPGSignalMeter = ({
@@ -137,10 +100,14 @@ const PPGSignalMeter = ({
   perfusionIndex = 0,
   pressure,
 }: PPGSignalMeterProps) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const animationRef = useRef<number | null>(null);
-  const isRunningRef = useRef(false);
-  const dataBufferRef = useRef<CircularBuffer | null>(null);
+  const glContainerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
+  const sceneManagerRef = useRef<EcgSceneManager | null>(null);
+  const ecgMeshRef = useRef<EcgRibbonMesh | null>(null);
+  const ppgMeshRef = useRef<EcgRibbonMesh | null>(null);
+  const particlesRef = useRef<EcgParticles | null>(null);
+  const synthRef = useRef<ECGWaveformSynthesizer | null>(null);
+  const bgCacheRef = useRef<HTMLCanvasElement | null>(null);
 
   const propsRef = useRef({
     value,
@@ -169,14 +136,22 @@ const PPGSignalMeter = ({
   const lastHrvUpdateRef = useRef<number>(0);
   const lastBpmStatsUpdateRef = useRef<number>(0);
 
-  const bgCacheRef = useRef<HTMLCanvasElement | null>(null);
-  const sweepPosRef = useRef(0);
-  const lastFrameTimeRef = useRef(0);
-  const signalPathRef = useRef<{ x: number; y: number }[]>([]);
-  const prevYRef = useRef(0);
-
   useEffect(() => {
-    propsRef.current = { value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure };
+    propsRef.current = {
+      value,
+      quality,
+      isFingerDetected,
+      arrhythmiaStatus,
+      preserveResults,
+      isPeak,
+      bpm,
+      spo2,
+      rrIntervals,
+      rawArrhythmiaData,
+      elapsedTime,
+      perfusionIndex,
+      pressure,
+    };
 
     const now = Date.now();
 
@@ -210,30 +185,75 @@ const PPGSignalMeter = ({
       bpmStatsRef.current = { min: 0, max: 0, sum: 0, n: 0 };
       bpmTrendRef.current = [];
     }
-  }, [value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure]);
+  }, [
+    value,
+    quality,
+    isFingerDetected,
+    arrhythmiaStatus,
+    preserveResults,
+    isPeak,
+    bpm,
+    spo2,
+    rrIntervals,
+    rawArrhythmiaData,
+    elapsedTime,
+    perfusionIndex,
+    pressure,
+  ]);
 
   useEffect(() => {
-    if (!dataBufferRef.current) {
-      dataBufferRef.current = new CircularBuffer(CONFIG.BUFFER_SIZE);
-    }
+    const container = glContainerRef.current;
+    if (!container) return;
+
+    const manager = new EcgSceneManager(
+      container,
+      {
+        backgroundColor: 0x000a05,
+        fogNear: 800,
+        fogFar: 3200,
+        pixelRatioCap: 2,
+        antialias: true,
+        powerPreference: 'high-performance',
+      },
+      LAYOUT
+    );
+
+    sceneManagerRef.current = manager;
+    ecgMeshRef.current = manager.createChannel(ECG_CHANNEL);
+    ppgMeshRef.current = manager.createChannel(PPG_CHANNEL);
+    particlesRef.current = new EcgParticles(manager as unknown as THREE.Scene, PPG_CHANNEL, 160);
+    synthRef.current = new ECGWaveformSynthesizer({ sampleRateHz: 60, maxActiveComplexes: 24 });
+
+    manager.start();
+
     return () => {
-      isRunningRef.current = false;
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      manager.dispose();
+      sceneManagerRef.current = null;
+      ecgMeshRef.current = null;
+      ppgMeshRef.current = null;
+      particlesRef.current = null;
+      synthRef.current = null;
     };
   }, []);
 
   useEffect(() => {
-    if (preserveResults && !isFingerDetected) {
-      dataBufferRef.current?.clear();
+    if (!isPeak || !synthRef.current || !sceneManagerRef.current) return;
+    const rrSample = rrIntervals && rrIntervals.length > 0 ? rrIntervals[rrIntervals.length - 1] : 800;
+    const rhythm = rhythmFromStatus(arrhythmiaStatus, bpm, rrIntervals);
+    const complex = synthRef.current.onHeartBeat(Date.now(), rrSample, rhythm);
+    if (complex) {
+      sceneManagerRef.current.triggerBeatPulse(1);
+      beatFlashRef.current = { time: Date.now(), age: 0 };
+      beatHistoryRef.current.push({ isArrhythmia: rhythm !== 'NSR', time: Date.now() });
+      if (beatHistoryRef.current.length > 20) beatHistoryRef.current = beatHistoryRef.current.slice(-20);
     }
-  }, [preserveResults, isFingerDetected]);
+  }, [isPeak, arrhythmiaStatus, bpm, rrIntervals]);
 
   const drawBackground = useCallback((ctx: CanvasRenderingContext2D) => {
     const W = CONFIG.CANVAS_WIDTH;
     const H = CONFIG.CANVAS_HEIGHT;
     ctx.fillStyle = CONFIG.BG_COLOR;
     ctx.fillRect(0, 0, W, H);
-
     const bgGrad = ctx.createRadialGradient(W / 2, H * 0.36, 0, W / 2, H * 0.36, Math.max(W, H) / 1.05);
     bgGrad.addColorStop(0, '#0b1a10');
     bgGrad.addColorStop(0.5, '#050d08');
@@ -259,79 +279,53 @@ const PPGSignalMeter = ({
     const H = CONFIG.CANVAS_HEIGHT;
     const stageY0 = 280;
     const stageY1 = 1220;
-    const stageH = stageY1 - stageY0;
-
     ctx.save();
     ctx.beginPath();
-    ctx.rect(0, stageY0, W, stageH);
+    ctx.rect(0, stageY0, W, stageY1 - stageY0);
     ctx.clip();
 
     ctx.strokeStyle = CONFIG.GRID_MINOR;
     ctx.lineWidth = 0.5;
-    const minorStep = 8;
-    for (let y = stageY0; y <= stageY1; y += minorStep) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(W, y);
-      ctx.stroke();
+    for (let y = stageY0; y <= stageY1; y += 8) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
     }
-    for (let x = 0; x < W; x += minorStep) {
-      ctx.beginPath();
-      ctx.moveTo(x, stageY0);
-      ctx.lineTo(x, stageY1);
-      ctx.stroke();
+    for (let x = 0; x < W; x += 8) {
+      ctx.beginPath(); ctx.moveTo(x, stageY0); ctx.lineTo(x, stageY1); ctx.stroke();
     }
 
     ctx.strokeStyle = CONFIG.GRID_MAJOR;
     ctx.lineWidth = 0.8;
-    const majorStep = 40;
-    for (let y = stageY0; y <= stageY1; y += majorStep) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(W, y);
-      ctx.stroke();
+    for (let y = stageY0; y <= stageY1; y += 40) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
     }
-    for (let x = 0; x < W; x += majorStep) {
-      ctx.beginPath();
-      ctx.moveTo(x, stageY0);
-      ctx.lineTo(x, stageY1);
-      ctx.stroke();
+    for (let x = 0; x < W; x += 40) {
+      ctx.beginPath(); ctx.moveTo(x, stageY0); ctx.lineTo(x, stageY1); ctx.stroke();
     }
 
     ctx.strokeStyle = CONFIG.GRID_MAJOR;
     ctx.lineWidth = 1;
-    const bigStep = 200;
-    for (let y = stageY0; y <= stageY1; y += bigStep) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(W, y);
-      ctx.stroke();
+    for (let y = stageY0; y <= stageY1; y += 200) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
     }
-    for (let x = 0; x < W; x += bigStep) {
-      ctx.beginPath();
-      ctx.moveTo(x, stageY0);
-      ctx.lineTo(x, stageY1);
-      ctx.stroke();
+    for (let x = 0; x < W; x += 200) {
+      ctx.beginPath(); ctx.moveTo(x, stageY0); ctx.lineTo(x, stageY1); ctx.stroke();
     }
-
     ctx.restore();
   }, []);
 
   const drawHeader = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
     const W = CONFIG.CANVAS_WIDTH;
     const { quality, elapsedTime } = propsRef.current;
-
     ctx.font = `bold 11px ${CONFIG.FONT}`;
     ctx.textAlign = 'left';
     ctx.fillStyle = CONFIG.SIGNAL_COLOR;
-    ctx.fillText('● CARDIAC MONITOR', 14, 22);
-
+    ctx.fillText('● CARDIAC MONITOR — DUAL CHANNEL', 14, 22);
     ctx.font = `9px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(0, 255, 136, 0.6)';
-    ctx.fillText('ECG/PPG WAVEFORM · REAL-TIME', 14, 36);
+    ctx.fillText('ECG + PPG · 3D · REAL-TIME', 14, 36);
 
     const recentBeat = now - beatFlashRef.current.time < 400;
-    const hx = 220;
+    const hx = 240;
     ctx.font = `bold 18px ${CONFIG.FONT}`;
     ctx.fillStyle = recentBeat ? '#ff6b6b' : CONFIG.SIGNAL_COLOR;
     ctx.textAlign = 'center';
@@ -392,7 +386,6 @@ const PPGSignalMeter = ({
   const drawMetricsRow = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
     const W = CONFIG.CANVAS_WIDTH;
     const { bpm, spo2, perfusionIndex, pressure, rrIntervals } = propsRef.current;
-
     const y = 52;
     const h = 200;
     const gap = 10;
@@ -539,293 +532,9 @@ const PPGSignalMeter = ({
     ctx.fillText('PI ≥ 2%', piCard + 12, y + 180);
   }, []);
 
-  const draw3DStage = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
-    const { preserveResults, isFingerDetected: detected, value: signalValue, isPeak: peak, arrhythmiaStatus: arrStatus, bpm, rrIntervals } = propsRef.current;
-    const stage = { x0: 58, x1: 782, y0: 268, y1: 1260 };
-    const stageW = stage.x1 - stage.x0;
-    const stageH = stage.y1 - stage.y0;
-    const centerY = (stage.y0 + stage.y1) / 2;
-    const cam = pitchYaw(now);
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(stage.x0, stage.y0, stage.x1 - stage.x0, stage.y1 - stage.y0);
-    ctx.clip();
-
-    const plBackL = project(-420, 0, -900, cam);
-    const plBackR = project(420, 0, -900, cam);
-    const plFrontL = project(-420, 0, 0, cam);
-    const plFrontR = project(420, 0, 0, cam);
-    const planeGrad = ctx.createLinearGradient(0, plBackL.sy, 0, plFrontL.sy);
-    planeGrad.addColorStop(0, 'rgba(0, 15, 8, 0.3)');
-    planeGrad.addColorStop(1, 'rgba(0, 25, 15, 0.5)');
-    ctx.fillStyle = planeGrad;
-    ctx.beginPath();
-    ctx.moveTo(plBackL.sx, plBackL.sy);
-    ctx.lineTo(plBackR.sx, plBackR.sy);
-    ctx.lineTo(plFrontR.sx, plFrontR.sy);
-    ctx.lineTo(plFrontL.sx, plFrontL.sy);
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.strokeStyle = 'rgba(0, 255, 136, 0.06)';
-    ctx.lineWidth = 1;
-    for (let i = 0; i <= 10; i++) {
-      const x = -420 + (i / 10) * 840;
-      const a = project(x, 0, -900, cam);
-      const b = project(x, 0, 0, cam);
-      ctx.beginPath();
-      ctx.moveTo(a.sx, a.sy);
-      ctx.lineTo(b.sx, b.sy);
-      ctx.stroke();
-    }
-    for (let i = 0; i <= 8; i++) {
-      const z = -900 + (i / 8) * 900;
-      const a = project(-420, 0, z, cam);
-      const b = project(420, 0, z, cam);
-      ctx.beginPath();
-      ctx.moveTo(a.sx, a.sy);
-      ctx.lineTo(b.sx, b.sy);
-      ctx.stroke();
-    }
-    ctx.strokeStyle = 'rgba(0, 255, 136, 0.2)';
-    ctx.lineWidth = 1.4;
-    ctx.beginPath();
-    ctx.moveTo(plFrontL.sx, plFrontL.sy);
-    ctx.lineTo(plFrontR.sx, plFrontR.sy);
-    ctx.stroke();
-    ctx.strokeStyle = 'rgba(0, 255, 136, 0.08)';
-    ctx.beginPath();
-    ctx.moveTo(plBackL.sx, plBackL.sy);
-    ctx.lineTo(plBackR.sx, plBackR.sy);
-    ctx.stroke();
-
-    for (let s = 0; s <= 2.8; s += 0.5) {
-      const x = -380 + (s / 2.8) * 760;
-      const a = project(x, 0, -380, cam);
-      const b = project(x, 20, -380, cam);
-      ctx.strokeStyle = 'rgba(77, 215, 254, 0.20)';
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      ctx.moveTo(a.sx, a.sy);
-      ctx.lineTo(b.sx, b.sy);
-      ctx.stroke();
-      if (s === Math.round(s)) {
-        ctx.font = `9px ${CONFIG.FONT}`;
-        ctx.fillStyle = 'rgba(0, 255, 136, 0.3)';
-        ctx.textAlign = 'center';
-        ctx.fillText(`${s}s`, a.sx, a.sy - 8);
-      }
-    }
-
-    const hasWave = !(preserveResults && !detected);
-    if (!hasWave) {
-      ctx.restore();
-      return;
-    }
-
-    const scaledValue = signalValue * 2;
-
-    if (peak) {
-      beatFlashRef.current = { time: now, age: 0 };
-      const currentCount = arrStatus ? parseInt(arrStatus.split('|')[1] || '0') : 0;
-      const isArr = currentCount > (parseInt(arrStatus?.split('|')[1] || '0') > 0 ? 1 : 0);
-      beatHistoryRef.current.push({ isArrhythmia: isArr, time: now });
-      if (beatHistoryRef.current.length > 20) {
-        beatHistoryRef.current = beatHistoryRef.current.slice(-20);
-      }
-    }
-
-    const buffer = dataBufferRef.current;
-    if (buffer) {
-      buffer.push({ time: now, value: scaledValue, isArrhythmia: false });
-    }
-
-    const points = buffer?.getPoints() || [];
-    if (points.length > 30) {
-      let min = Infinity;
-      let max = -Infinity;
-      const recentPoints = points.length > 150 ? points.slice(-150) : points;
-      for (let i = 0; i < recentPoints.length; i++) {
-        const v = recentPoints[i].value;
-        if (v < min) min = v;
-        if (v > max) max = v;
-      }
-      const range = Math.max(40, max - min);
-      const stats = amplitudeStatsRef.current;
-      stats.min = stats.min * 0.95 + (min - range * 0.1) * 0.05;
-      stats.max = stats.max * 0.95 + (max + range * 0.1) * 0.05;
-      stats.range = stats.max - stats.min;
-    }
-
-    const stats = amplitudeStatsRef.current;
-    const beatAge = now - beatFlashRef.current.time;
-    const beatPulse = Math.exp(-Math.max(0, beatAge) / 320);
-    const ampBoost = 1 + 0.06 * beatPulse;
-    const waveBright = 0.72 + 0.28 * beatPulse;
-
-    const proj3: { sx: number; sy: number; syPlane: number; isArr: boolean; x: number; y: number; zc: number; tag: string }[] = [];
-    const pointsList = points.length > 400 ? points.slice(-400) : points;
-
-    const rrSample = rrIntervals && rrIntervals.length > 0 ? rrIntervals[rrIntervals.length - 1] : undefined;
-    const { label: rhythmLabel } = beatAnnotations(rrSample, bpm, arrStatus);
-
-    for (let i = 0; i < pointsList.length; i++) {
-      const pt = pointsList[i];
-      const age = now - pt.time;
-      if (age > CONFIG.WINDOW_MS) continue;
-      const x = -380 + ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS) * 760;
-      const z = -380 + (age / CONFIG.WINDOW_MS) * 130;
-      const phase = ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS);
-      const modeled = cardiacModel(phase);
-      const normalizedY = (stats.max - pt.value) / stats.range;
-      const worldY = (normalizedY - 0.5) * 1520 * ampBoost;
-      const p = project(x, worldY, z, cam);
-      const pp = project(x, 0, z, cam);
-      proj3.push({ sx: p.sx, sy: p.sy, syPlane: pp.sy, isArr: pt.isArrhythmia, x, y: worldY, zc: p.zc, tag: modeled.tag });
-    }
-
-    if (proj3.length > 2) {
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-
-      ctx.save();
-      ctx.globalAlpha = 0.12;
-      ctx.strokeStyle = CONFIG.SIGNAL_COLOR;
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      let mstarted = false;
-      for (const c of proj3) {
-        const m = project(c.x, -c.y * 0.5, -380, cam);
-        if (!mstarted) { ctx.moveTo(m.sx, m.sy); mstarted = true; }
-        else ctx.lineTo(m.sx, m.sy);
-      }
-      ctx.stroke();
-      ctx.restore();
-
-      ctx.beginPath();
-      ctx.moveTo(proj3[0].sx, proj3[0].sy);
-      for (const c of proj3) ctx.lineTo(c.sx, c.sy);
-      for (let i = proj3.length - 1; i >= 0; i--) ctx.lineTo(proj3[i].sx, proj3[i].syPlane);
-      ctx.closePath();
-      const ribbonGrad = ctx.createLinearGradient(0, Math.min(...proj3.map(c => c.sy)) - 20, 0, Math.max(...proj3.map(c => c.syPlane)) + 20);
-      ribbonGrad.addColorStop(0, 'rgba(0, 255, 136, 0.12)');
-      ribbonGrad.addColorStop(0.5, 'rgba(0, 255, 136, 0.04)');
-      ribbonGrad.addColorStop(1, 'rgba(0, 255, 136, 0.0)');
-      ctx.fillStyle = ribbonGrad;
-      ctx.fill();
-
-      const runs: { pts: { sx: number; sy: number; syPlane: number }[]; arr: boolean }[] = [];
-      let currentRun: { sx: number; sy: number; syPlane: number }[] = [];
-      let currentArr = proj3[0].isArr;
-      for (const c of proj3) {
-        if (c.isArr === currentArr) {
-          currentRun.push({ sx: c.sx, sy: c.sy, syPlane: c.syPlane });
-        } else {
-          if (currentRun.length > 1) runs.push({ pts: currentRun, arr: currentArr });
-          currentRun = [{ sx: c.sx, sy: c.sy, syPlane: c.syPlane }];
-          currentArr = c.isArr;
-        }
-      }
-      if (currentRun.length > 1) runs.push({ pts: currentRun, arr: currentArr });
-
-      ctx.strokeStyle = 'rgba(0, 255, 136, 0.10)';
-      ctx.lineWidth = 1;
-      for (let i = 0; i < proj3.length; i += 3) {
-        const c = proj3[i];
-        ctx.beginPath();
-        ctx.moveTo(c.sx, c.sy);
-        ctx.lineTo(c.sx, c.syPlane);
-        ctx.stroke();
-      }
-
-      for (const run of runs) {
-        if (!run.arr) continue;
-        ctx.beginPath();
-        ctx.moveTo(run.pts[0].sx, run.pts[0].sy);
-        for (const c of run.pts) ctx.lineTo(c.sx, c.sy);
-        for (let i = run.pts.length - 1; i >= 0; i--) ctx.lineTo(run.pts[i].sx, run.pts[i].syPlane);
-        ctx.closePath();
-        ctx.fillStyle = 'rgba(255, 51, 68, 0.08)';
-        ctx.fill();
-      }
-
-      const strokePass = (arr: boolean, width: number, alpha: number, blur: number, useCore = false) => {
-        ctx.save();
-        ctx.globalAlpha = alpha * waveBright;
-        for (const run of runs) {
-          if (run.arr !== arr) continue;
-          ctx.beginPath();
-          ctx.moveTo(run.pts[0].sx, run.pts[0].sy);
-          for (let i = 1; i < run.pts.length; i++) ctx.lineTo(run.pts[i].sx, run.pts[i].sy);
-          if (blur > 0) {
-            ctx.shadowColor = arr ? CONFIG.ARRHYTHMIA_GLOW : CONFIG.SIGNAL_GLOW;
-            ctx.shadowBlur = blur;
-          }
-          ctx.strokeStyle = arr ? (useCore ? '#ffd9d9' : CONFIG.SIGNAL_ARRHYTHMIA) : (useCore ? '#ffffff' : CONFIG.SIGNAL_COLOR);
-          ctx.lineWidth = width;
-          ctx.stroke();
-        }
-        ctx.restore();
-      };
-
-      strokePass(false, 8, 0.15, 20);
-      strokePass(true, 8, 0.15, 20);
-      strokePass(false, 2.5, 0.9, 10);
-      strokePass(true, 2.5, 0.9, 10);
-      strokePass(false, 1, 1, 0, true);
-      strokePass(true, 1, 1, 0, true);
-
-      ctx.save();
-      ctx.globalAlpha = 0.85 * waveBright;
-      ctx.strokeStyle = CONFIG.BASELINE_COLOR;
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 6]);
-      ctx.beginPath();
-      let started = false;
-      for (const c of proj3) {
-        const base = project(c.x, 0, -380, cam);
-        if (!started) { ctx.moveTo(base.sx, base.sy); started = true; }
-        else ctx.lineTo(base.sx, base.sy);
-      }
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.restore();
-
-      const last = proj3[proj3.length - 1];
-      const beamTop = project(last.x, 1300, -380, cam);
-      const beamBottom = project(last.x, -1000, -380, cam);
-      const beamGrad = ctx.createLinearGradient(beamTop.sx - 70, 0, beamTop.sx + 6, 0);
-      const beamPulse = 0.14 + 0.08 * Math.sin(now / 240) + 0.10 * beatPulse;
-      beamGrad.addColorStop(0, 'rgba(0, 255, 136, 0)');
-      beamGrad.addColorStop(1, `rgba(0, 255, 136, ${beamPulse})`);
-      ctx.fillStyle = beamGrad;
-      const btop = Math.min(beamTop.sy, beamBottom.sy);
-      const bheight = Math.abs(beamBottom.sy - beamTop.sy);
-      ctx.fillRect(beamTop.sx - 70, btop, 76, bheight);
-      ctx.save();
-      ctx.shadowColor = 'rgba(0, 255, 136, 0.9)';
-      ctx.shadowBlur = 12;
-      ctx.fillStyle = `rgba(0, 255, 136, ${0.35 + 0.2 * beatPulse})`;
-      ctx.fillRect(beamTop.sx - 1.5, btop, 1.5, bheight);
-      ctx.restore();
-
-      ctx.save();
-      ctx.font = `bold 9px ${CONFIG.FONT}`;
-      ctx.fillStyle = 'rgba(255,255,255,0.75)';
-      ctx.textAlign = 'left';
-      ctx.shadowColor = 'rgba(0,0,0,0.8)';
-      ctx.shadowBlur = 6;
-      ctx.fillText(`RHYTHM ${rhythmLabel}`, last.sx + 8, last.sy - 14);
-      ctx.restore();
-    }
-    ctx.restore();
-  }, []);
-
   const drawAnalyticsBand = useCallback((ctx: CanvasRenderingContext2D) => {
     const W = CONFIG.CANVAS_WIDTH;
     const { rrIntervals, bpm, spo2 } = propsRef.current;
-
     const y = 1264;
     const h = 320;
     const gap = 10;
@@ -973,7 +682,7 @@ const PPGSignalMeter = ({
     ctx.fillStyle = 'rgba(0, 255, 136, 0.5)';
     ctx.fillText('BEAT HISTORY', rx + 14, y + 150);
     const beatHistory = beatHistoryRef.current;
-    const arrCount = beatHistory.filter(b => b.isArrhythmia).length;
+    const arrCount = beatHistory.filter((b) => b.isArrhythmia).length;
     const normalCount = beatHistory.length - arrCount;
     ctx.textAlign = 'right';
     ctx.fillStyle = CONFIG.SIGNAL_COLOR;
@@ -1087,7 +796,7 @@ const PPGSignalMeter = ({
     ctx.fillText('IBI', lx + 336, ly);
 
     ctx.fillStyle = 'rgba(0, 255, 136, 0.3)';
-    ctx.fillText('SWEEP 25mm/s · FILTER 0.5-4Hz · SOURCE PPG', 420, ly);
+    ctx.fillText('SWEEP 25mm/s · FILTER 0.5-4Hz · SOURCE PPG+ECG', 380, ly);
 
     ctx.textAlign = 'right';
     const alarms: string[] = [];
@@ -1111,74 +820,49 @@ const PPGSignalMeter = ({
     }
   }, []);
 
-  const render = useCallback(() => {
-    const canvas = canvasRef.current;
+  useEffect(() => {
+    const canvas = overlayRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d', { alpha: false });
+    const ctx = canvas.getContext('2d', { alpha: true });
     if (!ctx) return;
 
-    const now = Date.now();
+    const resize = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    };
+    resize();
+    window.addEventListener('resize', resize);
 
-    ensureBgCache(ctx);
-    drawECGGrid(ctx);
-    drawHeader(ctx, now);
-    drawMetricsRow(ctx, now);
-    draw3DStage(ctx, now);
-    drawAnalyticsBand(ctx);
-    drawFooter(ctx);
-  }, [ensureBgCache, drawECGGrid, drawHeader, drawMetricsRow, draw3DStage, drawAnalyticsBand, drawFooter]);
-
-  useEffect(() => {
-    if (isRunningRef.current) return;
-    isRunningRef.current = true;
-
-    const frameTime = 1000 / CONFIG.TARGET_FPS;
-    let lastRenderTime = 0;
-
-    const renderLoop = () => {
-      if (!isRunningRef.current) return;
-
+    const drawOverlay = () => {
       const now = Date.now();
-      if (now - lastRenderTime < frameTime) {
-        animationRef.current = requestAnimationFrame(renderLoop);
-        return;
-      }
-      lastRenderTime = now;
-
-      render();
-      animationRef.current = requestAnimationFrame(renderLoop);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawHeader(ctx, now);
+      drawMetricsRow(ctx, now);
+      drawAnalyticsBand(ctx);
+      drawFooter(ctx);
+      requestAnimationFrame(drawOverlay);
     };
+    drawOverlay();
 
-    animationRef.current = requestAnimationFrame(renderLoop);
-
-    return () => {
-      isRunningRef.current = false;
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    };
-  }, [render]);
+    return () => window.removeEventListener('resize', resize);
+  }, [drawHeader, drawMetricsRow, drawAnalyticsBand, drawFooter]);
 
   const handleReset = useCallback(() => {
-    dataBufferRef.current?.clear();
-    amplitudeStatsRef.current = { min: -50, max: 50, range: 100 };
     beatHistoryRef.current = [];
     ibiDisplayRef.current = 0;
     hrvDisplayRef.current = { sdnn: 0, rmssd: 0 };
     bpmStatsRef.current = { min: 0, max: 0, sum: 0, n: 0 };
     bpmTrendRef.current = [];
-    signalPathRef.current = [];
-    sweepPosRef.current = 0;
+    amplitudeStatsRef.current = { min: -50, max: 50, range: 100 };
+    synthRef.current?.reset();
     onReset();
   }, [onReset]);
 
   return (
     <div className="fixed inset-0 bg-black">
-      <canvas
-        ref={canvasRef}
-        width={CONFIG.CANVAS_WIDTH}
-        height={CONFIG.CANVAS_HEIGHT}
-        className="w-full h-full absolute inset-0"
-      />
-      <div className="fixed bottom-0 left-0 right-0 h-12 grid grid-cols-2 z-10">
+      <div ref={glContainerRef} className="absolute inset-0" />
+      <canvas ref={overlayRef} className="absolute inset-0 pointer-events-none" />
+      <div className="fixed bottom-0 left-0 right-0 h-14 grid grid-cols-2 z-10">
         <button
           onClick={onStartMeasurement}
           className={`font-semibold text-sm tracking-wide transition-colors border-t backdrop-blur-sm ${

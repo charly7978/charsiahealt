@@ -1,144 +1,85 @@
 import * as THREE from 'three';
 import type { EcgChannelConfig } from './types';
 
-interface Particle {
-  /** Fase normalizada [0..1]: dónde está la partícula en el canal. */
-  phase: number;
-  /** Vida restante en ms. */
-  lifeMs: number;
-  /** Velocidad propia (px/s equivalente en mundo). */
-  speed: number;
-}
-
-/**
- * Sistema de partículas de glóbulos (Points) que fluyen por la cinta PPG
- * siguiendo su forma en Y. Avanza con `flowSpeed` (mm/s del barrido).
- */
 export class EcgParticles {
-  readonly points: THREE.Points;
-  private readonly geometry: THREE.BufferGeometry;
-  private readonly material: THREE.PointsMaterial;
-  private readonly channel: EcgChannelConfig;
+  private readonly scene: THREE.Scene;
+  private readonly config: EcgChannelConfig;
   private readonly count: number;
+  private points: THREE.Points | null = null;
+  private geometry: THREE.BufferGeometry | null = null;
+  private material: THREE.PointsMaterial | null = null;
+  private readonly phases: Float32Array;
 
-  /** Estado por partícula. */
-  private readonly particleData: Particle[];
-  private readonly ages: Float32Array;
-
-  private readonly posAttr: THREE.BufferAttribute;
-  private readonly colorAttr: THREE.BufferAttribute;
-
-  private readonly baseColor = new THREE.Color(0xff7050);
-  private readonly peakColor = new THREE.Color(0xffd9a0);
-
-  /** Brote de partículas al frente (0..1), decae en update(). */
-  private burstStrength = 0;
-
-  constructor(scene: THREE.Scene, channel: EcgChannelConfig, count = 140) {
-    this.channel = channel;
+  constructor(scene: THREE.Scene, config: EcgChannelConfig, count = 180) {
+    this.scene = scene;
+    this.config = config;
     this.count = count;
+    this.phases = new Float32Array(count);
 
-    this.geometry = new THREE.BufferGeometry();
-    const positions = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
-    this.ages = new Float32Array(count);
+    this.build();
+  }
 
-    this.particleData = [];
-    for (let i = 0; i < count; i++) {
-      this.particleData.push({
-        phase: Math.random(),
-        lifeMs: 600 + Math.random() * 900,
-        speed: 0.6 + Math.random() * 0.8,
-      });
-      this.ages[i] = Math.random();
-      positions[i * 3 + 1] = channel.baseY;
+  private build(): void {
+    const positions = new Float32Array(this.count * 3);
+    const colors = new Float32Array(this.count * 3);
+
+    for (let i = 0; i < this.count; i++) {
+      this.phases[i] = Math.random();
+      positions[i * 3] = (Math.random() - 0.5) * this.config.width;
+      positions[i * 3 + 1] = this.config.baseY;
+      positions[i * 3 + 2] = Math.random() * this.config.depth;
+
+      colors[i * 3] = 1;
+      colors[i * 3 + 1] = 0.35;
+      colors[i * 3 + 2] = 0.2;
     }
 
-    this.posAttr = new THREE.BufferAttribute(positions, 3);
-    this.colorAttr = new THREE.BufferAttribute(colors, 3);
-    this.geometry.setAttribute('position', this.posAttr);
-    this.geometry.setAttribute('color', this.colorAttr);
+    this.geometry = new THREE.BufferGeometry();
+    this.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
     this.material = new THREE.PointsMaterial({
-      size: 7,
+      size: 3.5,
       vertexColors: true,
       transparent: true,
-      opacity: 0.55,
+      opacity: 0.85,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
-      sizeAttenuation: true,
     });
 
     this.points = new THREE.Points(this.geometry, this.material);
-    this.points.frustumCulled = false;
-    scene.add(this.points);
+    this.scene.add(this.points);
   }
 
-  /** Dispara un brote de partículas al frente (pulso por latido). */
-  burst(): void {
-    this.burstStrength = 1;
-    // Reavivar partículas cercanas al frente.
-    for (let i = 0; i < this.count; i += 3) {
-      const p = this.particleData[i];
-      p.phase = Math.min(1, 0.82 + Math.random() * 0.14);
-      p.lifeMs = 500 + Math.random() * 500;
-    }
-  }
-
-  /** Actualiza posiciones (fase avanza y vida decae). */
   update(deltaMs: number, flowSpeed: number): void {
-    this.burstStrength = Math.max(0, this.burstStrength - deltaMs / 500);
-
-    const { baseY, amplitude, width, depth } = this.channel;
-    const halfW = width / 2;
-    const positions = this.posAttr.array as Float32Array;
-    const colors = this.colorAttr.array as Float32Array;
+    if (!this.geometry || !this.points) return;
+    const positions = this.geometry.attributes.position.array as Float32Array;
 
     for (let i = 0; i < this.count; i++) {
-      const p = this.particleData[i];
+      this.phases[i] += (flowSpeed * deltaMs) / 1000;
+      if (this.phases[i] > 1) this.phases[i] -= 1;
 
-      // Avanzar fase a lo largo del eje Z (profundidad → frente).
-      const dzPerMs = (depth * flowSpeed) / 1000;
-      p.phase += (p.speed * dzPerMs * deltaMs) / depth;
-
-      // Ciclo de vida: al terminar, respawn en el fondo.
-      p.lifeMs -= deltaMs;
-      if (p.lifeMs <= 0) {
-        p.lifeMs = 600 + Math.random() * 900;
-        p.phase = 0.95 + Math.random() * 0.05; // reaparecen al fondo
-        p.speed = 0.6 + Math.random() * 0.8;
-      }
-
-      // Posición: X fijo (ligero jitter), Z = -depth + phase*depth, Y según
-      // una onda PPG simplificada (pico sistólico cerca del frente).
-      const frac = Math.min(1, Math.max(0, p.phase));
-      const jitterX = Math.sin(i * 1.7) * 8;
-      const x = -halfW * 0.7 + jitterX;
-      const z = -depth * (1 - frac);
-      // Forma PPG: subida rápida y caída lenta (dicrotismo suave).
-      const t = 1 - frac; // 0 fondo .. 1 frente
-      const ppgY = Math.sin(Math.min(1, t * 2.4) * Math.PI * 0.5) * amplitude * 0.85;
-      const y = baseY + ppgY;
-
-      positions[i * 3] = x;
-      positions[i * 3 + 1] = y;
-      positions[i * 3 + 2] = z;
-
-      // Color: rojo cálido; cerca del pico → crema.
-      const nearPeak = t > 0.72 ? 1 : 0;
-      colors[i * 3] = this.baseColor.r + (this.peakColor.r - this.baseColor.r) * nearPeak;
-      colors[i * 3 + 1] = this.baseColor.g + (this.peakColor.g - this.baseColor.g) * nearPeak;
-      colors[i * 3 + 2] = this.baseColor.b + (this.peakColor.b - this.baseColor.b) * nearPeak;
+      const v = this.phases[i];
+      positions[i * 3] = (v - 0.5) * this.config.width;
+      positions[i * 3 + 1] = this.config.baseY + (Math.sin(v * Math.PI * 4) * 0.5) * this.config.amplitude;
+      positions[i * 3 + 2] = this.config.depth - v * this.config.depth;
     }
 
-    this.posAttr.needsUpdate = true;
-    this.colorAttr.needsUpdate = true;
+    this.geometry.attributes.position.needsUpdate = true;
   }
 
-  /** Libera los recursos WebGL. */
   dispose(): void {
-    if (this.points.parent) this.points.parent.remove(this.points);
-    this.geometry.dispose();
-    this.material.dispose();
+    if (this.geometry) {
+      this.geometry.dispose();
+      this.geometry = null;
+    }
+    if (this.material) {
+      this.material.dispose();
+      this.material = null;
+    }
+    if (this.points) {
+      this.scene.remove(this.points);
+      this.points = null;
+    }
   }
 }
