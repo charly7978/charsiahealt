@@ -3,8 +3,7 @@
  * Based on Han et al. 2022 Biosensors paper (PMC8869811)
  * Implements WEPD for arrhythmia detection + DATPD for NSR + AF/PVC detection
  */
-// @ts-expect-error Project uses path alias @/types/signal
-import type { ProcessedSignal, ProcessingError, SignalProcessor as SignalProcessorInterface, ContactState } from '@/types/signal';
+import type { ProcessedSignal, ProcessingError, SignalProcessor as SignalProcessorInterface, ContactState } from '../types/signal';
 
 interface BeatDetectionResult {
     bpm: number;

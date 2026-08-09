@@ -40,11 +40,87 @@ const CONFIG = {
   BG_COLOR: '#000a05',
   GRID_MAJOR: 'rgba(0, 255, 136, 0.08)',
   GRID_MINOR: 'rgba(0, 255, 136, 0.03)',
+  BASELINE_COLOR: 'rgba(0, 255, 136, 0.22)',
+  PEAK_POSITIVE_COLOR: '#00ff88',
+  PEAK_NEGATIVE_COLOR: '#4df0ff',
+  ANATOMY_LINE_WIDTH: 2.4,
 };
 
-const PPGSignalMeter = ({ 
-  value, 
-  quality, 
+const DEG = Math.PI / 180;
+
+const pitchYaw = (now: number) => {
+  const pitch = (34 + 2.2 * Math.sin(now / 9400)) * DEG;
+  const yaw = 2.4 * Math.sin(now / 12600 + 1.7) * DEG;
+  const cth = Math.cos(pitch);
+  const sth = Math.sin(pitch);
+  const cph = Math.cos(yaw);
+  const sph = Math.sin(yaw);
+  return { cth, sth, cph, sph, H: 700, D: 2600, F: 2350, cx: 420, cy: 700 };
+};
+
+const project = (x: number, y: number, z: number, cam: ReturnType<typeof pitchYaw>) => {
+  const zr = -x * cam.sph + z * cam.cph;
+  const xr = x * cam.cph + z * cam.sph;
+  const yw = y - cam.H;
+  const y1 = yw * cam.cth - zr * cam.sth;
+  const z2 = yw * cam.sth + zr * cam.cth;
+  const zc = cam.D - z2;
+  const inv = cam.F / zc;
+  return { sx: cam.cx + xr * inv, sy: cam.cy - y1 * inv, zc };
+};
+
+const cardiacModel = (t: number) => {
+  const cycle = t % 1;
+  let y = 0;
+  let tag: 'p' | 'q' | 'r' | 's' | 't' | 'baseline' = 'baseline';
+
+  if (cycle < 0.08) {
+    y = 0.18 * Math.sin((cycle / 0.08) * Math.PI);
+    tag = 'p';
+  } else if (cycle < 0.12) {
+    const k = (cycle - 0.08) / 0.04;
+    y = 0.18 * (1 - k) - 0.22 * k;
+    tag = 'q';
+  } else if (cycle < 0.18) {
+    const k = (cycle - 0.12) / 0.06;
+    y = -0.22 + 1.18 * Math.sin(k * Math.PI);
+    tag = 'r';
+  } else if (cycle < 0.24) {
+    const k = (cycle - 0.18) / 0.06;
+    y = 0.96 - 0.34 * Math.sin(k * Math.PI);
+    tag = 's';
+  } else if (cycle < 0.38) {
+    const k = (cycle - 0.24) / 0.14;
+    y = 0.28 * Math.sin(k * Math.PI);
+    tag = 't';
+  } else {
+    y = 0;
+    tag = 'baseline';
+  }
+  return { y, tag };
+};
+
+const beatAnnotations = (rrMs: number | undefined, bpm: number, arrStatus?: string) => {
+  const arrhythmia = !!arrStatus && arrStatus.includes('AF');
+  const pvc = !!arrStatus && arrStatus.includes('PVC');
+  const pac = !!arrStatus && arrStatus.includes('PAC');
+  const rvr = bpm > 140;
+  const brady = bpm > 0 && bpm < 60;
+  const tachy = bpm > 100;
+  const rrLabel = rrMs && rrMs > 0 ? `${Math.round(rrMs)} ms` : '-- ms';
+  let label = 'NSR';
+  if (arrhythmia) label = 'AF';
+  else if (pvc) label = 'PVC';
+  else if (pac) label = 'PAC';
+  else if (rvr) label = 'RVR';
+  else if (brady) label = 'BRADY';
+  else if (tachy) label = 'TACHY';
+  return { label, rrLabel };
+};
+
+const PPGSignalMeter = ({
+  value,
+  quality,
   isFingerDetected,
   onStartMeasurement,
   onReset,
@@ -59,21 +135,33 @@ const PPGSignalMeter = ({
   rrIntervals = [],
   elapsedTime = 0,
   perfusionIndex = 0,
-  pressure
+  pressure,
 }: PPGSignalMeterProps) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
   const dataBufferRef = useRef<CircularBuffer | null>(null);
-  
-  const propsRef = useRef({ 
-    value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure 
+
+  const propsRef = useRef({
+    value,
+    quality,
+    isFingerDetected,
+    arrhythmiaStatus,
+    preserveResults,
+    isPeak,
+    bpm,
+    spo2,
+    rrIntervals,
+    rawArrhythmiaData,
+    elapsedTime,
+    perfusionIndex,
+    pressure,
   });
-  
+
   const beatFlashRef = useRef({ time: 0, age: Infinity });
   const beatHistoryRef = useRef<{ isArrhythmia: boolean; time: number }[]>([]);
   const amplitudeStatsRef = useRef({ min: -50, max: 50, range: 100 });
-  
+
   const ibiDisplayRef = useRef<number>(0);
   const hrvDisplayRef = useRef<{ sdnn: number; rmssd: number }>({ sdnn: 0, rmssd: 0 });
   const bpmStatsRef = useRef<{ min: number; max: number; sum: number; n: number }>({ min: 0, max: 0, sum: 0, n: 0 });
@@ -87,34 +175,65 @@ const PPGSignalMeter = ({
   const signalPathRef = useRef<{ x: number; y: number }[]>([]);
   const prevYRef = useRef(0);
 
-  const computeCamera = useCallback((now: number) => {
-    const pitch = (38 + 2.4 * Math.sin(now / 9000)) * Math.PI / 180;
-    const yaw = 2.6 * Math.sin(now / 13000 + 1.7) * Math.PI / 180;
-    return {
-      cth: Math.cos(pitch), sth: Math.sin(pitch),
-      cph: Math.cos(yaw), sph: Math.sin(yaw),
-      H: 700, D: 2600, F: 2350,
-      cx: 420, cy: 700
+  useEffect(() => {
+    propsRef.current = { value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure };
+
+    const now = Date.now();
+
+    if (now - lastHrvUpdateRef.current > 500 && rrIntervals && rrIntervals.length >= 2) {
+      lastHrvUpdateRef.current = now;
+      const last = rrIntervals[rrIntervals.length - 1];
+      ibiDisplayRef.current = Math.round(last);
+
+      const mean = rrIntervals.reduce((a, b) => a + b, 0) / rrIntervals.length;
+      const variance = rrIntervals.reduce((sum, rr) => sum + (rr - mean) ** 2, 0) / rrIntervals.length;
+      hrvDisplayRef.current.sdnn = Math.round(Math.sqrt(variance));
+
+      let sumSqDiffs = 0;
+      for (let i = 1; i < rrIntervals.length; i++) {
+        sumSqDiffs += (rrIntervals[i] - rrIntervals[i - 1]) ** 2;
+      }
+      hrvDisplayRef.current.rmssd = Math.round(Math.sqrt(sumSqDiffs / (rrIntervals.length - 1)));
+    }
+
+    if (bpm > 30 && bpm < 220 && now - lastBpmStatsUpdateRef.current > 500) {
+      lastBpmStatsUpdateRef.current = now;
+      const s = bpmStatsRef.current;
+      if (s.n === 0) { s.min = bpm; s.max = bpm; }
+      else { if (bpm < s.min) s.min = bpm; if (bpm > s.max) s.max = bpm; }
+      s.sum += bpm;
+      s.n += 1;
+      bpmTrendRef.current.push({ t: now, bpm });
+      if (bpmTrendRef.current.length > 80) bpmTrendRef.current.shift();
+    }
+    if (!isFingerDetected && !preserveResults) {
+      bpmStatsRef.current = { min: 0, max: 0, sum: 0, n: 0 };
+      bpmTrendRef.current = [];
+    }
+  }, [value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure]);
+
+  useEffect(() => {
+    if (!dataBufferRef.current) {
+      dataBufferRef.current = new CircularBuffer(CONFIG.BUFFER_SIZE);
+    }
+    return () => {
+      isRunningRef.current = false;
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
   }, []);
 
-  const project = useCallback((x: number, y: number, z: number, cam: ReturnType<typeof computeCamera>) => {
-    const zr = -x * cam.sph + z * cam.cph;
-    const xr = x * cam.cph + z * cam.sph;
-    const yw = y - cam.H;
-    const y1 = yw * cam.cth - zr * cam.sth;
-    const z2 = yw * cam.sth + zr * cam.cth;
-    const zc = cam.D - z2;
-    const inv = cam.F / zc;
-    return { sx: cam.cx + xr * inv, sy: cam.cy - y1 * inv, zc };
-  }, []);
+  useEffect(() => {
+    if (preserveResults && !isFingerDetected) {
+      dataBufferRef.current?.clear();
+    }
+  }, [preserveResults, isFingerDetected]);
 
   const drawBackground = useCallback((ctx: CanvasRenderingContext2D) => {
     const W = CONFIG.CANVAS_WIDTH;
     const H = CONFIG.CANVAS_HEIGHT;
     ctx.fillStyle = CONFIG.BG_COLOR;
     ctx.fillRect(0, 0, W, H);
-    
+
     const bgGrad = ctx.createRadialGradient(W / 2, H * 0.36, 0, W / 2, H * 0.36, Math.max(W, H) / 1.05);
     bgGrad.addColorStop(0, '#0b1a10');
     bgGrad.addColorStop(0.5, '#050d08');
@@ -141,12 +260,12 @@ const PPGSignalMeter = ({
     const stageY0 = 280;
     const stageY1 = 1220;
     const stageH = stageY1 - stageY0;
-    
+
     ctx.save();
     ctx.beginPath();
     ctx.rect(0, stageY0, W, stageH);
     ctx.clip();
-    
+
     ctx.strokeStyle = CONFIG.GRID_MINOR;
     ctx.lineWidth = 0.5;
     const minorStep = 8;
@@ -162,7 +281,7 @@ const PPGSignalMeter = ({
       ctx.lineTo(x, stageY1);
       ctx.stroke();
     }
-    
+
     ctx.strokeStyle = CONFIG.GRID_MAJOR;
     ctx.lineWidth = 0.8;
     const majorStep = 40;
@@ -178,7 +297,7 @@ const PPGSignalMeter = ({
       ctx.lineTo(x, stageY1);
       ctx.stroke();
     }
-    
+
     ctx.strokeStyle = CONFIG.GRID_MAJOR;
     ctx.lineWidth = 1;
     const bigStep = 200;
@@ -194,23 +313,23 @@ const PPGSignalMeter = ({
       ctx.lineTo(x, stageY1);
       ctx.stroke();
     }
-    
+
     ctx.restore();
   }, []);
 
   const drawHeader = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
     const W = CONFIG.CANVAS_WIDTH;
     const { quality, elapsedTime } = propsRef.current;
-    
+
     ctx.font = `bold 11px ${CONFIG.FONT}`;
     ctx.textAlign = 'left';
     ctx.fillStyle = CONFIG.SIGNAL_COLOR;
     ctx.fillText('● CARDIAC MONITOR', 14, 22);
-    
+
     ctx.font = `9px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(0, 255, 136, 0.6)';
-    ctx.fillText('ECG SIMULATION · REAL-TIME', 14, 36);
-    
+    ctx.fillText('ECG/PPG WAVEFORM · REAL-TIME', 14, 36);
+
     const recentBeat = now - beatFlashRef.current.time < 400;
     const hx = 220;
     ctx.font = `bold 18px ${CONFIG.FONT}`;
@@ -235,7 +354,7 @@ const PPGSignalMeter = ({
     ctx.fillStyle = 'rgba(0, 255, 136, 0.6)';
     ctx.textAlign = 'left';
     ctx.fillText('LIVE', hx + 18, 30);
-    
+
     const cxc = W / 2;
     const bw = 150;
     ctx.textAlign = 'center';
@@ -253,7 +372,7 @@ const PPGSignalMeter = ({
     ctx.font = `bold 10px ${CONFIG.FONT}`;
     ctx.fillStyle = quality > 60 ? CONFIG.SIGNAL_COLOR : quality > 30 ? '#fbbf24' : '#ff5d5d';
     ctx.fillText(`${quality.toFixed(0)}%`, cxc + bw / 2 + 24, 28);
-    
+
     const d = new Date();
     const hh = String(d.getHours()).padStart(2, '0');
     const mm = String(d.getMinutes()).padStart(2, '0');
@@ -273,13 +392,13 @@ const PPGSignalMeter = ({
   const drawMetricsRow = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
     const W = CONFIG.CANVAS_WIDTH;
     const { bpm, spo2, perfusionIndex, pressure, rrIntervals } = propsRef.current;
-    
+
     const y = 52;
     const h = 200;
     const gap = 10;
     const cardW = (W - gap * 5) / 4;
     const xs = [gap, gap * 2 + cardW, gap * 3 + cardW * 2, gap * 4 + cardW * 3];
-    
+
     ctx.save();
     for (let i = 0; i < 4; i++) {
       const x = xs[i];
@@ -292,14 +411,14 @@ const PPGSignalMeter = ({
       ctx.fillRect(x, y, cardW, 2);
     }
     ctx.restore();
-    
+
     const hrCard = xs[0];
     const hrAlarm = bpm > 0 && (bpm < 60 || bpm > 100);
     ctx.font = `bold 9px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(0, 255, 136, 0.6)';
     ctx.textAlign = 'left';
     ctx.fillText('HEART RATE', hrCard + 12, y + 18);
-    
+
     const beatAge = now - beatFlashRef.current.time;
     const beatPulse = propsRef.current.isFingerDetected && beatAge < 450 ? (1 - beatAge / 450) : 0;
     const valSize = 52 + 8 * beatPulse;
@@ -330,7 +449,7 @@ const PPGSignalMeter = ({
     ctx.font = `8px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(0, 255, 136, 0.4)';
     ctx.fillText('RANGE 60-100', hrCard + 12, y + 180);
-    
+
     const spCard = xs[1];
     const spBorder = spo2 >= 95 ? CONFIG.SIGNAL_COLOR : spo2 >= 90 ? '#fbbf24' : spo2 > 0 ? '#ff5d5d' : 'rgba(0, 255, 136, 0.3)';
     ctx.font = `bold 9px ${CONFIG.FONT}`;
@@ -364,7 +483,7 @@ const PPGSignalMeter = ({
     ctx.font = `8px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(77, 215, 254, 0.4)';
     ctx.fillText('TARGET ≥ 95%', spCard + 12, y + 180);
-    
+
     const mpCard = xs[2];
     const sys = pressure?.systolic || 0;
     const dia = pressure?.diastolic || 0;
@@ -394,7 +513,7 @@ const PPGSignalMeter = ({
     ctx.font = `8px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(129, 140, 248, 0.4)';
     ctx.fillText('MAP 70-105', mpCard + 12, y + 180);
-    
+
     const piCard = xs[3];
     const piVal = perfusionIndex || 0;
     const piBorder = piVal >= 0.02 ? CONFIG.SIGNAL_COLOR : piVal >= 0.005 ? '#fbbf24' : '#ff5d5d';
@@ -421,24 +540,22 @@ const PPGSignalMeter = ({
   }, []);
 
   const draw3DStage = useCallback((ctx: CanvasRenderingContext2D, now: number) => {
-    const { COLORS } = CONFIG;
-    const { preserveResults, isFingerDetected: detected, value: signalValue, isPeak: peak, arrhythmiaStatus: arrStatus } = propsRef.current;
+    const { preserveResults, isFingerDetected: detected, value: signalValue, isPeak: peak, arrhythmiaStatus: arrStatus, bpm, rrIntervals } = propsRef.current;
     const stage = { x0: 58, x1: 782, y0: 268, y1: 1260 };
     const stageW = stage.x1 - stage.x0;
     const stageH = stage.y1 - stage.y0;
     const centerY = (stage.y0 + stage.y1) / 2;
-    const cam = computeCamera(now);
-    const proj = (x: number, y: number, z: number) => project(x, y, z, cam);
-    
+    const cam = pitchYaw(now);
+
     ctx.save();
     ctx.beginPath();
     ctx.rect(stage.x0, stage.y0, stage.x1 - stage.x0, stage.y1 - stage.y0);
     ctx.clip();
-    
-    const plBackL = proj(-420, 0, -900);
-    const plBackR = proj(420, 0, -900);
-    const plFrontL = proj(-420, 0, 0);
-    const plFrontR = proj(420, 0, 0);
+
+    const plBackL = project(-420, 0, -900, cam);
+    const plBackR = project(420, 0, -900, cam);
+    const plFrontL = project(-420, 0, 0, cam);
+    const plFrontR = project(420, 0, 0, cam);
     const planeGrad = ctx.createLinearGradient(0, plBackL.sy, 0, plFrontL.sy);
     planeGrad.addColorStop(0, 'rgba(0, 15, 8, 0.3)');
     planeGrad.addColorStop(1, 'rgba(0, 25, 15, 0.5)');
@@ -450,13 +567,13 @@ const PPGSignalMeter = ({
     ctx.lineTo(plFrontL.sx, plFrontL.sy);
     ctx.closePath();
     ctx.fill();
-    
+
     ctx.strokeStyle = 'rgba(0, 255, 136, 0.06)';
     ctx.lineWidth = 1;
     for (let i = 0; i <= 10; i++) {
       const x = -420 + (i / 10) * 840;
-      const a = proj(x, 0, -900);
-      const b = proj(x, 0, 0);
+      const a = project(x, 0, -900, cam);
+      const b = project(x, 0, 0, cam);
       ctx.beginPath();
       ctx.moveTo(a.sx, a.sy);
       ctx.lineTo(b.sx, b.sy);
@@ -464,8 +581,8 @@ const PPGSignalMeter = ({
     }
     for (let i = 0; i <= 8; i++) {
       const z = -900 + (i / 8) * 900;
-      const a = proj(-420, 0, z);
-      const b = proj(420, 0, z);
+      const a = project(-420, 0, z, cam);
+      const b = project(420, 0, z, cam);
       ctx.beginPath();
       ctx.moveTo(a.sx, a.sy);
       ctx.lineTo(b.sx, b.sy);
@@ -482,11 +599,11 @@ const PPGSignalMeter = ({
     ctx.moveTo(plBackL.sx, plBackL.sy);
     ctx.lineTo(plBackR.sx, plBackR.sy);
     ctx.stroke();
-    
+
     for (let s = 0; s <= 2.8; s += 0.5) {
       const x = -380 + (s / 2.8) * 760;
-      const a = proj(x, 0, -380);
-      const b = proj(x, 20, -380);
+      const a = project(x, 0, -380, cam);
+      const b = project(x, 20, -380, cam);
       ctx.strokeStyle = 'rgba(77, 215, 254, 0.20)';
       ctx.lineWidth = 1.2;
       ctx.beginPath();
@@ -500,15 +617,15 @@ const PPGSignalMeter = ({
         ctx.fillText(`${s}s`, a.sx, a.sy - 8);
       }
     }
-    
+
     const hasWave = !(preserveResults && !detected);
     if (!hasWave) {
       ctx.restore();
       return;
     }
-    
+
     const scaledValue = signalValue * 2;
-    
+
     if (peak) {
       beatFlashRef.current = { time: now, age: 0 };
       const currentCount = arrStatus ? parseInt(arrStatus.split('|')[1] || '0') : 0;
@@ -518,12 +635,12 @@ const PPGSignalMeter = ({
         beatHistoryRef.current = beatHistoryRef.current.slice(-20);
       }
     }
-    
+
     const buffer = dataBufferRef.current;
     if (buffer) {
       buffer.push({ time: now, value: scaledValue, isArrhythmia: false });
     }
-    
+
     const points = buffer?.getPoints() || [];
     if (points.length > 30) {
       let min = Infinity;
@@ -540,33 +657,38 @@ const PPGSignalMeter = ({
       stats.max = stats.max * 0.95 + (max + range * 0.1) * 0.05;
       stats.range = stats.max - stats.min;
     }
-    
+
     const stats = amplitudeStatsRef.current;
     const beatAge = now - beatFlashRef.current.time;
     const beatPulse = Math.exp(-Math.max(0, beatAge) / 320);
     const ampBoost = 1 + 0.06 * beatPulse;
     const waveBright = 0.72 + 0.28 * beatPulse;
-    
-    const proj3: { sx: number; sy: number; syPlane: number; isArr: boolean; x: number; y: number; zc: number }[] = [];
+
+    const proj3: { sx: number; sy: number; syPlane: number; isArr: boolean; x: number; y: number; zc: number; tag: string }[] = [];
     const pointsList = points.length > 400 ? points.slice(-400) : points;
-    
+
+    const rrSample = rrIntervals && rrIntervals.length > 0 ? rrIntervals[rrIntervals.length - 1] : undefined;
+    const { label: rhythmLabel } = beatAnnotations(rrSample, bpm, arrStatus);
+
     for (let i = 0; i < pointsList.length; i++) {
       const pt = pointsList[i];
       const age = now - pt.time;
       if (age > CONFIG.WINDOW_MS) continue;
       const x = -380 + ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS) * 760;
       const z = -380 + (age / CONFIG.WINDOW_MS) * 130;
+      const phase = ((CONFIG.WINDOW_MS - age) / CONFIG.WINDOW_MS);
+      const modeled = cardiacModel(phase);
       const normalizedY = (stats.max - pt.value) / stats.range;
       const worldY = (normalizedY - 0.5) * 1520 * ampBoost;
-      const p = proj(x, worldY, z);
-      const pp = proj(x, 0, z);
-      proj3.push({ sx: p.sx, sy: p.sy, syPlane: pp.sy, isArr: pt.isArrhythmia, x, y: worldY, zc: p.zc });
+      const p = project(x, worldY, z, cam);
+      const pp = project(x, 0, z, cam);
+      proj3.push({ sx: p.sx, sy: p.sy, syPlane: pp.sy, isArr: pt.isArrhythmia, x, y: worldY, zc: p.zc, tag: modeled.tag });
     }
-    
+
     if (proj3.length > 2) {
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
-      
+
       ctx.save();
       ctx.globalAlpha = 0.12;
       ctx.strokeStyle = CONFIG.SIGNAL_COLOR;
@@ -574,13 +696,13 @@ const PPGSignalMeter = ({
       ctx.beginPath();
       let mstarted = false;
       for (const c of proj3) {
-        const m = proj(c.x, -c.y * 0.5, -380);
+        const m = project(c.x, -c.y * 0.5, -380, cam);
         if (!mstarted) { ctx.moveTo(m.sx, m.sy); mstarted = true; }
         else ctx.lineTo(m.sx, m.sy);
       }
       ctx.stroke();
       ctx.restore();
-      
+
       ctx.beginPath();
       ctx.moveTo(proj3[0].sx, proj3[0].sy);
       for (const c of proj3) ctx.lineTo(c.sx, c.sy);
@@ -592,7 +714,7 @@ const PPGSignalMeter = ({
       ribbonGrad.addColorStop(1, 'rgba(0, 255, 136, 0.0)');
       ctx.fillStyle = ribbonGrad;
       ctx.fill();
-      
+
       const runs: { pts: { sx: number; sy: number; syPlane: number }[]; arr: boolean }[] = [];
       let currentRun: { sx: number; sy: number; syPlane: number }[] = [];
       let currentArr = proj3[0].isArr;
@@ -606,7 +728,7 @@ const PPGSignalMeter = ({
         }
       }
       if (currentRun.length > 1) runs.push({ pts: currentRun, arr: currentArr });
-      
+
       ctx.strokeStyle = 'rgba(0, 255, 136, 0.10)';
       ctx.lineWidth = 1;
       for (let i = 0; i < proj3.length; i += 3) {
@@ -616,7 +738,7 @@ const PPGSignalMeter = ({
         ctx.lineTo(c.sx, c.syPlane);
         ctx.stroke();
       }
-      
+
       for (const run of runs) {
         if (!run.arr) continue;
         ctx.beginPath();
@@ -627,7 +749,7 @@ const PPGSignalMeter = ({
         ctx.fillStyle = 'rgba(255, 51, 68, 0.08)';
         ctx.fill();
       }
-      
+
       const strokePass = (arr: boolean, width: number, alpha: number, blur: number, useCore = false) => {
         ctx.save();
         ctx.globalAlpha = alpha * waveBright;
@@ -646,17 +768,33 @@ const PPGSignalMeter = ({
         }
         ctx.restore();
       };
-      
+
       strokePass(false, 8, 0.15, 20);
       strokePass(true, 8, 0.15, 20);
       strokePass(false, 2.5, 0.9, 10);
       strokePass(true, 2.5, 0.9, 10);
       strokePass(false, 1, 1, 0, true);
       strokePass(true, 1, 1, 0, true);
-      
+
+      ctx.save();
+      ctx.globalAlpha = 0.85 * waveBright;
+      ctx.strokeStyle = CONFIG.BASELINE_COLOR;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 6]);
+      ctx.beginPath();
+      let started = false;
+      for (const c of proj3) {
+        const base = project(c.x, 0, -380, cam);
+        if (!started) { ctx.moveTo(base.sx, base.sy); started = true; }
+        else ctx.lineTo(base.sx, base.sy);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
       const last = proj3[proj3.length - 1];
-      const beamTop = proj(last.x, 1300, -380);
-      const beamBottom = proj(last.x, -1000, -380);
+      const beamTop = project(last.x, 1300, -380, cam);
+      const beamBottom = project(last.x, -1000, -380, cam);
       const beamGrad = ctx.createLinearGradient(beamTop.sx - 70, 0, beamTop.sx + 6, 0);
       const beamPulse = 0.14 + 0.08 * Math.sin(now / 240) + 0.10 * beatPulse;
       beamGrad.addColorStop(0, 'rgba(0, 255, 136, 0)');
@@ -671,19 +809,28 @@ const PPGSignalMeter = ({
       ctx.fillStyle = `rgba(0, 255, 136, ${0.35 + 0.2 * beatPulse})`;
       ctx.fillRect(beamTop.sx - 1.5, btop, 1.5, bheight);
       ctx.restore();
+
+      ctx.save();
+      ctx.font = `bold 9px ${CONFIG.FONT}`;
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.textAlign = 'left';
+      ctx.shadowColor = 'rgba(0,0,0,0.8)';
+      ctx.shadowBlur = 6;
+      ctx.fillText(`RHYTHM ${rhythmLabel}`, last.sx + 8, last.sy - 14);
+      ctx.restore();
     }
     ctx.restore();
-  }, [computeCamera, project]);
+  }, []);
 
   const drawAnalyticsBand = useCallback((ctx: CanvasRenderingContext2D) => {
     const W = CONFIG.CANVAS_WIDTH;
     const { rrIntervals, bpm, spo2 } = propsRef.current;
-    
+
     const y = 1264;
     const h = 320;
     const gap = 10;
     const w = (W - gap * 3) / 2;
-    
+
     ctx.save();
     for (let i = 0; i < 2; i++) {
       const x = i === 0 ? gap : gap * 2 + w;
@@ -696,13 +843,13 @@ const PPGSignalMeter = ({
       ctx.fillRect(x, y, w, 2);
     }
     ctx.restore();
-    
+
     const tx = gap;
     ctx.font = `bold 9px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(0, 255, 136, 0.6)';
     ctx.textAlign = 'left';
     ctx.fillText('HRV ANALYSIS', tx + 14, y + 18);
-    
+
     const trend = bpmTrendRef.current;
     if (trend.length >= 2) {
       let minB = trend[0].bpm;
@@ -745,11 +892,11 @@ const PPGSignalMeter = ({
     ctx.moveTo(tx + 10, y + 132);
     ctx.lineTo(tx + w - 10, y + 132);
     ctx.stroke();
-    
+
     ctx.font = `8px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(0, 255, 136, 0.5)';
     ctx.fillText('HRV METRICS', tx + 14, y + 150);
-    
+
     const hrv = hrvDisplayRef.current;
     const ibi = ibiDisplayRef.current;
     const meanRR = rrIntervals && rrIntervals.length > 0
@@ -772,13 +919,13 @@ const PPGSignalMeter = ({
     const meanBpm = stats.n > 0 ? Math.round(stats.sum / stats.n) : 0;
     ctx.fillStyle = 'rgba(0, 255, 136, 0.5)';
     ctx.fillText(`AVG HR ${meanBpm || '--'} bpm`, tx + 14, y + 276);
-    
+
     const rx = gap * 2 + w;
     ctx.font = `bold 9px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(77, 215, 254, 0.6)';
     ctx.textAlign = 'left';
     ctx.fillText('RR INTERVALS', rx + 14, y + 18);
-    
+
     if (rrIntervals && rrIntervals.length >= 2) {
       const rrRecent = rrIntervals.slice(-60);
       let rrMin = Infinity;
@@ -814,14 +961,14 @@ const PPGSignalMeter = ({
       ctx.textAlign = 'right';
       ctx.fillText(`${Math.round(rrMax)}ms`, px0 + pw - 2, py0 + 12);
     }
-    
+
     ctx.strokeStyle = 'rgba(0, 255, 136, 0.15)';
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(rx + 10, y + 132);
     ctx.lineTo(rx + w - 10, y + 132);
     ctx.stroke();
-    
+
     ctx.font = `8px ${CONFIG.FONT}`;
     ctx.fillStyle = 'rgba(0, 255, 136, 0.5)';
     ctx.fillText('BEAT HISTORY', rx + 14, y + 150);
@@ -833,7 +980,7 @@ const PPGSignalMeter = ({
     ctx.fillText(`N:${normalCount}`, rx + w - 14, y + 150);
     ctx.fillStyle = arrCount > 0 ? CONFIG.SIGNAL_ARRHYTHMIA : 'rgba(0, 255, 136, 0.3)';
     ctx.fillText(` A:${arrCount}`, rx + w - 60, y + 150);
-    
+
     const dotSpacing = 22;
     const totalWidth = beatHistory.length * dotSpacing;
     const startX = rx + w / 2 - totalWidth / 2;
@@ -866,7 +1013,7 @@ const PPGSignalMeter = ({
       ctx.textAlign = 'center';
       ctx.fillText('—', rx + w / 2, cy + 4);
     }
-    
+
     ctx.strokeStyle = 'rgba(0, 255, 136, 0.15)';
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -897,12 +1044,12 @@ const PPGSignalMeter = ({
   const drawFooter = useCallback((ctx: CanvasRenderingContext2D) => {
     const W = CONFIG.CANVAS_WIDTH;
     const { bpm, spo2 } = propsRef.current;
-    
+
     ctx.font = `8px ${CONFIG.FONT}`;
     ctx.textAlign = 'left';
     const lx = 14;
     const ly = 1656;
-    
+
     ctx.fillStyle = CONFIG.SIGNAL_COLOR;
     ctx.fillRect(lx, ly - 6, 15, 3);
     ctx.beginPath();
@@ -910,7 +1057,7 @@ const PPGSignalMeter = ({
     ctx.fill();
     ctx.fillStyle = 'rgba(0, 255, 136, 0.6)';
     ctx.fillText('Normal', lx + 30, ly);
-    
+
     ctx.fillStyle = CONFIG.SIGNAL_ARRHYTHMIA;
     ctx.fillRect(lx + 100, ly - 6, 15, 3);
     ctx.beginPath();
@@ -918,14 +1065,14 @@ const PPGSignalMeter = ({
     ctx.fill();
     ctx.fillStyle = 'rgba(0, 255, 136, 0.6)';
     ctx.fillText('Arrhythmia', lx + 130, ly);
-    
+
     ctx.beginPath();
     ctx.arc(lx + 220, ly - 4, 4, 0, Math.PI * 2);
     ctx.fillStyle = CONFIG.SIGNAL_COLOR;
     ctx.fill();
     ctx.fillStyle = 'rgba(0, 255, 136, 0.6)';
     ctx.fillText('Peak', lx + 230, ly);
-    
+
     ctx.beginPath();
     ctx.moveTo(lx + 264, ly - 6);
     ctx.lineTo(lx + 260, ly);
@@ -934,14 +1081,14 @@ const PPGSignalMeter = ({
     ctx.fillStyle = 'rgba(0, 255, 136, 0.6)';
     ctx.fill();
     ctx.fillText('Valley', lx + 274, ly);
-    
+
     ctx.fillStyle = 'rgba(103, 232, 249, 0.6)';
     ctx.fillRect(lx + 318, ly - 5, 12, 2);
     ctx.fillText('IBI', lx + 336, ly);
-    
+
     ctx.fillStyle = 'rgba(0, 255, 136, 0.3)';
     ctx.fillText('SWEEP 25mm/s · FILTER 0.5-4Hz · SOURCE PPG', 420, ly);
-    
+
     ctx.textAlign = 'right';
     const alarms: string[] = [];
     if (bpm > 0 && (bpm < 50 || bpm > 120)) alarms.push('HR!');
@@ -964,66 +1111,14 @@ const PPGSignalMeter = ({
     }
   }, []);
 
-  useEffect(() => {
-    propsRef.current = { value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure };
-    
-    const now = Date.now();
-    
-    if (now - lastHrvUpdateRef.current > 500 && rrIntervals && rrIntervals.length >= 2) {
-      lastHrvUpdateRef.current = now;
-      const last = rrIntervals[rrIntervals.length - 1];
-      ibiDisplayRef.current = Math.round(last);
-      
-      const mean = rrIntervals.reduce((a, b) => a + b, 0) / rrIntervals.length;
-      const variance = rrIntervals.reduce((sum, rr) => sum + (rr - mean) ** 2, 0) / rrIntervals.length;
-      hrvDisplayRef.current.sdnn = Math.round(Math.sqrt(variance));
-      
-      let sumSqDiffs = 0;
-      for (let i = 1; i < rrIntervals.length; i++) {
-        sumSqDiffs += (rrIntervals[i] - rrIntervals[i - 1]) ** 2;
-      }
-      hrvDisplayRef.current.rmssd = Math.round(Math.sqrt(sumSqDiffs / (rrIntervals.length - 1)));
-    }
-    
-    if (bpm > 30 && bpm < 220 && now - lastBpmStatsUpdateRef.current > 500) {
-      lastBpmStatsUpdateRef.current = now;
-      const s = bpmStatsRef.current;
-      if (s.n === 0) { s.min = bpm; s.max = bpm; }
-      else { if (bpm < s.min) s.min = bpm; if (bpm > s.max) s.max = bpm; }
-      s.sum += bpm; s.n += 1;
-      bpmTrendRef.current.push({ t: now, bpm });
-      if (bpmTrendRef.current.length > 80) bpmTrendRef.current.shift();
-    }
-    if (!isFingerDetected && !preserveResults) {
-      bpmStatsRef.current = { min: 0, max: 0, sum: 0, n: 0 };
-      bpmTrendRef.current = [];
-    }
-  }, [value, quality, isFingerDetected, arrhythmiaStatus, preserveResults, isPeak, bpm, spo2, rrIntervals, rawArrhythmiaData, elapsedTime, perfusionIndex, pressure]);
-
-  useEffect(() => {
-    if (!dataBufferRef.current) {
-      dataBufferRef.current = new CircularBuffer(CONFIG.BUFFER_SIZE);
-    }
-    return () => {
-      isRunningRef.current = false;
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (preserveResults && !isFingerDetected) {
-      dataBufferRef.current?.clear();
-    }
-  }, [preserveResults, isFingerDetected]);
-
   const render = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
-    
+
     const now = Date.now();
-    
+
     ensureBgCache(ctx);
     drawECGGrid(ctx);
     drawHeader(ctx, now);
@@ -1036,26 +1131,26 @@ const PPGSignalMeter = ({
   useEffect(() => {
     if (isRunningRef.current) return;
     isRunningRef.current = true;
-    
+
     const frameTime = 1000 / CONFIG.TARGET_FPS;
     let lastRenderTime = 0;
-    
+
     const renderLoop = () => {
       if (!isRunningRef.current) return;
-      
+
       const now = Date.now();
       if (now - lastRenderTime < frameTime) {
         animationRef.current = requestAnimationFrame(renderLoop);
         return;
       }
       lastRenderTime = now;
-      
+
       render();
       animationRef.current = requestAnimationFrame(renderLoop);
     };
-    
+
     animationRef.current = requestAnimationFrame(renderLoop);
-    
+
     return () => {
       isRunningRef.current = false;
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
@@ -1084,7 +1179,7 @@ const PPGSignalMeter = ({
         className="w-full h-full absolute inset-0"
       />
       <div className="fixed bottom-0 left-0 right-0 h-12 grid grid-cols-2 z-10">
-        <button 
+        <button
           onClick={onStartMeasurement}
           className={`font-semibold text-sm tracking-wide transition-colors border-t backdrop-blur-sm ${
             isMonitoring
@@ -1094,7 +1189,7 @@ const PPGSignalMeter = ({
         >
           {isMonitoring ? 'DETENER' : 'INICIAR'}
         </button>
-        <button 
+        <button
           onClick={handleReset}
           className="bg-slate-700/15 hover:bg-slate-700/25 active:bg-slate-700/35 text-slate-300 font-semibold text-sm tracking-wide transition-colors border-t border-slate-700/40 backdrop-blur-sm"
         >
