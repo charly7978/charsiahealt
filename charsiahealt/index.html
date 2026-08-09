@@ -1,0 +1,78 @@
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>healthpulse-captain</title>
+    <style>
+      :root {
+        --sat: env(safe-area-inset-top);
+        --sar: env(safe-area-inset-right);
+        --sab: env(safe-area-inset-bottom);
+        --sal: env(safe-area-inset-left);
+      }
+      
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        -webkit-tap-highlight-color: transparent;
+      }
+      
+      html {
+        height: 100%;
+        height: -webkit-fill-available;
+      }
+      
+      body {
+        min-height: 100%;
+        min-height: -webkit-fill-available;
+        background: #000;
+        overflow: hidden;
+        position: fixed;
+        inset: 0;
+        padding: var(--sat) var(--sar) var(--sab) var(--sal);
+      }
+      
+      #root {
+        width: 100%;
+        height: 100%;
+        height: 100vh;
+        height: -webkit-fill-available;
+        display: flex;
+        flex-direction: column;
+        background: #000;
+        overflow: hidden;
+      }
+
+      @supports (height: 100dvh) {
+        #root {
+          height: 100dvh;
+        }
+      }
+    </style>
+    
+  
+  <meta name="description" content="This app monitors vital signs like heart rate, SpO2, and blood pressure using the device&#39;s camera.">
+  
+  
+  <meta property="og:image" content="https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/0b1ee978-9e0d-4723-92fc-58da3660384f/id-preview-db4957d3--47bac171-d383-419e-92ab-6f1092178f39.lovable.app-1775707731324.png">
+  <meta name="twitter:image" content="https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/0b1ee978-9e0d-4723-92fc-58da3660384f/id-preview-db4957d3--47bac171-d383-419e-92ab-6f1092178f39.lovable.app-1775707731324.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="healthpulse-captain">
+  <meta name="twitter:title" content="healthpulse-captain">
+  <meta property="og:description" content="This app monitors vital signs like heart rate, SpO2, and blood pressure using the device&#39;s camera.">
+  <meta name="twitter:description" content="This app monitors vital signs like heart rate, SpO2, and blood pressure using the device&#39;s camera.">
+</head>
+  <body>
+    <div id="root"></div>
+    <script src="https://cdn.gpteng.co/gptengineer.js" type="module"></script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

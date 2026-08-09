@@ -1,0 +1,1375 @@
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import { Heart, AlertTriangle, Activity, X, Shield, Clock, CheckCircle2, Brain, Loader2, Settings as SettingsIcon } from "lucide-react";
+import { playCompletionSound } from "@/utils/soundUtils";
+import VitalSign from "@/components/VitalSign";
+import CameraView, { CameraViewHandle } from "@/components/CameraView";
+import { useSignalProcessor } from "@/hooks/useSignalProcessor";
+import { useHeartBeatProcessor } from "@/hooks/useHeartBeatProcessor";
+import { useVitalSignsProcessor } from "@/hooks/useVitalSignsProcessor";
+import { useSaveMeasurement } from "@/hooks/useSaveMeasurement";
+import { useHealthAnalysis } from "@/hooks/useHealthAnalysis";
+import PPGSignalMeter from "@/components/PPGSignalMeter";
+import { VitalSignsResult } from "@/modules/vital-signs/VitalSignsProcessor";
+import { toast } from "@/hooks/use-toast";
+import { ppgPerf } from "@/utils/logger";
+import { usePerfTelemetry, getPerfConsent, setPerfConsent } from "@/hooks/usePerfTelemetry";
+import type { BackpressureConfig } from "@/lib/perf/backpressureConfig";
+import { VitalsSanityChecker } from "@/lib/sanity/vitalsSanity";
+import {
+  SANITY_PROFILES,
+  getActiveProfileId,
+  setActiveProfileId,
+  getCustomOverrides,
+  setCustomOverrides,
+  resolveProfile,
+} from "@/lib/sanity/sanityProfiles";
+import {
+  startSession as startAuditSession,
+  setActiveProfile as setAuditProfile,
+  recordVerdict as recordAuditVerdict,
+  clearLog as clearAuditLog,
+  downloadJSON as downloadAuditJSON,
+  downloadCSV as downloadAuditCSV,
+  getEntries as getAuditEntries,
+  getNegativeCount as getAuditNegativeCount,
+  getPersistedEntries as getPersistedAuditEntries,
+  getPersistedNegativeCount as getPersistedAuditNegativeCount,
+  clearPersistedLog as clearPersistedAuditLog,
+} from "@/lib/sanity/sanityAuditLog";
+
+import { supabase } from "@/integrations/supabase/client";
+
+interface VideoFrameMetadata {
+  mediaTime?: number;
+  presentationTime?: number;
+  expectedDisplayTime?: number;
+  width?: number;
+  height?: number;
+  presentedFrames?: number;
+  processingDuration?: number;
+}
+
+/** Compara los campos mostrados de dos resultados de vitales (evita re-renders
+ *  cuando el procesador devuelve un objeto nuevo con los mismos valores). */
+function vitalsEqual(a: VitalSignsResult, b: VitalSignsResult): boolean {
+  return (
+    a.spo2 === b.spo2 &&
+    a.glucose === b.glucose &&
+    a.hemoglobin === b.hemoglobin &&
+    a.pressure.systolic === b.pressure.systolic &&
+    a.pressure.diastolic === b.pressure.diastolic &&
+    a.pressure.confidence === b.pressure.confidence &&
+    a.lipids.totalCholesterol === b.lipids.totalCholesterol &&
+    a.lipids.triglycerides === b.lipids.triglycerides &&
+    a.arrhythmiaStatus === b.arrhythmiaStatus &&
+    a.arrhythmiaCount === b.arrhythmiaCount &&
+    a.signalQuality === b.signalQuality &&
+    a.measurementConfidence === b.measurementConfidence &&
+    a.isCalibrating === b.isCalibrating &&
+    a.calibrationProgress === b.calibrationProgress
+  );
+}
+
+const Index = () => {
+  // ESTADOS PRINCIPALES
+  const [isMonitoring, setIsMonitoring] = useState(false);
+  const [isCameraOn, setIsCameraOn] = useState(false);
+  const [vitalSigns, setVitalSigns] = useState<VitalSignsResult>({
+    spo2: 0,
+    glucose: 0,
+    hemoglobin: 0,
+    pressure: { systolic: 0, diastolic: 0, confidence: 'INSUFFICIENT' as const, featureQuality: 0 },
+    arrhythmiaCount: 0,
+    arrhythmiaStatus: "SIN ARRITMIAS|0",
+    lipids: { totalCholesterol: 0, triglycerides: 0 },
+    isCalibrating: false,
+    calibrationProgress: 0,
+    lastArrhythmiaData: undefined,
+    signalQuality: 0,
+    measurementConfidence: 'INVALID'
+  });
+  const [heartRate, setHeartRate] = useState(0);
+  const [heartbeatSignal, setHeartbeatSignal] = useState(0);
+  const [beatMarker, setBeatMarker] = useState(0);
+  const [arrhythmiaCount, setArrhythmiaCount] = useState<string | number>("--");
+  const [elapsedTime, setElapsedTime] = useState(0);
+  const [showResults, setShowResults] = useState(false);
+  const [isCalibrating, setIsCalibrating] = useState(false);
+  const [calibrationProgress, setCalibrationProgress] = useState(0);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [rrIntervals, setRRIntervals] = useState<number[]>([]);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  
+  const [measurementSummary, setMeasurementSummary] = useState<{
+    totalBeats: number;
+    arrhythmiaBeats: number;
+    normalPercent: number;
+  } | null>(null);
+  
+  // REFERENCIAS
+  const measurementTimerRef = useRef<number | null>(null);
+  const totalBeatsRef = useRef(0);
+  const arrhythmiaBeatsRef = useRef(0);
+  const lastArrhythmiaCountForBeatsRef = useRef(0);
+  const arrhythmiaDetectedRef = useRef(false);
+  const lastArrhythmiaData = useRef<{ timestamp: number; rmssd: number; rrVariation: number; } | null>(null);
+  const cameraRef = useRef<CameraViewHandle>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const frameLoopRef = useRef<number | null>(null);
+  const isProcessingRef = useRef(false);
+  const vitalSignsFrameCounter = useRef<number>(0);
+  const unstableFrameCounter = useRef<number>(0);
+  const latestArrhythmiaCountRef = useRef<number>(0);
+  const prevRRIntervalsRef = useRef<number[]>([]);
+  // anti-sim-allow: reason="Wires up the runtime detector for fabricated vitals streams." ref="GUARDRAIL-DIST-RUNTIME"
+  // Runtime guardrail: detect implausible vitals streams.
+  const [sanityProfileId, setSanityProfileId] = useState<string>(() => getActiveProfileId());
+  const [customJSON, setCustomJSON] = useState<string>(() => {
+    const o = getCustomOverrides();
+    return Object.keys(o).length ? JSON.stringify(o, null, 2) : "";
+  });
+  const [auditNegativeCount, setAuditNegativeCount] = useState(0);
+  const bpmSanityRef = useRef<VitalsSanityChecker>(
+    new VitalsSanityChecker({
+      ...resolveProfile(getActiveProfileId()).effective,
+      onVerdict: (sample, verdict, win) => {
+        recordAuditVerdict(sample, verdict, win);
+        if (!verdict.ok) setAuditNegativeCount(getAuditNegativeCount());
+      },
+    })
+  );
+  const sanityErrorRef = useRef<string | null>(null);
+  const sanityToastAtRef = useRef<number>(0);
+  const [sanityError, setSanityError] = useState<string | null>(null);
+
+  const rebuildSanityChecker = useCallback((profileId: string) => {
+    const { effective } = resolveProfile(profileId);
+    bpmSanityRef.current = new VitalsSanityChecker({
+      ...effective,
+      onVerdict: (sample, verdict, win) => {
+        recordAuditVerdict(sample, verdict, win);
+        if (!verdict.ok) setAuditNegativeCount(getAuditNegativeCount());
+      },
+    });
+    setAuditProfile(profileId);
+  }, []);
+
+  const handleProfileChange = useCallback((id: string) => {
+    setSanityProfileId(id);
+    setActiveProfileId(id);
+    rebuildSanityChecker(id);
+  }, [rebuildSanityChecker]);
+
+  const handleCustomApply = useCallback(() => {
+    const txt = customJSON.trim();
+    try {
+      const parsed = txt ? JSON.parse(txt) : {};
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        setCustomOverrides(parsed);
+        rebuildSanityChecker(sanityProfileId);
+        toast({ title: "✓ Umbrales aplicados", description: "Configuración personalizada activa." });
+      } else {
+        throw new Error("JSON debe ser un objeto");
+      }
+    } catch (e) {
+      toast({ variant: "destructive", title: "JSON inválido", description: String((e as Error).message ?? e) });
+    }
+  }, [customJSON, sanityProfileId, rebuildSanityChecker]);
+
+  const handleCustomClear = useCallback(() => {
+    setCustomOverrides(null);
+    setCustomJSON("");
+    rebuildSanityChecker(sanityProfileId);
+  }, [sanityProfileId, rebuildSanityChecker]);
+
+  // HOOKS DE PROCESAMIENTO
+  const { 
+    startProcessing, 
+    stopProcessing, 
+    lastSignal, 
+    processFrame, 
+    isProcessing, 
+    framesProcessed,
+    getRGBStats,
+    getBackpressureState,
+    getBackpressureConfig,
+    setBackpressureConfig,
+    currentStride,
+  } = useSignalProcessor();
+  
+  const { 
+    processSignal: processHeartBeat, 
+    reset: resetHeartBeat,
+  } = useHeartBeatProcessor();
+  
+  const { 
+    processSignal: processVitalSigns, 
+    setRGBData,
+    reset: resetVitalSigns,
+    fullReset: fullResetVitalSigns,
+    hasValidPressureEstimate,
+    lastValidResults,
+    startCalibration,
+    forceCalibrationCompletion,
+    getCalibrationProgress
+  } = useVitalSignsProcessor();
+  
+  const { saveMeasurement } = useSaveMeasurement();
+  const { analysis, isAnalyzing, analyzeVitals, clearAnalysis } = useHealthAnalysis();
+  const [showAIAnalysis, setShowAIAnalysis] = useState(false);
+
+  // ---- Telemetría de rendimiento (opt-in) ----
+  const [telemetryOn, setTelemetryOn] = useState<boolean>(() => getPerfConsent());
+  const [showSettings, setShowSettings] = useState(false);
+  const [bpCfg, setBpCfg] = useState<BackpressureConfig>(() => getBackpressureConfig());
+
+  const updateBp = useCallback((patch: Partial<BackpressureConfig>) => {
+    const next = setBackpressureConfig(patch);
+    setBpCfg(next);
+  }, [setBackpressureConfig]);
+  usePerfTelemetry({
+    enabled: telemetryOn && isMonitoring,
+    intervalMs: 15000,
+    context: {
+      getCamera: () => cameraRef.current?.getDiagnostics?.() ?? {},
+      getPipeline: () => ({
+        sqi: lastSignal?.quality ?? 0,
+        fingerDetected: !!lastSignal?.fingerDetected,
+        perfusionIndex: lastSignal?.perfusionIndex ?? 0,
+        bpm: heartRate,
+        spo2: vitalSigns.spo2,
+        confidence: vitalSigns.measurementConfidence,
+        backpressure: getBackpressureState(),
+      }),
+    },
+  });
+
+  // ---- Aviso visual cuando el backpressure adaptativo cambia el stride ----
+  // Solo notifica cambios *automáticos* (no overrides manuales del usuario)
+  // y solo durante una medición activa, con una ventana de gracia inicial
+  // para no disparar al arrancar.
+  const prevStrideRef = useRef<number>(currentStride);
+  const monitoringStartedAtRef = useRef<number>(0);
+  useEffect(() => {
+    if (isMonitoring && monitoringStartedAtRef.current === 0) {
+      monitoringStartedAtRef.current = performance.now();
+      prevStrideRef.current = currentStride;
+      return;
+    }
+    if (!isMonitoring) {
+      monitoringStartedAtRef.current = 0;
+      prevStrideRef.current = currentStride;
+      return;
+    }
+    const prev = prevStrideRef.current;
+    if (prev === currentStride) return;
+    prevStrideRef.current = currentStride;
+
+    // Ventana de gracia: ignora transiciones en los primeros 2s.
+    if (performance.now() - monitoringStartedAtRef.current < 2000) return;
+
+    // Si el cambio es manual (forceStride definido), no notificamos.
+    try {
+      const cfg = getBackpressureConfig();
+      if (typeof cfg.forceStride === 'number') return;
+      if (!cfg.enabled) return;
+    } catch { return; }
+
+    if (currentStride > prev) {
+      toast({
+        title: "⚡ Modo ahorro activado",
+        description: `Rendimiento bajo detectado, reduciendo muestreo (stride ${currentStride}).`,
+        duration: 3000,
+      });
+    } else {
+      toast({
+        title: "✓ Rendimiento restaurado",
+        description: `Muestreo completo activo (stride ${currentStride}).`,
+        duration: 2500,
+      });
+    }
+  }, [currentStride, isMonitoring, getBackpressureConfig]);
+
+  // CANVAS PARA CAPTURA
+  useEffect(() => {
+    if (!canvasRef.current) {
+      canvasRef.current = document.createElement('canvas');
+      canvasRef.current.width = 320;
+      canvasRef.current.height = 240;
+      ctxRef.current = canvasRef.current.getContext('2d', { 
+        willReadFrequently: true,
+        alpha: false 
+      });
+    }
+  }, []);
+
+  // PANTALLA COMPLETA
+  const enterFullScreen = useCallback(async () => {
+    if (isFullscreen) return;
+    try {
+      const docEl = document.documentElement;
+      const webkitDocEl = docEl as unknown as { webkitRequestFullscreen?: () => Promise<void> };
+      if (docEl.requestFullscreen) {
+        await docEl.requestFullscreen();
+      } else if (webkitDocEl.webkitRequestFullscreen) {
+        await webkitDocEl.webkitRequestFullscreen();
+      }
+      if (screen.orientation?.lock) {
+        await screen.orientation.lock('portrait').catch(() => {});
+      }
+      setIsFullscreen(true);
+    } catch (err) {
+      console.log('Error pantalla completa:', err);
+    }
+  }, [isFullscreen]);
+  
+  const exitFullScreen = useCallback(() => {
+    if (!isFullscreen) return;
+    try {
+      const doc = document as unknown as { webkitExitFullscreen?: () => void };
+      if (document.exitFullscreen) {
+        document.exitFullscreen();
+      } else if (doc.webkitExitFullscreen) {
+        doc.webkitExitFullscreen();
+      }
+      screen.orientation?.unlock();
+      setIsFullscreen(false);
+    } catch {
+      /* ignore */
+    }
+  }, [isFullscreen]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => enterFullScreen(), 1000);
+    
+    const handleFullscreenChange = () => {
+      const doc = document as unknown as { webkitFullscreenElement?: Element };
+      setIsFullscreen(Boolean(
+        document.fullscreenElement || doc.webkitFullscreenElement
+      ));
+    };
+    
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
+    
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('fullscreenchange', handleFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
+    };
+  }, [enterFullScreen]);
+
+  // PREVENIR SCROLL
+  useEffect(() => {
+    const preventScroll = (e: Event) => e.preventDefault();
+    document.body.addEventListener('touchmove', preventScroll, { passive: false });
+    document.body.addEventListener('scroll', preventScroll, { passive: false });
+    return () => {
+      document.body.removeEventListener('touchmove', preventScroll);
+      document.body.removeEventListener('scroll', preventScroll);
+    };
+  }, []);
+
+  // SINCRONIZACIÓN DE RESULTADOS
+  useEffect(() => {
+    if (lastValidResults && !isMonitoring) {
+      setVitalSigns(lastValidResults);
+      setShowResults(true);
+    }
+  }, [lastValidResults, isMonitoring]);
+
+  // === LOOP DE CAPTURA — requestVideoFrameCallback con fallback RAF ===
+  const startFrameLoop = useCallback(() => {
+    if (isProcessingRef.current) return;
+    isProcessingRef.current = true;
+    
+    const canvas = canvasRef.current;
+    const ctx = ctxRef.current;
+    if (!canvas || !ctx) {
+      isProcessingRef.current = false;
+      return;
+    }
+
+    const captureOneFrame = () => {
+      if (!isProcessingRef.current) return;
+      const video = cameraRef.current?.getVideoElement();
+      if (!video || video.readyState < 2 || video.videoWidth === 0) {
+        frameLoopRef.current = requestAnimationFrame(() => captureOneFrame());
+        return;
+      }
+      try {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        processFrame(imageData);
+      } catch {
+        /* frame fallido: se omite sin parar el loop */
+      }
+      scheduleNext(video);
+    };
+
+    const scheduleNext = (video: HTMLVideoElement) => {
+      if (!isProcessingRef.current) return;
+      if ('requestVideoFrameCallback' in video) {
+        const vfcVideo = video as HTMLVideoElement & {
+          requestVideoFrameCallback?: (
+            cb: (now: number, metadata: VideoFrameMetadata) => void
+          ) => number;
+        };
+        vfcVideo.requestVideoFrameCallback?.((_now: number, metadata: VideoFrameMetadata) => {
+          ppgPerf.markFrame(metadata);
+          captureOneFrame();
+        });
+      } else {
+        ppgPerf.markFrame();
+        frameLoopRef.current = requestAnimationFrame(() => captureOneFrame());
+      }
+    };
+    
+    console.log('🎬 Captura iniciada (requestVideoFrameCallback)');
+    captureOneFrame();
+  }, [processFrame]);
+
+  const stopFrameLoop = useCallback(() => {
+    isProcessingRef.current = false;
+    if (frameLoopRef.current) {
+      cancelAnimationFrame(frameLoopRef.current);
+      frameLoopRef.current = null;
+    }
+  }, []);
+
+  // === INICIO DE MONITOREO ===
+  const startMonitoring = useCallback(() => {
+    if (isMonitoring) return;
+    
+    console.log('🚀 Iniciando monitoreo...');
+    
+    if (navigator.vibrate) {
+      navigator.vibrate([200]);
+    }
+    
+    enterFullScreen();
+    setShowResults(false);
+    setMeasurementSummary(null);
+    setElapsedTime(0);
+    totalBeatsRef.current = 0;
+    arrhythmiaBeatsRef.current = 0;
+    lastArrhythmiaCountForBeatsRef.current = 0;
+    setVitalSigns(prev => ({ ...prev, arrhythmiaStatus: "SIN ARRITMIAS|0" }));
+    
+    // Iniciar procesamiento
+    startProcessing();
+    setIsCameraOn(true);
+    setIsMonitoring(true);
+    
+    // Timer de medición
+    if (measurementTimerRef.current) {
+      clearInterval(measurementTimerRef.current);
+    }
+    
+    measurementTimerRef.current = window.setInterval(() => {
+      setElapsedTime(prev => prev + 1);
+    }, 1000);
+
+    // Audit log: nueva sesión
+    const sid = `${Date.now().toString(36)}-${Math.floor(performance.now()).toString(36)}`;
+    startAuditSession(sid, sanityProfileId);
+    setAuditNegativeCount(0);
+    
+    // Calibración automática
+    setIsCalibrating(true);
+    startCalibration();
+    setTimeout(() => setIsCalibrating(false), 3000);
+    
+  }, [isMonitoring, startProcessing, startCalibration, enterFullScreen, sanityProfileId]);
+
+  // === CUANDO LA CÁMARA ESTÁ LISTA ===
+  const handleStreamReady = useCallback((stream: MediaStream) => {
+    console.log('📹 Stream recibido');
+    setCameraStream(stream);
+    
+    // Esperar a que el video esté listo y comenzar captura
+    setTimeout(() => {
+      const video = cameraRef.current?.getVideoElement();
+      if (video && video.readyState >= 2) {
+        console.log('✅ Video listo:', video.videoWidth, 'x', video.videoHeight);
+        startFrameLoop();
+      } else {
+        // Reintentar
+        const checkReady = setInterval(() => {
+          const v = cameraRef.current?.getVideoElement();
+          if (v && v.readyState >= 2 && v.videoWidth > 0) {
+            clearInterval(checkReady);
+            console.log('✅ Video listo (retry):', v.videoWidth, 'x', v.videoHeight);
+            startFrameLoop();
+          }
+        }, 100);
+        
+        // Timeout después de 5 segundos
+        setTimeout(() => clearInterval(checkReady), 5000);
+      }
+    }, 500);
+  }, [startFrameLoop]);
+
+  // === FINALIZAR MEDICIÓN ===
+  const finalizeMeasurement = useCallback(async () => {
+    if (!isMonitoring) return;
+    
+    console.log('🛑 Finalizando medición...');
+    
+    // Sonido de finalización
+    playCompletionSound();
+    
+    // Vibración de finalización
+    if (navigator.vibrate) {
+      navigator.vibrate([100, 50, 100, 50, 200]);
+    }
+    // Detener loop primero
+    stopFrameLoop();
+    
+    // Detener timer
+    if (measurementTimerRef.current) {
+      clearInterval(measurementTimerRef.current);
+      measurementTimerRef.current = null;
+    }
+    
+    // Detener procesadores
+    stopProcessing();
+    
+    if (isCalibrating) {
+      forceCalibrationCompletion();
+    }
+    
+    const savedResults = resetVitalSigns();
+    
+    // Guardar medición en la base de datos automáticamente
+    if (savedResults || vitalSigns.spo2 > 0) {
+      const dataToSave = savedResults || vitalSigns;
+      await saveMeasurement({
+        heartRate,
+        vitalSigns: dataToSave,
+        signalQuality: lastSignal?.quality || 0
+      });
+    }
+    
+    // Detener cámara
+    setIsCameraOn(false);
+    
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+      setCameraStream(null);
+    }
+    
+    setIsMonitoring(false);
+    setIsCalibrating(false);
+    
+    if (savedResults) {
+      setVitalSigns(savedResults);
+    }
+    setShowResults(true);
+    
+    // Generar resumen estadístico
+    const total = totalBeatsRef.current;
+    const arrBeats = arrhythmiaBeatsRef.current;
+    setMeasurementSummary({
+      totalBeats: total,
+      arrhythmiaBeats: arrBeats,
+      normalPercent: total > 0 ? Math.round(((total - arrBeats) / total) * 100) : 100
+    });
+    
+    setElapsedTime(0);
+    setCalibrationProgress(0);
+    
+    console.log('✅ Medición finalizada y guardada');
+  }, [isMonitoring, isCalibrating, cameraStream, stopFrameLoop, stopProcessing, forceCalibrationCompletion, resetVitalSigns, saveMeasurement, heartRate, vitalSigns, lastSignal]);
+
+  // === RESET COMPLETO ===
+  const handleReset = useCallback(() => {
+    console.log('🔄 Reset completo...');
+    
+    stopFrameLoop();
+    
+    if (measurementTimerRef.current) {
+      clearInterval(measurementTimerRef.current);
+      measurementTimerRef.current = null;
+    }
+    
+    stopProcessing();
+    fullResetVitalSigns();
+    resetHeartBeat();
+    
+    setIsCameraOn(false);
+    
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+      setCameraStream(null);
+    }
+    
+    setIsMonitoring(false);
+    setShowResults(false);
+    setMeasurementSummary(null);
+    setIsCalibrating(false);
+    setElapsedTime(0);
+    setHeartRate(0);
+    totalBeatsRef.current = 0;
+    arrhythmiaBeatsRef.current = 0;
+    lastArrhythmiaCountForBeatsRef.current = 0;
+    unstableFrameCounter.current = 0;
+    latestArrhythmiaCountRef.current = 0;
+    prevRRIntervalsRef.current = [];
+    setHeartbeatSignal(0);
+    setBeatMarker(0);
+    setRRIntervals([]);
+    bpmSanityRef.current.reset();
+    sanityErrorRef.current = null;
+    setSanityError(null);
+    setVitalSigns({ 
+      spo2: 0,
+      glucose: 0,
+      hemoglobin: 0,
+      pressure: { systolic: 0, diastolic: 0, confidence: 'INSUFFICIENT' as const, featureQuality: 0 },
+      arrhythmiaCount: 0,
+      arrhythmiaStatus: "SIN ARRITMIAS|0",
+      lipids: { totalCholesterol: 0, triglycerides: 0 },
+      isCalibrating: false,
+      calibrationProgress: 0,
+      lastArrhythmiaData: undefined,
+      signalQuality: 0,
+      measurementConfidence: 'INVALID'
+    });
+    setArrhythmiaCount("--");
+    lastArrhythmiaData.current = null;
+    setCalibrationProgress(0);
+    arrhythmiaDetectedRef.current = false;
+    
+    console.log('✅ Reset completado');
+  }, [cameraStream, stopFrameLoop, stopProcessing, fullResetVitalSigns, resetHeartBeat]);
+
+  // === PROCESAR SEÑAL PPG ===
+  const UNSTABLE_ZERO_THRESHOLD = 15; // ~0.5s de señal mala antes de borrar vitales
+  const VITALS_PROCESS_EVERY_N_FRAMES = 3;
+  
+  useEffect(() => {
+    if (!lastSignal || !isMonitoring) return;
+    
+    const signalValue = lastSignal.filteredValue;
+    const contactState = lastSignal.contactState;
+    const stableHumanSignal =
+      contactState === 'STABLE_CONTACT' &&
+      (lastSignal.quality || 0) >= 12 &&
+      (lastSignal.perfusionIndex || 0) >= 0.005;
+
+    const heartBeatResult = processHeartBeat(
+      signalValue,
+      contactState,
+      lastSignal.timestamp
+    );
+
+    setHeartbeatSignal(stableHumanSignal ? heartBeatResult.filteredValue : 0);
+
+    if (!stableHumanSignal) {
+      unstableFrameCounter.current++;
+      
+      // Solo borrar vitales después de señal mala SOSTENIDA
+      if (unstableFrameCounter.current >= UNSTABLE_ZERO_THRESHOLD) {
+        setHeartRate(0);
+        vitalSignsFrameCounter.current = 0;
+        setBeatMarker(0);
+        setRRIntervals([]);
+        prevRRIntervalsRef.current = [];
+        latestArrhythmiaCountRef.current = 0;
+        setArrhythmiaCount("--");
+        arrhythmiaDetectedRef.current = false;
+        setVitalSigns(prev => (
+          prev.measurementConfidence === 'INVALID' &&
+          prev.spo2 === 0 &&
+          prev.glucose === 0 &&
+          prev.hemoglobin === 0 &&
+          prev.pressure.systolic === 0 &&
+          prev.pressure.diastolic === 0
+            ? prev
+            : {
+                ...prev,
+                spo2: 0,
+                glucose: 0,
+                hemoglobin: 0,
+                pressure: { systolic: 0, diastolic: 0, confidence: 'INSUFFICIENT' as const, featureQuality: 0 },
+                arrhythmiaCount: 0,
+                arrhythmiaStatus: "SIN ARRITMIAS|0",
+                lipids: { totalCholesterol: 0, triglycerides: 0 },
+                lastArrhythmiaData: undefined,
+                signalQuality: 0,
+                measurementConfidence: 'INVALID'
+              }
+        ));
+      }
+      // Durante los primeros frames inestables, mantener último valor válido (no borrar)
+      return;
+    }
+
+    // Señal estable — resetear contador de inestabilidad
+    unstableFrameCounter.current = 0;
+    // Guardrail anti-simulación: si el stream de BPM se vuelve constante /
+    // repetitivo / fuera de rango fisiológico, congelamos la actualización
+    // y exponemos un estado de error en lugar de pintar datos sospechosos.
+    const verdict = bpmSanityRef.current.push(heartBeatResult.bpm);
+    if (verdict.ok === false) {
+      const msg = `BPM stream ${verdict.reason} (${verdict.detail})`;
+      if (sanityErrorRef.current !== verdict.reason) {
+        sanityErrorRef.current = verdict.reason;
+        setSanityError(msg);
+        const now = performance.now();
+        if (now - sanityToastAtRef.current > 5000) {
+          sanityToastAtRef.current = now;
+          toast({
+            variant: "destructive",
+            title: "⚠ Señal sospechosa detectada",
+            description: msg,
+          });
+        }
+      }
+      // No actualizamos heartRate ni vitales mientras el verdict sea inválido.
+      return;
+    }
+    if (sanityErrorRef.current) {
+      sanityErrorRef.current = null;
+      setSanityError(null);
+    }
+    setHeartRate(heartBeatResult.bpm);
+
+    if (heartBeatResult.isPeak) {
+      setBeatMarker(1);
+      setTimeout(() => setBeatMarker(0), 300);
+      totalBeatsRef.current++;
+      // Se compara contra un ref siempre actualizado (no un closure stale del
+      // estado vitalSigns) para no depender de re-renders intermedios.
+      const currentArrCount = latestArrhythmiaCountRef.current;
+      if (currentArrCount > lastArrhythmiaCountForBeatsRef.current) {
+        arrhythmiaBeatsRef.current++;
+        lastArrhythmiaCountForBeatsRef.current = currentArrCount;
+      }
+    }
+
+    if (heartBeatResult.rrData?.intervals) {
+      const nextRR = heartBeatResult.rrData.intervals.slice(-5);
+      const prevRR = prevRRIntervalsRef.current;
+      if (prevRR.length !== nextRR.length || prevRR.some((v, i) => v !== nextRR[i])) {
+        prevRRIntervalsRef.current = nextRR;
+        setRRIntervals(nextRR);
+      }
+    }
+
+    vitalSignsFrameCounter.current++;
+
+    if (vitalSignsFrameCounter.current >= VITALS_PROCESS_EVERY_N_FRAMES) {
+      vitalSignsFrameCounter.current = 0;
+      const rgbStats = getRGBStats();
+
+      if (rgbStats.redDC > 0 && rgbStats.greenDC > 0) {
+        setRGBData({
+          redAC: rgbStats.redAC,
+          redDC: rgbStats.redDC,
+          greenAC: rgbStats.greenAC,
+          greenDC: rgbStats.greenDC
+        });
+      }
+
+      const vitals = processVitalSigns(
+        lastSignal.filteredValue,
+        heartBeatResult.rrData && heartBeatResult.rrData.intervals.length >= 2 && heartBeatResult.confidence > 0.18
+          ? heartBeatResult.rrData
+          : undefined
+      );
+
+      setVitalSigns(prev => (vitalsEqual(prev, vitals) ? prev : vitals));
+
+      if (heartBeatResult.rrData && heartBeatResult.rrData.intervals.length >= 2 && heartBeatResult.confidence > 0.18 && vitals.measurementConfidence !== 'INVALID') {
+        const arrhythmiaStatus = vitals.arrhythmiaStatus;
+        if (arrhythmiaStatus) {
+          lastArrhythmiaData.current = vitals.lastArrhythmiaData || null;
+          const parts = arrhythmiaStatus.split('|');
+          const count = parts.length > 1 ? parts[1] : "0";
+          setArrhythmiaCount(count);
+          latestArrhythmiaCountRef.current = vitals.arrhythmiaCount || 0;
+
+          const isArrhythmiaDetected = arrhythmiaStatus.includes("ARRITMIA DETECTADA");
+          if (isArrhythmiaDetected !== arrhythmiaDetectedRef.current) {
+            arrhythmiaDetectedRef.current = isArrhythmiaDetected;
+
+            if (isArrhythmiaDetected) {
+              if (navigator.vibrate) {
+                navigator.vibrate([200, 100, 200]);
+              }
+              toast({
+                title: "⚠️ Arritmia detectada",
+                description: `Latido irregular #${vitals.arrhythmiaCount}`,
+                variant: "destructive",
+                duration: 4000
+              });
+            }
+          }
+        }
+      }
+    }
+  }, [lastSignal, isMonitoring, processHeartBeat, processVitalSigns, setRGBData, getRGBStats]);
+
+  // AUTO-FINALIZAR a los 60 segundos (1 minuto)
+  useEffect(() => {
+    if (isMonitoring && elapsedTime >= 60) {
+      finalizeMeasurement();
+    }
+  }, [elapsedTime, isMonitoring, finalizeMeasurement]);
+
+  // CONTROL DE CALIBRACIÓN
+  useEffect(() => {
+    if (!isCalibrating) return;
+    
+    const interval = setInterval(() => {
+      const currentProgress = getCalibrationProgress();
+      setCalibrationProgress(currentProgress);
+
+      if (currentProgress >= 100) {
+        clearInterval(interval);
+        setIsCalibrating(false);
+        if (navigator.vibrate) {
+          navigator.vibrate([100]);
+        }
+      }
+    }, 500);
+
+    return () => clearInterval(interval);
+  }, [isCalibrating, getCalibrationProgress]);
+
+  const handleToggleMonitoring = () => {
+    if (isMonitoring) {
+      finalizeMeasurement();
+    } else {
+      startMonitoring();
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 flex flex-col bg-black" style={{ 
+      height: '100svh',
+      width: '100vw',
+      maxWidth: '100vw',
+      maxHeight: '100svh',
+      overflow: 'hidden',
+      touchAction: 'none',
+      userSelect: 'none',
+      WebkitTouchCallout: 'none',
+      WebkitUserSelect: 'none'
+    }}>
+      {/* OVERLAY PANTALLA COMPLETA */}
+      {!isFullscreen && (
+        <button 
+          onClick={enterFullScreen}
+          className="fixed inset-0 z-50 w-full h-full flex items-center justify-center bg-black/90 text-white"
+        >
+          <div className="text-center p-4 bg-primary/20 rounded-lg backdrop-blur-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5m11 5v-4m0 4h-4m4 0l-5-5" />
+            </svg>
+            <p className="text-lg font-semibold">Toca para modo pantalla completa</p>
+          </div>
+        </button>
+      )}
+
+      <div className="flex-1 relative">
+
+        {/* CÁMARA - Con ref directo */}
+        <div className="absolute inset-0">
+          <CameraView 
+            ref={cameraRef}
+            onStreamReady={handleStreamReady}
+            isMonitoring={isCameraOn}
+          />
+        </div>
+
+        {/* AJUSTES — botón discreto top-right */}
+        <button
+          type="button"
+          onClick={() => setShowSettings(true)}
+          aria-label="Ajustes"
+          className="absolute top-2 right-2 z-30 p-2 rounded-full bg-black/40 text-white/70 hover:text-white hover:bg-black/60 transition-colors"
+        >
+          <SettingsIcon className="h-4 w-4" />
+        </button>
+
+        {showSettings && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={() => setShowSettings(false)}>
+            <div className="bg-zinc-900 text-white rounded-lg p-5 w-[90%] max-w-sm border border-white/10" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-base font-semibold">Ajustes</h3>
+                <button onClick={() => setShowSettings(false)} aria-label="Cerrar" className="text-white/60 hover:text-white">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <label className="flex items-start gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={telemetryOn}
+                  onChange={(e) => {
+                    const v = e.target.checked;
+                    setPerfConsent(v);
+                    setTelemetryOn(v);
+                  }}
+                />
+                <span className="text-sm leading-snug">
+                  <span className="font-medium">Métricas anónimas de rendimiento</span>
+                  <span className="block text-white/60 text-xs mt-1">
+                    Envía estadísticas de FPS, latencia y calidad del pipeline para depurar problemas. No incluye datos personales ni mediciones biométricas.
+                  </span>
+                </span>
+              </label>
+
+              <div className="mt-5 pt-4 border-t border-white/10">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-1"
+                    checked={bpCfg.enabled}
+                    onChange={(e) => updateBp({ enabled: e.target.checked, forceStride: undefined })}
+                  />
+                  <span className="text-sm leading-snug">
+                    <span className="font-medium">Backpressure adaptativo</span>
+                    <span className="block text-white/60 text-xs mt-1">
+                      Reduce el muestreo espacial (stride) cuando el dispositivo no llega al fps objetivo. No altera la frecuencia temporal.
+                    </span>
+                  </span>
+                </label>
+
+                <div className={`mt-3 grid grid-cols-2 gap-3 ${bpCfg.enabled && typeof bpCfg.forceStride !== 'number' ? '' : 'opacity-50 pointer-events-none'}`}>
+                  <label className="text-xs text-white/70">
+                    fps bajo (sube stride)
+                    <input
+                      type="number" min={5} max={59} step={1}
+                      value={bpCfg.lowFpsThreshold}
+                      onChange={(e) => updateBp({ lowFpsThreshold: Number(e.target.value) })}
+                      className="mt-1 w-full bg-zinc-800 border border-white/10 rounded px-2 py-1 text-white"
+                    />
+                  </label>
+                  <label className="text-xs text-white/70">
+                    fps alto (baja stride)
+                    <input
+                      type="number" min={6} max={60} step={1}
+                      value={bpCfg.highFpsThreshold}
+                      onChange={(e) => updateBp({ highFpsThreshold: Number(e.target.value) })}
+                      className="mt-1 w-full bg-zinc-800 border border-white/10 rounded px-2 py-1 text-white"
+                    />
+                  </label>
+                  <label className="text-xs text-white/70">
+                    Sostenido (ms)
+                    <input
+                      type="number" min={250} max={30000} step={250}
+                      value={bpCfg.sustainMs}
+                      onChange={(e) => updateBp({ sustainMs: Number(e.target.value) })}
+                      className="mt-1 w-full bg-zinc-800 border border-white/10 rounded px-2 py-1 text-white"
+                    />
+                  </label>
+                  <label className="text-xs text-white/70">
+                    Stride máximo
+                    <input
+                      type="number" min={3} max={8} step={1}
+                      value={bpCfg.maxStride}
+                      onChange={(e) => updateBp({ maxStride: Number(e.target.value) })}
+                      className="mt-1 w-full bg-zinc-800 border border-white/10 rounded px-2 py-1 text-white"
+                    />
+                  </label>
+                </div>
+
+                <div className="mt-3 flex items-center gap-2">
+                  <span className="text-xs text-white/70">Forzar stride:</span>
+                  {[undefined, 3, 4, 5].map((s) => (
+                    <button
+                      key={String(s)}
+                      type="button"
+                      onClick={() => updateBp({ forceStride: s })}
+                      className={`text-xs px-2 py-1 rounded border ${
+                        (bpCfg.forceStride ?? 'auto') === (s ?? 'auto')
+                          ? 'bg-white/20 border-white/40 text-white'
+                          : 'bg-zinc-800 border-white/10 text-white/70 hover:text-white'
+                      }`}
+                    >
+                      {s === undefined ? 'auto' : s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Sanity profile + audit log */}
+              <div className="mt-5 pt-4 border-t border-white/10">
+                <div className="text-sm font-medium mb-2">Guardrail anti-simulación</div>
+                <label className="text-xs text-white/70 block">
+                  Perfil de umbrales
+                  <select
+                    value={sanityProfileId}
+                    onChange={(e) => handleProfileChange(e.target.value)}
+                    className="mt-1 w-full bg-zinc-800 border border-white/10 rounded px-2 py-1 text-white"
+                  >
+                    {SANITY_PROFILES.map(p => (
+                      <option key={p.id} value={p.id}>{p.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <p className="text-[11px] text-white/50 mt-1">
+                  {SANITY_PROFILES.find(p => p.id === sanityProfileId)?.description}
+                </p>
+
+                <details className="mt-3 text-xs text-white/70">
+                  <summary className="cursor-pointer text-white/80">Umbrales efectivos / overrides JSON</summary>
+                  <pre className="mt-2 p-2 bg-zinc-800 rounded text-[10px] text-white/60 overflow-auto max-h-32">
+{JSON.stringify(resolveProfile(sanityProfileId).effective, null, 2)}
+                  </pre>
+                  <textarea
+                    value={customJSON}
+                    onChange={(e) => setCustomJSON(e.target.value)}
+                    placeholder='{ "windowSize": 40, "min": 35 }'
+                    rows={4}
+                    className="mt-2 w-full bg-zinc-800 border border-white/10 rounded px-2 py-1 text-white font-mono text-[11px]"
+                  />
+                  <div className="mt-2 flex gap-2">
+                    <button type="button" onClick={handleCustomApply}
+                      className="text-xs px-2 py-1 rounded bg-white/15 hover:bg-white/25 border border-white/20">
+                      Aplicar overrides
+                    </button>
+                    <button type="button" onClick={handleCustomClear}
+                      className="text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 border border-white/10">
+                      Limpiar
+                    </button>
+                  </div>
+                </details>
+
+                <div className="mt-3 flex items-center justify-between gap-2">
+                  <span className="text-xs text-white/70">
+                    Veredictos: {getAuditEntries().length}
+                    {auditNegativeCount > 0 && (
+                      <span className="ml-1 text-amber-400">({auditNegativeCount} alertas)</span>
+                    )}
+                  </span>
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => downloadAuditJSON()}
+                      className="text-xs px-2 py-1 rounded bg-white/15 hover:bg-white/25 border border-white/20">
+                      JSON
+                    </button>
+                    <button type="button" onClick={() => downloadAuditCSV()}
+                      className="text-xs px-2 py-1 rounded bg-white/15 hover:bg-white/25 border border-white/20">
+                      CSV
+                    </button>
+                    <button type="button" onClick={() => { clearAuditLog(); setAuditNegativeCount(0); }}
+                      className="text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 border border-white/10">
+                      Limpiar
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-3 pt-3 border-t border-white/10">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs text-white/70">
+                      Histórico persistido: {getPersistedAuditEntries().length}
+                      {getPersistedAuditNegativeCount() > 0 && (
+                        <span className="ml-1 text-amber-400">({getPersistedAuditNegativeCount()} alertas)</span>
+                      )}
+                    </span>
+                    <div className="flex gap-2">
+                      <button type="button" onClick={() => downloadAuditJSON(`sanity-audit-history-${Date.now()}.json`, "persisted")}
+                        className="text-xs px-2 py-1 rounded bg-white/15 hover:bg-white/25 border border-white/20">
+                        JSON
+                      </button>
+                      <button type="button" onClick={() => downloadAuditCSV(`sanity-audit-history-${Date.now()}.csv`, "persisted")}
+                        className="text-xs px-2 py-1 rounded bg-white/15 hover:bg-white/25 border border-white/20">
+                        CSV
+                      </button>
+                      <button type="button" onClick={() => { clearPersistedAuditLog(); setAuditNegativeCount(0); }}
+                        className="text-xs px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 border border-white/10">
+                        Borrar
+                      </button>
+                    </div>
+                  </div>
+                  <p className="mt-1 text-[10px] text-white/40">
+                    Sobrevive a recargas. Retención máx: 2000 entradas.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="relative z-10 h-full">
+          <div className="flex-1 h-full">
+            <PPGSignalMeter 
+              value={heartbeatSignal}
+              quality={lastSignal?.quality || 0}
+              isFingerDetected={lastSignal?.fingerDetected || false}
+              onStartMeasurement={handleToggleMonitoring}
+              onReset={handleReset}
+              isMonitoring={isMonitoring}
+              arrhythmiaStatus={vitalSigns.arrhythmiaStatus}
+              rawArrhythmiaData={lastArrhythmiaData.current}
+              preserveResults={showResults}
+              diagnosticMessage={lastSignal?.diagnostics?.message}
+              isPeak={beatMarker === 1}
+              bpm={heartRate}
+              spo2={vitalSigns.spo2}
+              rrIntervals={rrIntervals}
+              elapsedTime={elapsedTime}
+              perfusionIndex={lastSignal?.perfusionIndex || 0}
+              pressure={vitalSigns.pressure}
+            />
+          </div>
+
+          {/* SIGNOS VITALES — overlay transparente sobre el monitor a pantalla completa */}
+          <div className="absolute inset-x-0 bottom-[60px] px-3 py-3 pointer-events-none bg-gradient-to-t from-black/70 via-black/30 to-transparent">
+            <div className="grid grid-cols-3 gap-2 place-items-center pointer-events-auto">
+              <VitalSign 
+                label="FRECUENCIA CARDÍACA"
+                value={heartRate > 0 ? Math.round(heartRate) : "--"}
+                unit="BPM"
+                highlighted={showResults}
+              />
+              <VitalSign 
+                label="SPO2"
+                value={vitalSigns.spo2 > 0 ? vitalSigns.spo2 : "--"}
+                unit="%"
+                highlighted={showResults}
+              />
+              <VitalSign 
+                label="PRESIÓN ARTERIAL"
+                value={vitalSigns.pressure && vitalSigns.pressure.systolic > 0 
+                  ? `${vitalSigns.pressure.systolic}/${vitalSigns.pressure.diastolic}` 
+                  : "--/--"}
+                unit="mmHg"
+                highlighted={showResults}
+                confidenceLevel={vitalSigns.pressure?.confidence}
+                featureQuality={vitalSigns.pressure?.featureQuality}
+              />
+              <VitalSign 
+                label="HEMOGLOBINA (EST.)"
+                value={vitalSigns.hemoglobin > 0 ? vitalSigns.hemoglobin : "--"}
+                unit="g/dL"
+                highlighted={showResults}
+              />
+              <VitalSign 
+                label="GLUCOSA (EST.)"
+                value={vitalSigns.glucose > 0 ? vitalSigns.glucose : "--"}
+                unit="mg/dL"
+                highlighted={showResults}
+              />
+              <VitalSign 
+                label="COLEST./TRIGL. (EST.)"
+                value={
+                  vitalSigns.lipids?.totalCholesterol > 0 || vitalSigns.lipids?.triglycerides > 0
+                    ? `${vitalSigns.lipids?.totalCholesterol || "--"}/${vitalSigns.lipids?.triglycerides || "--"}`
+                    : "--/--"
+                }
+                unit="mg/dL"
+                highlighted={showResults}
+              />
+            </div>
+          </div>
+
+          {/* RESUMEN ESTADÍSTICO POST-MEDICIÓN */}
+          {showResults && measurementSummary && (() => {
+            const { totalBeats, arrhythmiaBeats, normalPercent } = measurementSummary;
+            const normalBeats = totalBeats - arrhythmiaBeats;
+            const avgBpm = heartRate > 0 ? Math.round(heartRate) : '--';
+            const statusColor = normalPercent >= 95 ? 'emerald' : normalPercent >= 80 ? 'yellow' : 'red';
+            const statusText = normalPercent >= 95 ? 'RITMO NORMAL' : normalPercent >= 80 ? 'LEVE IRREGULARIDAD' : 'IRREGULARIDAD DETECTADA';
+            const statusIcon = normalPercent >= 95 ? CheckCircle2 : normalPercent >= 80 ? AlertTriangle : AlertTriangle;
+            const StatusIcon = statusIcon;
+            
+            return (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm animate-fade-in">
+                <div className="bg-slate-950 border border-slate-700/50 rounded-2xl max-w-sm w-[92%] shadow-2xl overflow-hidden">
+                  
+                  {/* Header con estado */}
+                  <div className={`px-4 py-3 bg-${statusColor}-500/10 border-b border-slate-800`}>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <StatusIcon className={`w-5 h-5 text-${statusColor}-400`} />
+                        <div>
+                          <h3 className="text-white text-sm font-bold tracking-wide">MEDICIÓN COMPLETADA</h3>
+                          <p className={`text-${statusColor}-400 text-[10px] font-semibold tracking-wider`}>{statusText}</p>
+                        </div>
+                      </div>
+                      <button 
+                        onClick={() => setMeasurementSummary(null)}
+                        className="p-1.5 rounded-full bg-slate-800 hover:bg-slate-700 transition-colors"
+                      >
+                        <X className="w-4 h-4 text-slate-400" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Métricas principales */}
+                  <div className="p-4 space-y-2">
+                    
+                    {/* BPM y SpO2 en fila */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-slate-900/80 rounded-xl p-3 text-center border border-slate-800/50">
+                        <Heart className="w-4 h-4 text-red-400 mx-auto mb-1" fill="currentColor" />
+                        <div className="text-white text-2xl font-bold leading-none">{avgBpm}</div>
+                        <div className="text-slate-500 text-[9px] mt-1 font-medium">BPM PROMEDIO</div>
+                      </div>
+                      <div className="bg-slate-900/80 rounded-xl p-3 text-center border border-slate-800/50">
+                        <Activity className="w-4 h-4 text-cyan-400 mx-auto mb-1" />
+                        <div className="text-white text-2xl font-bold leading-none">
+                          {vitalSigns.spo2 > 0 ? vitalSigns.spo2 : '--'}
+                          <span className="text-sm text-slate-400">%</span>
+                        </div>
+                        <div className="text-slate-500 text-[9px] mt-1 font-medium">SpO₂</div>
+                      </div>
+                    </div>
+
+                    {/* Presión arterial */}
+                    {vitalSigns.pressure?.systolic > 0 && (
+                      <div className="bg-slate-900/80 rounded-xl p-3 border border-slate-800/50 flex items-center gap-3">
+                        <Shield className="w-5 h-5 text-blue-400" />
+                        <div className="flex-1">
+                          <div className="flex items-center gap-2">
+                            <div className="text-slate-500 text-[9px] font-medium">PRESIÓN ARTERIAL</div>
+                            {vitalSigns.pressure.confidence && vitalSigns.pressure.confidence !== 'INSUFFICIENT' && (
+                              <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded-full ${
+                                vitalSigns.pressure.confidence === 'HIGH' ? 'bg-emerald-500/20 text-emerald-400' :
+                                vitalSigns.pressure.confidence === 'MEDIUM' ? 'bg-yellow-500/20 text-yellow-400' :
+                                'bg-orange-500/20 text-orange-400'
+                              }`}>
+                                {vitalSigns.pressure.confidence}
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-white text-lg font-bold">
+                            {vitalSigns.pressure.systolic}/{vitalSigns.pressure.diastolic}
+                            <span className="text-xs text-slate-500 ml-1">mmHg</span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Barras de ritmo */}
+                    <div className="bg-slate-900/80 rounded-xl p-3 border border-slate-800/50">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-slate-400 text-[10px] font-semibold tracking-wide">ANÁLISIS DE RITMO</span>
+                        <div className="flex items-center gap-1">
+                          <Clock className="w-3 h-3 text-slate-500" />
+                          <span className="text-slate-500 text-[9px]">30s</span>
+                        </div>
+                      </div>
+                      
+                      {/* Latidos normales */}
+                      <div className="mb-2">
+                        <div className="flex justify-between items-center mb-0.5">
+                          <span className="text-emerald-400 text-[9px] font-medium">■ Normales</span>
+                          <span className="text-white text-xs font-bold">{normalBeats}</span>
+                        </div>
+                        <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                          <div className="h-full bg-gradient-to-r from-emerald-600 to-emerald-400 rounded-full transition-all duration-1000 ease-out"
+                               style={{ width: `${totalBeats > 0 ? (normalBeats / totalBeats) * 100 : 0}%` }} />
+                        </div>
+                      </div>
+                      
+                      {/* Arritmias */}
+                      <div>
+                        <div className="flex justify-between items-center mb-0.5">
+                          <span className="text-red-400 text-[9px] font-medium">■ Arrítmicos</span>
+                          <span className="text-white text-xs font-bold">{arrhythmiaBeats}</span>
+                        </div>
+                        <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                          <div className={`h-full rounded-full transition-all duration-1000 ease-out ${arrhythmiaBeats > 0 ? 'bg-gradient-to-r from-red-600 to-red-400' : 'bg-slate-700'}`}
+                               style={{ width: `${totalBeats > 0 ? (arrhythmiaBeats / totalBeats) * 100 : 100}%` }} />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Porcentaje circular visual */}
+                    <div className="flex items-center justify-center gap-4 pt-1">
+                      <div className="relative w-16 h-16">
+                        <svg viewBox="0 0 36 36" className="w-full h-full -rotate-90">
+                          <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                fill="none" stroke="#1e293b" strokeWidth="3" />
+                          <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                fill="none"
+                                className={`${statusColor === 'emerald' ? 'stroke-emerald-400' : statusColor === 'yellow' ? 'stroke-yellow-400' : 'stroke-red-400'}`}
+                                strokeWidth="3"
+                                strokeDasharray={`${normalPercent}, 100`}
+                                strokeLinecap="round" />
+                        </svg>
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <span className={`text-sm font-bold ${statusColor === 'emerald' ? 'text-emerald-400' : statusColor === 'yellow' ? 'text-yellow-400' : 'text-red-400'}`}>
+                            {normalPercent}%
+                          </span>
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-white text-xs font-semibold">Ritmo Normal</div>
+                        <div className="text-slate-500 text-[9px]">{totalBeats} latidos analizados</div>
+                        <div className={`text-[10px] font-semibold mt-0.5 ${statusColor === 'emerald' ? 'text-emerald-400' : statusColor === 'yellow' ? 'text-yellow-400' : 'text-red-400'}`}>
+                          {statusText}
+                        </div>
+                      </div>
+                    </div>
+                    {/* Botón Análisis AI */}
+                    <button
+                      onClick={() => {
+                        analyzeVitals({ heartRate, vitalSigns, quality: lastSignal?.quality || 0 });
+                        setShowAIAnalysis(true);
+                      }}
+                      disabled={isAnalyzing}
+                      className="w-full mt-2 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-semibold text-sm transition-all disabled:opacity-50"
+                    >
+                      {isAnalyzing ? (
+                        <><Loader2 className="w-4 h-4 animate-spin" /> Analizando...</>
+                      ) : (
+                        <><Brain className="w-4 h-4" /> Análisis AI de Salud</>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* MODAL ANÁLISIS AI */}
+          {showAIAnalysis && (
+            <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-sm animate-fade-in">
+              <div className="bg-slate-950 border border-slate-700/50 rounded-2xl max-w-sm w-[92%] max-h-[80vh] shadow-2xl overflow-hidden flex flex-col">
+                <div className="px-4 py-3 bg-purple-500/10 border-b border-slate-800 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Brain className="w-5 h-5 text-purple-400" />
+                    <h3 className="text-white text-sm font-bold">Análisis AI de Salud</h3>
+                  </div>
+                  <button
+                    onClick={() => { setShowAIAnalysis(false); clearAnalysis(); }}
+                    className="p-1.5 rounded-full bg-slate-800 hover:bg-slate-700 transition-colors"
+                  >
+                    <X className="w-4 h-4 text-slate-400" />
+                  </button>
+                </div>
+                <div className="flex-1 overflow-y-auto p-4">
+                  {isAnalyzing ? (
+                    <div className="flex flex-col items-center justify-center py-12 gap-3">
+                      <Loader2 className="w-8 h-8 text-purple-400 animate-spin" />
+                      <p className="text-slate-400 text-sm">Analizando tus signos vitales...</p>
+                    </div>
+                  ) : analysis ? (
+                    <div className="text-slate-300 text-xs leading-relaxed whitespace-pre-wrap">
+                      {analysis}
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center justify-center py-12 gap-3">
+                      <p className="text-slate-500 text-sm">No se pudo generar el análisis.</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Index;
