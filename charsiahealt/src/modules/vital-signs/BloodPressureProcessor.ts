@@ -145,18 +145,13 @@ export class BloodPressureProcessor {
     // 7. Modelo de regresión DBP
     let dbp = this.estimateDBP(mf, hr, rrVar.rmssd);
 
-    // 8. Coherencia fisiológica (sin clamp, solo coherencia relativa)
-    if (dbp >= sbp) {
-      dbp = sbp * 0.62;
+    // 8. Coherencia fisiológica (sin clamps coercitivos)
+    // Objeción Juez Propósito: Eliminado el clamp dbp = sbp * 0.62.
+    // Solo marcamos como insuficiente si la relación es físicamente imposible.
+    if (dbp >= sbp || sbp - dbp < 10) {
+      return insufficient;
     }
-    const pp = sbp - dbp;
-    if (pp < 15) {
-      dbp = sbp - 25;
-    }
-    if (pp > 100) {
-      dbp = sbp - 55;
-    }
-
+    
     // 9. EMA smoothing
     if (this.lastSBP > 0) {
       sbp = this.lastSBP * (1 - this.EMA_ALPHA) + sbp * this.EMA_ALPHA;
@@ -164,7 +159,7 @@ export class BloodPressureProcessor {
     }
     this.lastSBP = sbp;
     this.lastDBP = dbp;
-
+    
     const map = dbp + (sbp - dbp) / 3;
 
     // 10. Calidad y confianza

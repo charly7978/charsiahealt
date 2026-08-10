@@ -221,7 +221,7 @@ const PPGSignalMeter = ({
     sceneManagerRef.current = manager;
     ecgMeshRef.current = manager.createChannel(ECG_CHANNEL);
     ppgMeshRef.current = manager.createChannel(PPG_CHANNEL);
-    particlesRef.current = new EcgParticles(manager as unknown as THREE.Scene, PPG_CHANNEL, 160);
+    particlesRef.current = new EcgParticles(manager.getScene(), PPG_CHANNEL, 160);
     synthRef.current = new ECGWaveformSynthesizer({ sampleRateHz: 60, maxActiveComplexes: 24 });
 
     manager.start();

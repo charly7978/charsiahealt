@@ -34,10 +34,10 @@ export class ECGWaveformSynthesizer {
     this.currentRhythm = rhythm;
 
     const config = rhythmConfig(rhythm);
-    const jitter = (Math.random() - 0.5) * 2 * this.jitterMs;
     this.respiratoryPhase += (Math.PI * 2) / 4;
     const respiratoryMod = 1 + this.respiratoryAmplitudeMod * Math.sin(this.respiratoryPhase);
-    const rScale = clamp(respiratoryMod + (Math.random() - 0.5) * 0.04, 0.7, 1.25);
+    // Deterministic modulation based on respiratory phase without artificial random noise
+    const rScale = clamp(respiratoryMod, 0.7, 1.25);
 
     const complex = generateECGComplex(Math.max(rrMs, 420), config, {
       sampleRateHz: this.sampleRateHz,

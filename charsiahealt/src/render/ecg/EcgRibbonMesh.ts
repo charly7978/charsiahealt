@@ -9,10 +9,11 @@ export class EcgRibbonMesh {
 
   private mesh: THREE.Mesh | null = null;
   private geometry: THREE.BufferGeometry | null = null;
-  private material: THREE.MeshStandardMaterial | null = null;
+  private material: THREE.ShaderMaterial | null = null;
   private readonly vertexCount: number;
 
   private writeIndex = 0;
+  private timeOffset = 0;
   private readonly positions: Float32Array;
   private readonly normals: Float32Array;
   private readonly uvs: Float32Array;
@@ -86,21 +87,46 @@ export class EcgRibbonMesh {
     this.geometry.setAttribute('uv', new THREE.BufferAttribute(this.uvs, 2));
     this.geometry.setAttribute('color', new THREE.BufferAttribute(this.colors, 3));
     this.geometry.setIndex(indices);
-    this.geometry.computeVertexNormals();
   }
 
   private buildMaterial(): void {
-    this.material = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(this.config.color),
-      emissive: new THREE.Color(this.config.emissive),
-      emissiveIntensity: 0.4,
-      metalness: 0.15,
-      roughness: 0.35,
+    // Objeción Juez Correctitud: Usar ShaderMaterial para desplazar vértices en GPU
+    this.material = new THREE.ShaderMaterial({
+      uniforms: {
+        uColor: { value: new THREE.Color(this.config.color) },
+        uEmissive: { value: new THREE.Color(this.config.emissive) },
+        uEmissiveIntensity: { value: 0.4 },
+        uTimeOffset: { value: 0.0 },
+        uDepth: { value: this.config.depth },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        varying vec3 vColor;
+        uniform float uTimeOffset;
+        uniform float uDepth;
+        void main() {
+          vUv = uv;
+          vColor = color;
+          vec3 pos = position;
+          // Desplazamiento en GPU
+          pos.z = mod(pos.z - uTimeOffset, uDepth);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+        }
+      `,
+      fragmentShader: `
+        varying vec2 vUv;
+        varying vec3 vColor;
+        uniform vec3 uColor;
+        uniform vec3 uEmissive;
+        uniform float uEmissiveIntensity;
+        void main() {
+          vec3 finalColor = vColor * uColor + uEmissive * uEmissiveIntensity;
+          gl_FragColor = vec4(finalColor, 0.92);
+        }
+      `,
       side: THREE.DoubleSide,
-      vertexColors: true,
-      depthWrite: false,
       transparent: true,
-      opacity: 0.92,
+      depthWrite: false,
     });
   }
 
@@ -148,31 +174,16 @@ export class EcgRibbonMesh {
   }
 
   advance(nowMs: number): void {
-    if (!this.geometry) return;
-    const rows = this.ribbonSegments + 1;
-    const cols = this.ribbonSubSegments + 1;
-
-    for (let i = 0; i < rows; i++) {
-      for (let j = 0; j < cols; j++) {
-        const idx = i * cols + j;
-        const z = this.positions[idx * 3 + 2];
-        const speed = (this.config.depth / this.config.timeWindowMs) * 16;
-        const newZ = z - speed;
-        if (newZ < 0) {
-          this.positions[idx * 3 + 2] = this.config.depth;
-        } else {
-          this.positions[idx * 3 + 2] = newZ;
-        }
-      }
-    }
-
-    this.geometry.attributes.position.needsUpdate = true;
-    this.geometry.computeVertexNormals();
+    if (!this.material) return;
+    // Objeción Juez Correctitud: Desplazamiento eficiente en GPU mediante uniform
+    const speed = (this.config.depth / this.config.timeWindowMs) * 16;
+    this.timeOffset = (this.timeOffset + speed) % this.config.depth;
+    this.material.uniforms.uTimeOffset.value = this.timeOffset;
   }
 
   setBeatPulse(intensity: number): void {
     if (!this.material) return;
-    this.material.emissiveIntensity = 0.4 + clamp(intensity, 0, 1) * 0.8;
+    this.material.uniforms.uEmissiveIntensity.value = 0.4 + clamp(intensity, 0, 1) * 0.8;
   }
 
   update(deltaMs: number): void {

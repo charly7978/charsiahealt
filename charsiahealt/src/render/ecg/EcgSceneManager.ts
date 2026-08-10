@@ -16,6 +16,9 @@ export class EcgSceneManager {
   private ecgMesh: EcgRibbonMesh | null = null;
   private ppgMesh: EcgRibbonMesh | null = null;
   private particles: THREE.Points | null = null;
+  private grid: THREE.GridHelper | null = null;
+  private sweepBeamMesh: THREE.Mesh | null = null;
+  private lights: THREE.Light[] = [];
 
   private readonly sweepBeam: SweepBeamState = {
     positionZ: 0,
@@ -56,14 +59,17 @@ export class EcgSceneManager {
 
     const ambient = new THREE.AmbientLight('#445566', 0.6);
     this.scene.add(ambient);
+    this.lights.push(ambient);
 
     const directional = new THREE.DirectionalLight('#ffffff', 0.9);
     directional.position.set(200, -300, 900);
     this.scene.add(directional);
+    this.lights.push(directional);
 
     const point = new THREE.PointLight('#00ff88', 0.7, 1600);
     point.position.set(0, -120, 700);
     this.scene.add(point);
+    this.lights.push(point);
 
     this.addGrid();
     this.addSweepBeam();
@@ -73,10 +79,10 @@ export class EcgSceneManager {
 
   private addGrid(): void {
     if (!this.scene) return;
-    const grid = new THREE.GridHelper(1800, 36, '#1a3a2a', '#0d1f16');
-    grid.position.y = 400;
-    grid.position.z = -300;
-    this.scene.add(grid);
+    this.grid = new THREE.GridHelper(1800, 36, '#1a3a2a', '#0d1f16');
+    this.grid.position.y = 400;
+    this.grid.position.z = -300;
+    this.scene.add(this.grid);
   }
 
   private addSweepBeam(): void {
@@ -89,9 +95,14 @@ export class EcgSceneManager {
       side: THREE.DoubleSide,
       depthWrite: false,
     });
-    const beam = new THREE.Mesh(geometry, material);
-    beam.position.set(0, 0, 0);
-    this.scene.add(beam);
+    this.sweepBeamMesh = new THREE.Mesh(geometry, material);
+    this.sweepBeamMesh.position.set(0, 0, 0);
+    this.scene.add(this.sweepBeamMesh);
+  }
+
+  getScene(): THREE.Scene {
+    if (!this.scene) throw new Error('Scene not initialized');
+    return this.scene;
   }
 
   createChannel(config: EcgChannelConfig): EcgRibbonMesh {
@@ -192,7 +203,42 @@ export class EcgSceneManager {
       }
       this.particles = null;
     }
+    if (this.grid) {
+      this.grid.geometry.dispose();
+      if (Array.isArray(this.grid.material)) {
+        this.grid.material.forEach(m => m.dispose());
+      } else {
+        this.grid.material.dispose();
+      }
+      this.grid = null;
+    }
+    if (this.sweepBeamMesh) {
+      this.sweepBeamMesh.geometry.dispose();
+      if (Array.isArray(this.sweepBeamMesh.material)) {
+        this.sweepBeamMesh.material.forEach(m => m.dispose());
+      } else {
+        this.sweepBeamMesh.material.dispose();
+      }
+      this.sweepBeamMesh = null;
+    }
+    this.lights.forEach(light => {
+      if (light instanceof THREE.Light) {
+        this.scene?.remove(light);
+      }
+    });
+    this.lights = [];
+
     if (this.scene) {
+      this.scene.traverse((object) => {
+        if (object instanceof THREE.Mesh) {
+          object.geometry.dispose();
+          if (Array.isArray(object.material)) {
+            object.material.forEach(m => m.dispose());
+          } else {
+            object.material.dispose();
+          }
+        }
+      });
       this.scene.clear();
       this.scene = null;
     }
